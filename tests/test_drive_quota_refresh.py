@@ -587,5 +587,59 @@ class PassRefreshLockBranchTest(unittest.TestCase):
         self.assertEqual(reread["readings"]["provider-a"]["read_at"], T0)
 
 
+def project_with_chain(tmp, name, chain):
+    root = os.path.join(tmp, "ops", name)
+    os.makedirs(root)
+    with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+        handle.write(
+            '[profiles.default]\nruntime = "omp"\n'
+            f"[profiles.default.models.worker]\nchain = {chain!r}\n"
+        )
+    return projects.Project(name=name, unit_prefix=name + "-agent-", root=root)
+
+
+class UnionQuotaChainsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-quota-union-"))
+
+    def test_two_projects_yield_the_strictest_bound(self):
+        blue = project_with_chain(self.tmp, "blue", ["tired/model"])
+        green = project_with_chain(self.tmp, "green", ["fresh/model"])
+        pool = [provider("tired", stale_after_s=60.0), provider("fresh", stale_after_s=3600.0)]
+        union = drive.union_quota_chains([blue, green], pool)
+        self.assertEqual(union, {"worker": ["tired/model", "fresh/model"]})
+        self.assertEqual(quota.refresh_after_for(union, pool), 30.0)
+
+    def test_a_shared_entry_is_listed_once(self):
+        blue = project_with_chain(self.tmp, "blue", ["tired/model"])
+        green = project_with_chain(self.tmp, "green", ["tired/model"])
+        pool = [provider("tired", stale_after_s=60.0)]
+        self.assertEqual(
+            drive.union_quota_chains([blue, green], pool),
+            {"worker": ["tired/model"]},
+        )
+
+    def test_a_project_whose_profiles_fail_is_skipped(self):
+        blue = project_with_chain(self.tmp, "blue", ["tired/model"])
+        root = os.path.join(self.tmp, "ops", "broken")
+        os.makedirs(root)
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[models.default]\nchain = ["tired/model"]\n')
+        broken = projects.Project(name="broken", unit_prefix="broken-agent-", root=root)
+        pool = [provider("tired", stale_after_s=60.0)]
+        self.assertEqual(
+            drive.union_quota_chains([blue, broken], pool),
+            {"worker": ["tired/model"]},
+        )
+
+    def test_no_projects_use_the_default_bound(self):
+        pool = [provider("tired", stale_after_s=60.0)]
+        self.assertEqual(drive.union_quota_chains([], pool), {})
+        self.assertEqual(
+            quota.refresh_after_for(drive.union_quota_chains([], pool), pool),
+            accounts.DEFAULT_STALE_AFTER_S / 2.0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

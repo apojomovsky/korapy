@@ -437,6 +437,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             review_reader=review_reader,
             index_for=drive.pulls_index_for(tracker_factory),
             driven=driven,
+            pool=quota_pool,
             quota_refresh_after_s=quota_refresh_after_s,
         )
 
