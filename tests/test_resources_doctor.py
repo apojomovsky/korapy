@@ -636,6 +636,21 @@ class SliceDrift(unittest.TestCase):
         self.assertIn("launch an agent of web", row.fix)
         self.assertIn("hand stop", row.fix)
 
+    def test_host_plus_zero_share_drift_names_the_hand_stop(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("17179869184", "4000000"),
+                "korapy-web.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy.slice", row.detail)
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("launch an agent", row.fix)
+        self.assertIn("hand stop", row.fix)
+
 
 class ParseShow(unittest.TestCase):
     def test_parses_key_value_lines(self):

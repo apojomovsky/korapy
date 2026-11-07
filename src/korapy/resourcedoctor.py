@@ -700,6 +700,12 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
                     " (a cleared budget applies nothing: stop the slice by hand;"
                     " the zero-share slice needs a hand stop)"
                 )
+            else:
+                fix = (
+                    "launch an agent of that project, then run `korapy doctor` again"
+                    " (a cleared budget applies nothing: stop the slice by hand;"
+                    " the zero-share slice needs a hand stop)"
+                )
         return ResourceRow(
             "resources-slices",
             "warn",
