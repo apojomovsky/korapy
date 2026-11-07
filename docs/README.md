@@ -18,6 +18,7 @@
 | [`13-agent-ergonomics.md`](13-agent-ergonomics.md) | agent ergonomics: wait, events, the review-report reader, merge, and the gate |
 | [`14-heavy-lane.md`](14-heavy-lane.md) | the heavy lane: weighted slots, learned costs and pressure-aware admission for bursty work |
 | [`15-project-hygiene.md`](15-project-hygiene.md) | project-declared hygiene rules: dev images, build caches, scratch and old sessions for gc and disk |
+| [`16-tracker-repo-resolver.md`](16-tracker-repo-resolver.md) | one tracker-repo resolver for `[[repo]]` entries: the shared helper, the doctors' delegation, and the tickets to build them |
 | [`guide.md`](guide.md) | the operator's guide: running korapy on one host and driving a fleet with it |
 | [`adr/`](adr/) | decision records |
 
