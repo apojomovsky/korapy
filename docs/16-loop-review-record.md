@@ -87,26 +87,59 @@ command template, before the findings and summary steps. One
 template, one place: the resume message in `drive.py` reuses
 the prompt builder's command string, never a second copy
 (AGENTS.md "One fact, one place"; a test pins the two
-identical).
+identical). The same builder also serves the fix hint in
+`takeoff.py` `_check_review`, whose hand-written
+`--verdict <approve|block>` has drifted from `VERDICTS`
+(`reviewrecord.py`) and `prompts/reviewer.md`; the agreement
+test pins all three spellings, so the hint cannot drift
+again.
 
 Loop (`drive.py`): PROPOSED pure helper
 `needs_reprompt(finished, reviews, reprompted)` beside
 `_review_missing`, sharing its inputs plus the reprompt mark;
 PROPOSED planning step that turns a `review-missing` skip
 with no mark into one resume request carrying the exact
-command (commit pinned to the reviewed head, author pinned to
-the finished worker id, verdict left to the reviewer). The
-resume goes through the existing `launch.resume` seam with
-role reviewer (read-only preserved), so runtimes need no new
-interface (`resume_handle` already exists per runtime).
+command (commit pinned to the newest head read at plan time,
+the same head `merge --plan` checks; author pinned per the
+review launch rule below; verdict left to the reviewer). The
+head is re-validated newest == pinned immediately before the
+resume request and again after the resume returns: when the
+head moved, no resume is spent, the skip stands, and the
+ticket waits for a fresh review of the new head, so the one
+resume never burns on a record that cannot unblock the gate.
+The resume goes through the existing `launch.resume` seam
+with role reviewer (read-only preserved), so runtimes need no
+new interface (`resume_handle` already exists per runtime).
+
+Author: the exact source is the review launch rule
+(`drive.py` claim path): `(released or {}).get(key)` first,
+else `_finished_agent` of the `resolve_finished` newest
+entry for the ticket, read through `_finished_agent`,
+`_finished_role` and `_finished_outcome` only, no second
+resolver. The resume-pass capture (`_capture_finished_holders`)
+is usually empty, since no takeover precedes the resume, so
+the fallback carries the case. Empty or mismatch means no
+resume and the skip stands: no id at all, an unknown role or
+outcome, or a fallback that still names the finished
+reviewer itself (the two id flavors in `resolve_finished`:
+cross-pass unit name versus capture drive id) would record a
+self-review, which `write_record` refuses.
 
 Mark: PROPOSED one empty marker file per reprompted reviewer
-session beside the ticket's session dir (under the existing
-session root resolved through `paths`, alongside `reviews/`,
-not inside it, so `latest_record` never sees it). The mark is
-written before the resume is requested; a crash between mark
-and spawn reads as "already reprompted" and fails closed to
-today's skip.
+session inside the ticket dir,
+`os.path.join(paths.ticket_session_dir(repo, number),
+".reprompted-reviewer-<gen>")`, resolved only through
+`paths` like every other session path. It sits beside
+`reviews/`, never inside it, so `latest_record` never sees
+it; as a plain file it is ignored by `_role_leaves` (only
+`<role>-<gen>` dirs with a prompt count) and it inherits the
+ticket dir's dir-granular gc proofs, leaving with the ticket
+dir. The mark is written before the resume is requested; a
+crash between mark and spawn reads as "already reprompted"
+and fails closed to today's skip. A mark that cannot be
+written also fails closed: the skip stands, no resume is
+requested, the pass never crashes and never reprompts
+without a mark.
 
 ## 4. Exit codes, settings, failing closed
 
@@ -149,19 +182,23 @@ entry, review map, mark set) covering reviewer-ok with no
 record and no mark (true), mark present (false), non-`ok`
 outcome (false, never a protocol failure), record present
 (false), worker role (false). Agreement test: the resume
-message's command string equals the prompt template's, so
-the two cannot drift.
+message's command string, the prompt template's, and the
+`_check_review` fix hint all equal the one builder's output
+for `VERDICTS`, so the three cannot drift.
 
 Drive plan tests with a fake `launch.resume` at the existing
 seam: missing-record pass requests exactly one resume with
 the exact command (commit and author pinned); second pass
-with the mark requests none; resume success plus a record
-written by the fake reviewer clears the skip; resume refusal
-keeps the skip and the log line. Runtime side: fake
-`resume_handle` per runtime, reviewer stays read-only after
-resume (existing launch guarantee). No test touches the
-network, a real session dir, or a live unit; the suite guard
-keeps it honest.
+with the mark requests none; head moved between plan and
+resume requests none and keeps the skip for a fresh review;
+resume success plus a record written by the fake reviewer
+clears the skip; resume refusal keeps the skip and the log
+line; an unwritable mark keeps the skip with no resume and
+no failed pass. Runtime side: fake `resume_handle` per
+runtime, reviewer stays read-only after resume (existing
+launch guarantee). No test touches the network, a real
+session dir, or a live unit; the suite guard keeps it
+honest.
 
 ## 7. Tickets to file on approval
 
