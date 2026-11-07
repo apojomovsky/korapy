@@ -154,6 +154,20 @@ class HonestQuota(unittest.TestCase):
         self.assertIn("formatResetLine", body)
         self.assertIn("no reading", body)
 
+    def test_operator_marks_name_their_lift_time(self):
+        body = function_body(web_text("views.js"), "quotaProvider")
+        self.assertIn("mark until ", body)
+        self.assertIn("marked: no lift time recorded", body)
+
+    def test_operator_mark_passes_the_raw_epoch_to_the_reset_line(self):
+        # formatResetLine parses the epoch itself; handing it an
+        # already-parsed stamp multiplies by 1000 twice and reads
+        # years in the future.
+        body = function_body(web_text("views.js"), "quotaProvider")
+        self.assertIn("formatResetLine(mark.until, nowMs)", body)
+        self.assertNotIn("formatResetLine(until,", body)
+        self.assertNotIn("formatResetLine(liftAt,", body)
+
 
 class PlainLabels(unittest.TestCase):
     """Point 5: plain labels with one-line captions, tooltips for help."""

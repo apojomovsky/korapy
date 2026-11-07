@@ -298,6 +298,22 @@ function quotaProvider(name, info, nowMs) {
   }
   line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + read)));
   group.appendChild(line);
+  // The operator mark: a blocked provider names when the mark lifts,
+  // in local wall-clock time with the countdown, like the resets.
+  const mark = info.mark && typeof info.mark === "object" ? info.mark : null;
+  if (mark !== null) {
+    // formatResetLine parses the raw epoch itself; parsing here too
+    // would multiply by 1000 twice and read years in the future.
+    const liftAt = parseEpoch(mark.until);
+    group.appendChild(
+      el(
+        "p",
+        typeof liftAt === "number"
+          ? "mark until " + formatResetLine(mark.until, nowMs)
+          : "marked: no lift time recorded",
+      ),
+    );
+  }
   if (typeof info.error === "string" && info.error !== "") {
     group.appendChild(el("p", "reader error: " + info.error));
   }
