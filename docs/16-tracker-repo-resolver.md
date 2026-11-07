@@ -23,7 +23,7 @@ agreement test with a resolver guard. Non-goals: changing the
 drive-side short-to-tracker map (settled by the drive ticket:
 `repo_operators`, `root_short_map`, `production_repo_map`,
 `driven_repos`); changing short-name collision semantics across
-roots (section 4, a separate ticket); any new CLI verb or flag;
+roots (section 4, a separate ticket, #456); any new CLI verb or flag;
 any new exit code.
 
 ## 1. The problem
@@ -56,6 +56,9 @@ or `(None, problem)`. Explicit `tracker.repo` is validated with
 problem naming the entry) resolves against the root and the
 origin reads through `ghforge.origin_repo` (unparsable: a
 problem naming the path). No guessing, no fallback spelling.
+A second entry point takes the already-read origin URL (an
+`origin=` parameter) for callers that already ran `get-url`;
+both spellings share the parse-and-validate core (section 3).
 
 It lives in `syncli`, not `settings`: `syncli` already owns the
 `git(args, cwd)` seam shape and the forge-name validation, and
@@ -95,24 +98,32 @@ through; neither answers which tracker repo an entry feeds.
   `repo_operators`): already on the helper. Rename only.
 - PROPOSED `boarddoctor.sites_from_settings`: replaces
   `loaded["tracker.repo"] or name` with the helper, taking a
-  required keyword-only `git` seam (no default; production
-  passes `syncli._git`, tests a fake). A problem returns
-  `([], error)` naming the entry, the same channel as its
-  existing settings failures. No `BoardSite` shape change
-  (its `repo` comment admitting "or the entry name" goes
-  away with the fallback).
+  required keyword-only `git` seam (no default; tests pass a
+  fake). The production value arrives through the
+  `load_board_sites` threading below (`production_git`), so
+  one runner reaches the helper, not two. `syncli._git` and
+  `doctor.production_git` share that shape today; the
+  implementation either collapses them or justifies keeping
+  both. A problem returns `([], error)` naming the entry,
+  the same channel as its existing settings failures. No
+  `BoardSite` shape change (its `repo` comment admitting "or
+  the entry name" goes away with the fallback).
 - PROPOSED `doctor.load_board_sites` (the only production
   caller of `sites_from_settings`): takes the same required
   keyword-only `git` seam (no default) and threads it into
   `sites_from_settings`. The report-path call site
   `production_env` (`load_board_sites(settings_error)`) passes
-  `git=production_git`, the same runner `load_repo_sites`
-  receives two lines below, so there is no second default.
+  `git=production_git`, the same runner the `load_repo_sites`
+  call below receives, so there is no second default.
   Today `load_board_sites` calls `sites_from_settings` with
   no seam.
 - PROPOSED `doctor._repo_site`: replaces
   `resolved["tracker.repo"] or detect.remote_slug(origin)`
-  with the helper over its `git` seam. A problem becomes
+  with the helper over its `git` seam. `_repo_site` already
+  reads the origin URL once for its own row, so the helper
+  takes that already-read origin (an `origin=` parameter)
+  instead of running `get-url` a second time: one spawn per
+  repo and no window where two reads disagree. A problem becomes
   `RepoSite(name, origin_or_None, cause=problem)`, a warn row
   under the existing never-raise contract. Explicit values
   gain the `is_repo_name` check, so a malformed explicit
@@ -126,9 +137,11 @@ through; neither answers which tracker repo an entry feeds.
   naming the entry, and the two unreadable-origin entries
   warn naming the path and the reason.
 - Reviewed, no change: `mergecli`, `reviewcli` and `gccli`
-  call `ghforge.origin_repo(os.getcwd(), ...)` for the forge
-  repo of the working clone (where to open a PR, which repo
-  this clone is), a different fact from what an entry feeds.
+  call `ghforge.origin_repo` for the forge repo of a working
+  clone (`mergecli` and `reviewcli` pass `os.getcwd()`;
+  `gccli` passes its repo dir): where to open a PR, which
+  repo this clone is. That is a different fact from what an
+  entry feeds.
   `reviewrecord.local_repo` translates spellings downstream
   of the map. `takeoff` consumes the map.
 
@@ -138,7 +151,7 @@ Across registered roots `production_repo_map` keeps the first
 project naming a short name (`setdefault`), while
 `driven_repos` keeps each root's own set, so two projects
 sharing a short name each still drive their own tracker repos.
-That asymmetry is deliberate and a separate ticket owns it.
+That asymmetry is deliberate and a separate ticket (#456) owns it.
 This design is out of that scope: it must not change collision
 semantics, and the agreement test uses distinct short names
 (or pins first-winner explicitly where multi-root). After the
@@ -160,8 +173,9 @@ git seam, no network, no real clones:
    helper returns a problem; doctor yields a warn row with
    that cause; boarddoctor returns `([], error)`; the drive
    map raises `SettingsError`.
-3. Explicit `tracker.repo` set: all callers agree without
-   the git seam running (fake asserts no calls).
+3. Explicit `tracker.repo` set: all callers agree and the
+   helper makes no git call (the fake asserts none;
+   `_repo_site` still reads the origin for its own row).
 4. A resolver guard in the style of
    `test_drive_resolver_guard.py`: parsing `src/korapy`
    fails on any `["tracker.repo"] or` fallback outside the
@@ -178,23 +192,29 @@ reporting a guessed short-name site (now an error naming the
 entry) and doctor stops reporting a guessed origin-slug site
 (now a warn row with the cause). Both new readings name the
 entry and the reason, and both travel existing error channels,
-so no caller needs a new branch. No exit code changes: 4 is
-already the configuration-error code on the strict paths, and
-doctor rows already warn.
+so no production caller needs a new branch. The required
+`git` seam does touch test call sites: the five
+`sites_from_settings(root, env=...)` calls in
+`tests/test_board_doctor.py` pass a fake `git`. No exit code
+changes: 4 is already the configuration-error code on the
+strict paths, and doctor rows already warn.
 
 ## 7. Implementation tickets
 
-One ticket moves the helper (rename, public, same contract),
-one per doctor caller: `sites_from_settings` plus its sole
-caller `load_board_sites` threading the required `git` seam,
-plus the report-path call site `production_env` passing
-`git=production_git` (the same runner `load_repo_sites`
-receives two lines below, so there is no second default),
-and `_repo_site` (helper delegation plus the three silent
-branches), plus the agreement test and guard above. Docs
-freshness: no user-visible surface changes, so `commands.md`,
-`configuration.md`, the guide and the README stay as they
-are; this doc is the record.
+One ticket moves the helper (rename, public, same contract,
+plus the `origin=` single-read entry point), one per doctor
+caller: `sites_from_settings` plus its sole caller
+`load_board_sites` threading the required `git` seam, plus
+the report-path call site `production_env` passing
+`git=production_git` (the same runner the `load_repo_sites`
+call below receives, so there is no second default), and
+`_repo_site` (helper delegation plus the three silent
+branches), plus the agreement test and guard above, plus
+updating the five `sites_from_settings(root, env=...)` test
+call sites in `tests/test_board_doctor.py` to pass a fake
+`git`. Docs freshness: no user-visible surface changes, so
+`commands.md`, `configuration.md`, the guide and the README
+stay as they are; this doc is the record.
 
 Options:
 1. syncli helper, fail closed to exit 4 (recommended)
