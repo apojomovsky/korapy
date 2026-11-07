@@ -417,9 +417,8 @@ function resourceDim(labelText, abbrTitle, valueText, frac, help) {
   const shown = document.createElement("dd");
   shown.appendChild(document.createTextNode(cleanText(valueText)));
   if (frac !== null) {
-    const state = frac < 0.7 ? "ok" : frac < 0.9 ? "low" : "high";
     const barRow = document.createElement("div");
-    barRow.appendChild(meter(frac, state, labelText));
+    barRow.appendChild(meter(frac, bandFor(frac), labelText));
     shown.appendChild(barRow);
   }
   wrap.appendChild(shown);
@@ -433,16 +432,15 @@ function resourceDim(labelText, abbrTitle, valueText, frac, help) {
 // share as a tick inside. `term` builds the dt node (CPU keeps its
 // abbreviation), `help` is the tooltip, `fracText` the numbers line,
 // `frac` the bar, `marker` the tick, `reserved` the reservation line.
-function hostGauge(term, help, fracText, frac, label, marker, reserved, overloaded) {
+// Severity rides the bar band; overload itself is the server's
+// `saturated` verdict in the attention band, never a second cut here.
+function hostGauge(term, help, fracText, frac, label, marker, reserved) {
   const wrap = document.createElement("div");
   wrap.setAttribute("class", "field");
   wrap.setAttribute("title", help);
   wrap.appendChild(term);
   const shown = document.createElement("dd");
   shown.appendChild(document.createTextNode(cleanText(fracText)));
-  if (overloaded) {
-    shown.appendChild(document.createTextNode(" overloaded: load above 1 per core"));
-  }
   const barRow = document.createElement("div");
   barRow.appendChild(meter(frac, frac === null ? "unknown" : bandFor(frac), label, marker));
   shown.appendChild(barRow);
@@ -487,7 +485,6 @@ function cpuGauge(pressure, charged) {
     budgetCpu === null || budgetCpu === undefined
       ? "reserved for agents: not reported"
       : "reserved for agents: " + formatCpu(budgetCpu) + " of the host",
-    load !== null && load > 1,
   );
 }
 
@@ -519,7 +516,6 @@ function memoryGauge(pressure, charged) {
     budgetMem === null || budgetMem === undefined
       ? "reserved for agents: not reported"
       : "reserved for agents: " + formatMem(budgetMem) + " of the host",
-    false,
   );
 }
 
@@ -695,7 +691,7 @@ function diskCard(disk) {
     } else if (item && typeof item.total === "number" && item.total > 0) {
       const used = typeof item.used === "number" ? item.used / item.total : null;
       if (used !== null) {
-        row.appendChild(meter(used, used >= 0.9 ? "high" : "ok", String(item.path)));
+        row.appendChild(meter(used, bandFor(used), String(item.path)));
         row.appendChild(document.createTextNode(" "));
       }
       row.appendChild(
@@ -751,10 +747,18 @@ function driveCard(drive, nowMs) {
       ),
     );
   } else {
+    // A missing lock reading is not reported, never a healthy idle:
+    // the adjacent last-pass age is the signal when the lock is mute.
+    const lock =
+      info.lock_held === true
+        ? "running: a pass holds the lock"
+        : info.lock_held === false
+          ? "running"
+          : "not reported";
     section.appendChild(
       field(
         "Status",
-        info.lock_held ? "running: a pass holds the lock" : "running",
+        lock,
         "The loop is active: each pass syncs boards, claims tickets and starts agents.",
       ),
     );
@@ -1172,7 +1176,7 @@ function headerLine(header) {
   const finished =
     typeof info.agents_finished === "number" && Number.isFinite(info.agents_finished)
       ? info.agents_finished
-      : 0;
+      : null;
   const section = card("fleet", desc);
   section.setAttribute("class", "card strip");
   const line = document.createElement("p");
@@ -1182,7 +1186,9 @@ function headerLine(header) {
   line.appendChild(count);
   line.appendChild(document.createTextNode(cleanText(", " + stale)));
   section.appendChild(line);
-  if (finished > 0) {
+  if (finished === null) {
+    section.appendChild(el("p", "finished not reported"));
+  } else if (finished > 0) {
     const box = document.createElement("details");
     box.setAttribute("class", "finished");
     const head = document.createElement("summary");

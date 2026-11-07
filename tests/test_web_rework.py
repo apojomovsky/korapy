@@ -14,8 +14,9 @@ import re
 import tempfile
 import unittest
 from importlib import resources
+from pathlib import Path
 
-from korapy import serve
+from korapy import serve, snapshot
 from tests.test_serve import ServeCase
 
 
@@ -66,6 +67,10 @@ class Strip(unittest.TestCase):
     def test_stopped_gate_degrades_the_strip_to_unknown(self):
         body = function_body(web_text("views.js"), "renderStopped")
         self.assertIn("renderStrip(null", body)
+
+    def test_fleet_card_reports_a_missing_finished_count(self):
+        body = function_body(web_text("views.js"), "headerLine")
+        self.assertIn("finished not reported", body)
 
 
 class AgentsFirst(unittest.TestCase):
@@ -179,6 +184,15 @@ class AttentionBand(unittest.TestCase):
     def test_attention_card_leads_the_overview(self):
         body = function_body(web_text("views.js"), "renderOverview")
         self.assertIn("attentionCard(doc", body)
+
+
+class DriveLock(unittest.TestCase):
+    """A missing lock reading is not reported, never a healthy idle."""
+
+    def test_absent_lock_does_not_default_to_running(self):
+        body = function_body(web_text("views.js"), "driveCard")
+        self.assertIn("info.lock_held === true", body)
+        self.assertIn("info.lock_held === false", body)
 
 
 class Retention(unittest.TestCase):
@@ -306,6 +320,29 @@ class FixtureMode(ServeCase):
             path = self.write_fixture(tmp, "[1, 2]")
             with self.assertRaises(serve.ServeError):
                 serve.fixture_build(path)
+
+
+class FixtureContract(unittest.TestCase):
+    """The committed fixture stays a usable gauge source of truth."""
+
+    @staticmethod
+    def fixture():
+        root = Path(__file__).resolve().parent.parent
+        with open(root / "docs" / "assets" / "dashboard-fixture.json", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_fixture_matches_the_snapshot_schema(self):
+        doc = self.fixture()
+        self.assertEqual(doc["schema_version"], snapshot.SCHEMA_VERSION)
+
+    def test_fixture_carries_every_gauge_input(self):
+        doc = self.fixture()
+        pressure = doc["resources"]["pressure"]
+        for key in ("ncpu", "load_1min", "mem_total_mb", "mem_available_mb", "load_per_cpu"):
+            self.assertIsInstance(pressure[key], (int, float), key)
+        self.assertTrue(doc["agents"])
+        self.assertTrue(doc["quota"]["providers"])
+        self.assertTrue(doc["disk"]["paths"])
 
 
 class FixtureFlag(unittest.TestCase):

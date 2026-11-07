@@ -973,30 +973,12 @@ def _first_float(text):
         return None
 
 
-def _meminfo_pct(text):
-    """MemAvailable over MemTotal as a percent, or None when missing."""
-    if not isinstance(text, str):
-        return None
-    fields = {}
-    for line in text.splitlines():
-        key, _, value = line.partition(":")
-        fields[key.strip()] = value.strip().split()
-    try:
-        total = float(fields["MemTotal"][0])
-        available = float(fields["MemAvailable"][0])
-    except (KeyError, ValueError, IndexError):
-        return None
-    if total <= 0:
-        return None
-    return round(available / total * 100, 1)
+def _meminfo_kb(text):
+    """`(total_kb, available_kb)` from meminfo text, or None when missing.
 
-
-def _meminfo_mb(text):
-    """`(total_mb, available_mb)` from meminfo text, or None when missing.
-
-    The one reader for the absolute host memory the dashboard memory
-    gauge divides by; the percent stays with `_meminfo_pct`, so each
-    field keeps its own resolver.
+    The one parser for the host memory facts: the percent and the
+    absolute megabytes both divide from this reading, so the pressure
+    line and the dashboard gauge can never disagree on garbage.
     """
     if not isinstance(text, str):
         return None
@@ -1011,6 +993,28 @@ def _meminfo_mb(text):
         return None
     if total <= 0 or available < 0:
         return None
+    return (total, available)
+
+
+def _meminfo_pct(text):
+    """MemAvailable over MemTotal as a percent, or None when missing."""
+    absolute = _meminfo_kb(text)
+    if absolute is None:
+        return None
+    total, available = absolute
+    return round(available / total * 100, 1)
+
+
+def _meminfo_mb(text):
+    """`(total_mb, available_mb)` from meminfo text, or None when missing.
+
+    The one reader for the absolute host memory the dashboard memory
+    gauge divides by; both it and the percent read one parser.
+    """
+    absolute = _meminfo_kb(text)
+    if absolute is None:
+        return None
+    total, available = absolute
     return (round(total / 1024, 1), round(available / 1024, 1))
 
 

@@ -260,10 +260,10 @@ class VisualPass(unittest.TestCase):
         self.assertIn("@media (max-width: 700px)", css)
 
     def test_full_disk_reads_high_like_full_budget(self):
-        # A disk past 90% full and a budget past 90% charged share one
-        # threshold and one word, so full never reads as low usage.
+        # Disk bars band through the same cuts as every other bar, so
+        # full never reads as low usage and NaN never reads as healthy.
         views = web_text("views.js")
-        self.assertIn('>= 0.9 ? "high"', views)
+        self.assertIn("meter(used, bandFor(used),", views)
 
     def test_no_second_poll_loop_appears(self):
         app = web_text("app.js")
