@@ -1170,6 +1170,28 @@ def _project_quota(project, pool):
     )
 
 
+def union_quota_chains(registered, pool):
+    """Union of every registered project's quota chains, for the refresh age.
+
+    The refresh threshold derives from the strictest stale bound over
+    this union (see `quota.refresh_after_for`). A project whose
+    profiles fail to validate is skipped here; the gate rebuilds it
+    the same way and reports the problem there.
+    """
+    union: dict[str, list[str]] = {}
+    for project in registered or ():
+        try:
+            source = _project_quota(project, pool)
+        except settings.SettingsError:
+            continue
+        for role, chain in source.chains.items():
+            entries = union.setdefault(role, [])
+            for entry in chain or ():
+                if entry not in entries:
+                    entries.append(entry)
+    return union
+
+
 def stale_quota_providers(pool, ledger, now, *, refresh_after_s) -> list:
     """Names in pool order whose ledger entry needs a fresh read. Pure.
 
@@ -4764,9 +4786,10 @@ def _launching_pass(
     pass with exit 4 naming the repo.
     `quota_refresh_after_s` re-reads every provider
     whose ledger entry is older than that many seconds through the
-    reader seam before gating, once per pass, so admission and the
-    dashboard see a fresh ledger; with none no reader runs, exactly as
-    before. Failures record like the `quota refresh` verb and print
+    reader seam at the start of the pass, before the sync, once per
+    pass, so admission and the dashboard see a fresh ledger even when
+    the sync fails; with none no reader runs, exactly as before.
+    Failures record like the `quota refresh` verb and print
     one line each, and never change the exit code.
     `quota_load_reader` builds the readers (None loads them the way
     the verb does); the refreshed ledger persists through the ledger
@@ -4813,6 +4836,49 @@ def _launching_pass(
 
     if journal_path is not None:
         journal_write({"event": "pass_start", "at": now, "host": host or ""})
+    if quota_refresh_after_s is not None:
+        if pool is None:
+            try:
+                pool = accounts.providers()
+            except accounts.AccountsError as problem:
+                print(f"korapy drive: {problem}", file=err)
+                return finish(USAGE)
+        if pool:
+            loader = quota_load_reader if quota_load_reader is not None else accounts.load_reader
+            quota_results: dict = {}
+            if ledger is None:
+
+                def _quota_change(stored):
+                    updated, seen = refresh_stale(
+                        pool,
+                        stored,
+                        now,
+                        refresh_after_s=quota_refresh_after_s,
+                        load_reader=loader,
+                    )
+                    quota_results.update(seen)
+                    return updated if seen else None
+
+                try:
+                    ledger = quota_ledger.update(_quota_change)
+                except (quota_ledger.LedgerError, OSError) as problem:
+                    print(f"korapy drive: cannot refresh quota ({problem})", file=err)
+            else:
+                try:
+                    ledger, seen = refresh_stale(
+                        pool,
+                        ledger,
+                        now,
+                        refresh_after_s=quota_refresh_after_s,
+                        load_reader=loader,
+                    )
+                except Exception as problem:  # noqa: BLE001 - quota never stops the pass
+                    print(f"korapy drive: cannot refresh quota ({problem})", file=err)
+                else:
+                    quota_results.update(seen)
+            for name, (ok, detail) in quota_results.items():
+                if not ok:
+                    print(f"korapy drive: quota {name}: {detail}", file=err)
     try:
         (
             seen,
@@ -4884,42 +4950,6 @@ def _launching_pass(
         quota_for,
         pool,
     ) = ctx
-    if quota_refresh_after_s is not None and pool:
-        loader = quota_load_reader if quota_load_reader is not None else accounts.load_reader
-        quota_results: dict = {}
-        if ledger is None:
-
-            def _quota_change(stored):
-                updated, seen = refresh_stale(
-                    pool,
-                    stored,
-                    now,
-                    refresh_after_s=quota_refresh_after_s,
-                    load_reader=loader,
-                )
-                quota_results.update(seen)
-                return updated if seen else None
-
-            try:
-                ledger_data = quota_ledger.update(_quota_change)
-            except (quota_ledger.LedgerError, OSError) as problem:
-                print(f"korapy drive: cannot refresh quota ({problem})", file=err)
-        else:
-            try:
-                ledger_data, seen = refresh_stale(
-                    pool,
-                    ledger_data,
-                    now,
-                    refresh_after_s=quota_refresh_after_s,
-                    load_reader=loader,
-                )
-            except Exception as problem:  # noqa: BLE001 - quota never stops the pass
-                print(f"korapy drive: cannot refresh quota ({problem})", file=err)
-            else:
-                quota_results.update(seen)
-        for name, (ok, detail) in quota_results.items():
-            if not ok:
-                print(f"korapy drive: quota {name}: {detail}", file=err)
     day_today = None
     day_used = 0
     start_budget = None
@@ -5319,8 +5349,8 @@ def run_pass(
     listing calls (None reads the `drive.pulls_max_calls` host
     setting); a capped pass prints "pulls lookup limited" and refuses
     the unchecked starts. `quota_refresh_after_s`
-    re-reads stale quota before gating in the non-plan pass only;
-    `--plan` never takes it, so a dry run runs no reader.
+    re-reads stale quota at the start of the non-plan pass, before the
+    sync, only; `--plan` never takes it, so a dry run runs no reader.
     `quota_load_reader` builds those readers. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
