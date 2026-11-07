@@ -99,21 +99,24 @@ Loop (`drive.py`): PROPOSED pure helper
 `_review_missing`, sharing its inputs plus the reprompt mark;
 PROPOSED planning step that turns a `review-missing` skip
 with no mark into one resume request carrying the exact
-command (commit pinned to the newest head read at plan time,
-the same head `merge --plan` checks; author pinned per the
-review launch rule below; verdict left to the reviewer). All
-three head reads, the plan-time pin, the pre-resume
-revalidation and the post-resume revalidation, go through
-`mergeup.resolve_commit("HEAD", cwd)` in the ticket
-checkout, the same resolver `reviewcli.py` uses for the
-record's `--commit`; `drive.py` resolves no head today, so
-the resume path adds no second resolver for the head fact.
-The head is re-validated newest == pinned immediately
-before the resume request and again after the resume
-returns: when the head moved, no resume is spent, the skip
-stands, and the ticket waits for a fresh review of the new
-head, so the one resume never burns on a record that cannot
-unblock the gate.
+command (commit pinned to the ticket branch tip read fresh
+from the remote at plan time, the same tip `merge --plan`
+compares against `pr.head_sha`; author pinned per the
+review launch rule below; verdict left to the reviewer).
+Freshness comes first: the plan reads the tip with
+`git ls-remote origin refs/heads/<branch>` through the
+existing injectable git seam (the
+`takeoff.production_ls_remote` shape, in the main clone),
+still zero tracker or forge calls, and passes it as a full
+SHA so `reviewcli._commit` takes it verbatim. All three tip
+reads, the plan-time pin, the pre-resume revalidation and
+the post-resume revalidation, go through that same seam;
+`drive.py` reads no remote tip today, so the resume path
+adds no second resolver for the tip fact. When the tip
+cannot be read, or the tip moved between reads, no resume
+is spent, the skip stands, and the ticket waits for a fresh
+review of the new tip, so the one resume never burns on a
+record that cannot unblock the gate.
 The resume goes through the existing `launch.resume` seam
 with role reviewer (read-only preserved), so runtimes need no
 new interface (`resume_handle` already exists per runtime).
@@ -135,9 +138,13 @@ self-review, which `write_record` refuses.
 Mark: PROPOSED one empty marker file per reprompted reviewer
 session inside that session's own leaf,
 `os.path.join(paths.role_session_dir(repo, number,
-"reviewer", gen), ".reprompted")` with `gen` the reprompted
-reviewer session's generation, resolved only through `paths`
-like every other session path. A file directly under the
+"reviewer", gen), ".reprompted")` with `gen` from
+`units.parse_unit` of the finished unit name, the one
+resolver for the unit-name fact. A unit name that does not
+parse (the capture drive-id flavor, which `parse_unit`
+refuses) is an explicit no-resume branch with the skip
+standing, so no caller ever defaults to `gen=0` and marks
+the wrong leaf. A file directly under the
 ticket root is refused: `paths._legacy_session` reads any
 direct child file as a legacy generation-0 session, so every
 reprompted ticket would gain a phantom
@@ -212,9 +219,13 @@ resume requests none and keeps the skip for a fresh review;
 resume success plus a record written by the fake reviewer
 clears the skip; resume refusal keeps the skip and the log
 line; an unwritable mark keeps the skip with no resume and
-no failed pass. Author cases request no resume and keep the
-skip: no finished id at all, an unknown role or outcome, and
-a fallback that still names the finished reviewer itself.
+no failed pass. A fake git seam where the remote tip (B)
+differs from the plan-time pin (A), or cannot be read at
+all, requests no resume and keeps the skip. Author cases
+request no resume and keep the skip: no finished id at all,
+an unknown role or outcome, a fallback that still names the
+finished reviewer itself, and an unparseable generation
+(`units.parse_unit` returns None for the drive-id flavor).
 The mid-resume race lands the original session's record
 during the resume and resolves by create-exclusive
 first-wins (`write_record`: a retry with the same reviewer
