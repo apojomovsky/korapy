@@ -622,7 +622,9 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
     stops the slice by hand. A zero share applies nothing either, and no
     launch ever reconciles it, so its fix names only the hand stop.
     Mixed drift names the project a launch still reconciles and sends
-    the zero-share slice to a hand stop.
+    the zero-share slice to a hand stop. When no drifted slice names
+    a project a launch reconciles, the fix keeps the generic launch
+    advice and still names the hand stop for the zero-share slice.
     """
     if state.host is None or state.limits_error is not None:
         return None
@@ -697,6 +699,12 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
                 fix = (
                     f"launch an agent of {', '.join(runnable)},"
                     " then run `korapy doctor` again"
+                    " (a cleared budget applies nothing: stop the slice by hand;"
+                    " the zero-share slice needs a hand stop)"
+                )
+            else:
+                fix = (
+                    "launch an agent of that project, then run `korapy doctor` again"
                     " (a cleared budget applies nothing: stop the slice by hand;"
                     " the zero-share slice needs a hand stop)"
                 )
