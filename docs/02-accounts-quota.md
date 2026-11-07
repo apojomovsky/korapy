@@ -87,16 +87,20 @@ korapy checks every chain entry against the pool. An unknown provider is a confi
 Nobody runs `korapy quota refresh` by hand on a schedule, so the
 dispatch pass does it: every non-plan pass re-reads each provider
 whose last attempt (a successful `read_at` or a recorded failure's
-`at`) is older than the `quota.refresh_after_s` setting (default 900
-seconds), through the same reader seam and the same record-or-failure
-recording the verb uses, at most once per provider per pass. The
-refresh runs before gating, so admission and the dashboard see the
-fresh ledger in the same pass. A reader that fails or times out
-records its trimmed error and prints one line; it never blocks or
-crashes the pass, and the exit code never changes because of it. The
-pass persists the refreshed ledger through the ledger lock only when
-it loaded the ledger itself; `--plan` runs no reader at all. A stale
-reading keeps the admission behavior it always had
+`at`) is older than the pass's refresh age, through the same reader
+seam and the same record-or-failure recording the verb uses, at most
+once per provider per pass. The refresh age is half the strictest
+`stale_after` bound over the projects' chains, so a reading
+refreshes well before it counts stale; the `quota.refresh_after_s`
+setting (default 900 seconds) is an explicit override only and wins
+when set. The refresh runs at the start of the pass, before the
+sync, so admission and the dashboard see the fresh ledger in the
+same pass even when the sync is slow or fails. A reader that fails
+or times out records its trimmed error and prints one line; it never
+blocks or crashes the pass, and the exit code never changes because
+of it. The pass persists the refreshed ledger through the ledger
+lock only when it loaded the ledger itself; `--plan` runs no reader
+at all. A stale reading keeps the admission behavior it always had
 (`quota.unknown_blocks`); the refresh only makes the reading younger.
 
 Every view names each reading's age and, when it is stale, why:
