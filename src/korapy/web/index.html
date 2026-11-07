@@ -16,6 +16,7 @@
 <button id="token-btn" type="button">token</button>
 </header>
 <div id="banner" role="alert" hidden></div>
+<div id="strip" role="status" aria-label="fleet status">starting</div>
 <nav id="tabs" aria-label="views"></nav>
 <nav id="chips" aria-label="project filter"></nav>
 <main id="view" aria-live="off">
@@ -24,8 +25,8 @@
 <h1>dashboard</h1>
 <p id="status-line">loading server details</p>
 </section>
-<section id="cards" aria-label="fleet status"></section>
 <section id="agents" aria-label="agents"></section>
+<section id="cards" aria-label="fleet status"></section>
 <section id="detail" aria-label="agent detail" hidden>
 <p><a id="detail-back" href="#/">back to the overview</a></p>
 <div id="detail-fields" aria-label="agent fields"></div>
@@ -37,6 +38,13 @@
 <p id="tail-state" role="status"></p>
 </section>
 <section id="board" aria-label="board" hidden></section>
+<section id="help" aria-label="keyboard shortcuts" hidden>
+<h2>keys</h2>
+<p>j / k move between agent rows, Enter opens the row, / focuses the agent filter, ? shows this panel. Every key also works by click.</p>
+<div>
+<button id="help-close" type="button">close</button>
+</div>
+</section>
 <section id="token" aria-label="api token" hidden>
 <h2>api token</h2>
 <p id="token-help">Paste the API token for this server, then save.</p>
@@ -49,6 +57,7 @@
 </div>
 </section>
 </main>
+<div id="toasts" aria-live="polite" aria-label="notifications"></div>
 <script type="module" src="/ui/app.js"></script>
 </body>
 </html>

@@ -12,6 +12,7 @@
   --low: #9a6700;
   --high: #b42318;
   --stale: #715f00;
+  --live-bg: #e9f4ec;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -28,6 +29,7 @@
     --low: #d4a017;
     --high: #ff7b72;
     --stale: #c9a227;
+    --live-bg: #1e2f24;
   }
 }
 
@@ -481,6 +483,89 @@ table.agents td.id a {
   * {
     transition: none;
   }
+}
+
+/* The status strip: one line, always visible, stuck to the top while
+the cards scroll under it. Text carries the state, never color alone. */
+#strip {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  padding: 0.5rem 1rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+/* The agent filter: a label and a search box above the table. */
+.agent-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+
+.agent-filter input {
+  flex: 1 1 16rem;
+  min-height: 44px;
+  padding: 0.5rem;
+  font: inherit;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+/* Live rows carry a tint; the state word beside it keeps the
+meaning off color alone. */
+table.agents tbody tr[data-state="live"] {
+  background: var(--live-bg);
+}
+
+/* Keyboard and click selection share one outline. */
+table.agents tbody tr.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* The finished rows read as history: dimmed, never hidden. */
+details.finished table.agents {
+  opacity: 0.75;
+}
+
+/* Toasts: small confirmations bottom right, never in the footer. */
+#toasts {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: min(24rem, calc(100vw - 2rem));
+}
+
+.toast {
+  padding: 0.5rem 0.75rem;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+}
+
+/* The keyboard help panel reads as a card in the flow. */
+#help {
+  margin: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+#help[hidden] {
+  display: none;
 }
 
 @media (max-width: 700px) {

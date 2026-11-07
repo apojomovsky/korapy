@@ -308,12 +308,12 @@ class SourceDiscipline(unittest.TestCase):
         self.assertNotIn("<style", text)
         self.assertIsNone(re.search(r"\son\w+\s*=", text))
 
-    def test_only_the_token_key_touches_storage(self):
+    def test_only_the_token_and_snapshot_cache_touch_storage(self):
         found = set()
         for name in ("app.js", "api.js", "fmt.js", "views.js"):
             text = web_bytes(name).decode("utf-8")
             found.update(re.findall(r"korapy\.[A-Za-z_]+", text))
-        self.assertEqual(found, {"korapy.token"})
+        self.assertEqual(found, {"korapy.token", "korapy.snapshot"})
 
     def test_volatile_keys_match_the_server(self):
         text = web_bytes("fmt.js").decode("utf-8")
@@ -326,12 +326,15 @@ class SourceDiscipline(unittest.TestCase):
         self.assertEqual(names, set(serve.VOLATILE_KEYS))
 
     def test_bundle_stays_small(self):
+        # Ticket 642 grew the page (strip, attention, gauges, filter,
+        # keyboard, toasts, cache) and the caps with it: 75 KB a file,
+        # 150 KB total, still no framework, no build step, no images.
         total = 0
         for name in WEB_FILES:
             size = len(web_bytes(name))
-            self.assertLessEqual(size, 60 * 1024, name)
+            self.assertLessEqual(size, 75 * 1024, name)
             total += size
-        self.assertLessEqual(total, 120 * 1024)
+        self.assertLessEqual(total, 150 * 1024)
 
     def test_poll_backoff_table_is_pinned(self):
         text = web_bytes("api.js").decode("utf-8")
@@ -472,9 +475,10 @@ class SourceDiscipline(unittest.TestCase):
     def test_compare_and_skip_has_one_stable_path(self):
         app = web_bytes("app.js").decode("utf-8")
         self.assertIn("canonicalJson(stripVolatile(reply.data))", app)
-        # Two render sites: the poll compare path and the hashchange
-        # filter re-render over the last good payload, never a third.
-        self.assertEqual(app.count("renderOverview("), 2)
+        # Three render sites: the poll compare path, the hashchange
+        # filter re-render over the last good payload, and the boot
+        # saved-copy render before the first poll, never a fourth.
+        self.assertEqual(app.count("renderOverview("), 3)
 
     def test_shell_schema_expectation_matches_the_server(self):
         from korapy import snapshot

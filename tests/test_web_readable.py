@@ -157,10 +157,10 @@ class ResourceBars(unittest.TestCase):
         self.assertIn("millicores", fmt)
         self.assertIn("cores", fmt)
 
-    def test_resources_card_explains_charged_vs_measured(self):
+    def test_resources_card_explains_reserved_vs_measured(self):
         views = web_text("views.js")
-        self.assertIn("Charged is what admission reserved", views)
-        self.assertIn("measured is what", views)
+        self.assertIn("the tick inside is the share the loop reserved", views)
+        self.assertIn("measured use where the kernel reports it", views)
 
     def test_bare_field_names_are_replaced_by_labels(self):
         views = web_text("views.js")
@@ -205,7 +205,8 @@ class SectionHelp(unittest.TestCase):
             "Agents on this host right now.",
             "What the providers last reported.",
             "How many agents this host may run.",
-            "Charged is what admission reserved for live agents",
+            "The host as the kernel reports it.",
+            "Only items that need a human.",
             "Free space on the state and cache disks.",
             "The drive pass: sync boards, claim tickets, start agents.",
         ):
