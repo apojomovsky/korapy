@@ -101,12 +101,19 @@ PROPOSED planning step that turns a `review-missing` skip
 with no mark into one resume request carrying the exact
 command (commit pinned to the newest head read at plan time,
 the same head `merge --plan` checks; author pinned per the
-review launch rule below; verdict left to the reviewer). The
-head is re-validated newest == pinned immediately before the
-resume request and again after the resume returns: when the
-head moved, no resume is spent, the skip stands, and the
-ticket waits for a fresh review of the new head, so the one
-resume never burns on a record that cannot unblock the gate.
+review launch rule below; verdict left to the reviewer). All
+three head reads, the plan-time pin, the pre-resume
+revalidation and the post-resume revalidation, go through
+`mergeup.resolve_commit("HEAD", cwd)` in the ticket
+checkout, the same resolver `reviewcli.py` uses for the
+record's `--commit`; `drive.py` resolves no head today, so
+the resume path adds no second resolver for the head fact.
+The head is re-validated newest == pinned immediately
+before the resume request and again after the resume
+returns: when the head moved, no resume is spent, the skip
+stands, and the ticket waits for a fresh review of the new
+head, so the one resume never burns on a record that cannot
+unblock the gate.
 The resume goes through the existing `launch.resume` seam
 with role reviewer (read-only preserved), so runtimes need no
 new interface (`resume_handle` already exists per runtime).
@@ -126,20 +133,31 @@ cross-pass unit name versus capture drive id) would record a
 self-review, which `write_record` refuses.
 
 Mark: PROPOSED one empty marker file per reprompted reviewer
-session inside the ticket dir,
-`os.path.join(paths.ticket_session_dir(repo, number),
-".reprompted-reviewer-<gen>")`, resolved only through
-`paths` like every other session path. It sits beside
-`reviews/`, never inside it, so `latest_record` never sees
-it; as a plain file it is ignored by `_role_leaves` (only
-`<role>-<gen>` dirs with a prompt count) and it inherits the
-ticket dir's dir-granular gc proofs, leaving with the ticket
-dir. The mark is written before the resume is requested; a
-crash between mark and spawn reads as "already reprompted"
-and fails closed to today's skip. A mark that cannot be
-written also fails closed: the skip stands, no resume is
-requested, the pass never crashes and never reprompts
-without a mark.
+session inside that session's own leaf,
+`os.path.join(paths.role_session_dir(repo, number,
+"reviewer", gen), ".reprompted")` with `gen` the reprompted
+reviewer session's generation, resolved only through `paths`
+like every other session path. A file directly under the
+ticket root is refused: `paths._legacy_session` reads any
+direct child file as a legacy generation-0 session, so every
+reprompted ticket would gain a phantom
+`Session(ticket-root, worker-default, 0)` from
+`ticket_sessions`, and `launch._leaves` would union that
+phantom worker leaf into stop and close-previous. Inside the
+leaf the mark changes neither half of `ticket_sessions`:
+`_legacy_session` lists only the ticket root's direct
+children, and `_role_leaves` still sees the same
+`<role>-<gen>` dir with its prompt; `latest_record` scans
+only `reviews/`, so it never sees the mark. The mark leaves
+with the leaf under the existing session gc proofs, and a
+resume preserves it (the prompt and config are rewritten in
+place), so the post-resume pass still reads "already
+reprompted" and never spends a second resume. The mark is
+written before the resume is requested; a crash between mark
+and spawn reads as "already reprompted" and fails closed to
+today's skip. A mark that cannot be written also fails
+closed: the skip stands, no resume is requested, the pass
+never crashes and never reprompts without a mark.
 
 ## 4. Exit codes, settings, failing closed
 
@@ -194,7 +212,18 @@ resume requests none and keeps the skip for a fresh review;
 resume success plus a record written by the fake reviewer
 clears the skip; resume refusal keeps the skip and the log
 line; an unwritable mark keeps the skip with no resume and
-no failed pass. Runtime side: fake `resume_handle` per
+no failed pass. Author cases request no resume and keep the
+skip: no finished id at all, an unknown role or outcome, and
+a fallback that still names the finished reviewer itself.
+The mid-resume race lands the original session's record
+during the resume and resolves by create-exclusive
+first-wins (`write_record`: a retry with the same reviewer
+and verdict is a no-op, anything else is refused), so the
+gate reads the winner and never a duplicate. Mark placement
+tests use a fake sessions root: with `.reprompted` inside
+the reviewer leaf, `paths._legacy_session` stays false and
+`paths.ticket_sessions` returns the same leaves as without
+the mark. Runtime side: fake `resume_handle` per
 runtime, reviewer stays read-only after resume (existing
 launch guarantee). No test touches the network, a real
 session dir, or a live unit; the suite guard keeps it
