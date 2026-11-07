@@ -1342,23 +1342,30 @@ def _review_missing(holder, newest, reviews, key) -> bool:
     )
 
 
-def missing_review_records(finished, reviews, rows) -> list:
+def missing_review_records(finished, reviews, rows, *, driven=None) -> list:
     """[(repo, number, agent)] finished reviewers (outcome ok) with no record. Pure.
 
     `finished` is the newest finished entry per ticket, `reviews` the
     latest record per ticket, `rows` the {(repo, number): row} map with
     the pass's releases applied. Only rows the gate could have skipped
     as `review-missing` list: the row must be known, open, internally
-    owned and unheld, so a kept claim (a live unit, a failed release
-    write), a non-open or externally owned row, and a ticket with no
-    row never log. With no review map (`reviews` None) the check cannot
-    run and nothing is missing. A non-`ok` outcome is not a protocol
-    failure and never lists. Sorted for a stable once-per-pass log line.
+    owned, unheld, and in a repository some registered project drives,
+    so a kept claim (a live unit, a failed release write), a non-open
+    or externally owned row, a row outside every project's
+    repositories, and a ticket with no row never log. With no review
+    map (`reviews` None) the check cannot run and nothing is missing.
+    A non-`ok` outcome is not a protocol failure and never lists.
+    `driven` is the pass's {project name: tracker repos it drives} map;
+    with None every repo reads as driven, so unscoped callers keep
+    today's behavior. Sorted for a stable once-per-pass log line.
     """
     if finished is None or reviews is None:
         return []
+    union = None if driven is None else _driven_union(driven)
     found = []
     for (repo, number), newest in finished.items():
+        if union is not None and repo not in union:
+            continue
         row = (rows or {}).get((repo, number))
         if row is None or row.state != "open" or row.external:
             continue
@@ -1368,16 +1375,16 @@ def missing_review_records(finished, reviews, rows) -> list:
     return sorted(found)
 
 
-def log_missing_reviews(out, finished, reviews, rows) -> int:
+def log_missing_reviews(out, finished, reviews, rows, *, driven=None) -> int:
     """Print the once-per-pass missing-record lines. Returns the count.
 
     One line per ticket from `missing_review_records`, naming the
     ticket and the finished reviewer id. Both passes call this after
-    gating with the pass's released rows, so the line and the
-    `review-missing` skip verdicts agree.
+    gating with the pass's released rows and the pass's `driven` map,
+    so the line and the `review-missing` skip verdicts agree.
     """
     count = 0
-    for repo, number, agent in missing_review_records(finished, reviews, rows):
+    for repo, number, agent in missing_review_records(finished, reviews, rows, driven=driven):
         print(
             f"{repo}#{number}: reviewer finished without a review record (`{agent}`), "
             "review missing, skipped",
@@ -2016,7 +2023,7 @@ def _pass(
         reviews=reviews,
         driven=driven,
     )
-    log_missing_reviews(out, finished, reviews, _released_rows(items, released))
+    log_missing_reviews(out, finished, reviews, _released_rows(items, released), driven=driven)
     table = [
         Candidate(
             project=gated.project,
@@ -5026,7 +5033,7 @@ def _launching_pass(
         pulls_max_calls=pulls_max_calls,
         driven=driven,
     )
-    log_missing_reviews(out, finished, reviews, _released_rows(_items, freed))
+    log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)
     if host is None:
         try:
             configured = settings.load(root=None)["drive.agent_host"]
