@@ -11,6 +11,7 @@ import {
   isSupportedApi,
   isSupportedDocument,
   loadBoard,
+  loadCachedSnapshot,
   loadConfig,
   loadEvents,
   loadJournalLast,
@@ -26,10 +27,11 @@ import {
   olderStart,
   projectNames,
   resolveAgent,
+  saveCachedSnapshot,
   saveToken,
   snapshotProjects,
 } from "./api.js";
-import { canonicalJson, stripVolatile } from "./fmt.js";
+import { canonicalJson, formatAge, stripVolatile } from "./fmt.js";
 import {
   hideToken,
   renderBoardRows,
@@ -41,19 +43,22 @@ import {
   renderOverview,
   renderShell,
   renderStopped,
+  renderStrip,
   renderTail,
   renderTailButtons,
   renderTailFailed,
   renderTailLoading,
   renderTailMissing,
   renderTailPaused,
+  setAgentFilter,
   showToken,
+  toast,
 } from "./views.js";
 
 // The document schema this shell renders. Newer documents proceed
 // (additive); older or missing ones render as unsupported. Pinned
 // by the suite against the server's own schema number.
-const EXPECTED_SCHEMA_VERSION = 2;
+const EXPECTED_SCHEMA_VERSION = 3;
 
 let seenMs = null;
 let failures = 0;
@@ -320,6 +325,16 @@ async function tickLog(config, token, route, doc) {
   lastDoc = doc;
   lastFingerprint = canonicalJson(stripVolatile(doc));
   lastAgentKey = null;
+  try {
+    renderStrip(doc, { nowMs: Date.now() });
+  } catch {
+    // The strip is a courtesy; the log stacks below carry the view.
+  }
+  try {
+    saveCachedSnapshot(doc);
+  } catch {
+    // A refused write keeps the page working for this load only.
+  }
   let regReply = null;
   try {
     regReply = await loadProjects(token);
@@ -643,6 +658,7 @@ async function tick(config, token) {
       seenMs = Date.now();
       failures = 0;
       hideToken();
+      saveCachedSnapshot(reply.data);
       renderShell(shellFor(config, reply.data));
       if (!isSupportedDocument(reply.data, EXPECTED_SCHEMA_VERSION)) {
         const value =
@@ -739,6 +755,129 @@ function schedule(config, token) {
   timer = window.setTimeout(() => {
     void tick(config, token);
   }, delay);
+}
+
+// The selected agent row for keyboard movement. An index, not a node:
+// the poll loop rebuilds the tree and a kept node would go stale.
+let selectedRow = -1;
+
+function agentRowNodes() {
+  return [...document.querySelectorAll("#agents table.agents tbody tr")];
+}
+
+function selectRow(index) {
+  const rows = agentRowNodes();
+  for (const row of rows) {
+    row.classList.remove("selected");
+  }
+  if (rows.length === 0) {
+    selectedRow = -1;
+    return;
+  }
+  selectedRow = Math.max(0, Math.min(index, rows.length - 1));
+  rows[selectedRow].classList.add("selected");
+  rows[selectedRow].scrollIntoView({ block: "nearest" });
+}
+
+function openSelectedRow() {
+  const rows = agentRowNodes();
+  const row = rows[selectedRow];
+  const link = row ? row.querySelector("a") : null;
+  if (link !== null && link !== undefined) {
+    const href = link.getAttribute("href");
+    if (href !== null && href.startsWith("#/")) {
+      window.location.hash = href;
+    }
+  }
+}
+
+function toggleHelp() {
+  const panel = document.getElementById("help");
+  if (panel !== null) {
+    panel.hidden = !panel.hidden;
+  }
+}
+
+// The filter box, row clicks and the copy-link button, one delegated
+// listener that outlives the poll rebuilds. Typing never loses focus:
+// the rebuild re-applies the filter text and focus returns to it.
+function bindViewActions(config, getToken) {
+  document.getElementById("view").addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.id !== "agent-search") {
+      return;
+    }
+    setAgentFilter(target.value);
+    if (routeFromHash().name === "overview" && lastDoc !== null && !outdated) {
+      renderCurrent(config, getToken());
+      const box = document.getElementById("agent-search");
+      if (box !== null) {
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+      }
+    }
+  });
+  document.getElementById("view").addEventListener("click", (event) => {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (target === null) {
+      return;
+    }
+    const copy = target.closest("[data-copy-link]");
+    if (copy !== null) {
+      void (async () => {
+        try {
+          await window.navigator.clipboard.writeText(window.location.href);
+          toast("link copied");
+        } catch {
+          toast("copy failed: select the address bar instead");
+        }
+      })();
+      return;
+    }
+    const row = target.closest("#agents table.agents tbody tr");
+    if (row !== null) {
+      selectRow(agentRowNodes().indexOf(row));
+    }
+  });
+}
+
+function bindKeys() {
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+    const typing =
+      target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable);
+    if (event.key === "?" && !typing) {
+      event.preventDefault();
+      toggleHelp();
+      return;
+    }
+    if (typing) {
+      return;
+    }
+    if (event.key === "/") {
+      const box = document.getElementById("agent-search");
+      if (box !== null) {
+        event.preventDefault();
+        box.focus();
+      }
+    } else if (event.key === "j") {
+      selectRow(selectedRow + 1);
+    } else if (event.key === "k") {
+      selectRow(selectedRow - 1);
+    } else if (event.key === "Enter") {
+      openSelectedRow();
+    } else if (event.key === "Escape") {
+      const panel = document.getElementById("help");
+      if (panel !== null && !panel.hidden) {
+        panel.hidden = true;
+      }
+    }
+  });
+  document.getElementById("help-close").addEventListener("click", () => {
+    document.getElementById("help").hidden = true;
+  });
 }
 
 // The kind chips and paging buttons are re-created on every draw,
@@ -984,6 +1123,7 @@ function bindToken(config, setToken) {
       setToken(value);
       input.value = "";
       hideToken();
+      toast("token saved");
       failures = 0;
       // The tail timer chain holds its own token closure: drop it so
       // the tick below re-arms the tail on the pasted token.
@@ -1043,6 +1183,33 @@ async function boot() {
   let token = loadToken();
   liveToken = token;
   const route = routeFromHash();
+  // Instant restart: the last good snapshot renders at once under a
+  // saved-copy header; the first good poll replaces it. The compare
+  // cache stays empty so that poll always redraws and clears the note.
+  try {
+    const cached = loadCachedSnapshot();
+    if (
+      cached &&
+      cached.data &&
+      isSupportedDocument(cached.data, EXPECTED_SCHEMA_VERSION) &&
+      (route.name === "overview" || route.name === "unknown")
+    ) {
+      const cachedAt = typeof cached.at === "number" ? cached.at : Date.now();
+      lastDoc = cached.data;
+      renderShell(shellFor(config, cached.data));
+      renderOverview(cached.data, {
+        project: route.project,
+        nowMs: Date.now(),
+        notice:
+          "saved copy, " +
+          formatAge(cachedAt, Date.now()) +
+          " old; live data replaces it on the first good poll.",
+      });
+      lastProject = route.project;
+    }
+  } catch {
+    // A corrupt cache reads as no cache: the first poll draws fresh.
+  }
   if (route.name === "unknown") {
     renderShell({ mode: config.mode, api: config.api, version: null, seenMs: Date.now() });
   }
@@ -1054,6 +1221,8 @@ async function boot() {
     liveToken = value;
   });
   bindTailButtons(config, () => token);
+  bindViewActions(config, () => token);
+  bindKeys();
   bindLogView(
     () => token,
     (current) => {

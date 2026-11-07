@@ -863,6 +863,40 @@ class PressureParse(unittest.TestCase):
         self.assertIsNone(reading.memory_some_avg10)
         self.assertFalse(reading.saturated)
 
+    def test_host_facts_ride_the_same_reading(self):
+        reading = R.parse_pressure(LOADAVG, MEMINFO, 2)
+        self.assertEqual(reading.ncpu, 2)
+        self.assertEqual(reading.load_1min, 0.8)
+        self.assertEqual(reading.mem_total_mb, round(8000000 / 1024, 1))
+        self.assertEqual(reading.mem_available_mb, round(4400000 / 1024, 1))
+
+    def test_host_facts_read_unknown_without_a_source(self):
+        reading = R.parse_pressure("garbage\n", "MemTotal: nope\n", None)
+        self.assertIsNone(reading.ncpu)
+        self.assertIsNone(reading.load_1min)
+        self.assertIsNone(reading.mem_total_mb)
+        self.assertIsNone(reading.mem_available_mb)
+        self.assertFalse(reading.saturated)
+
+    def test_meminfo_without_available_leaves_absolutes_unknown(self):
+        reading = R.parse_pressure(LOADAVG, "MemTotal: 8000000 kB\n", 2)
+        self.assertIsNone(reading.mem_available_pct)
+        self.assertIsNone(reading.mem_total_mb)
+        self.assertIsNone(reading.mem_available_mb)
+
+    def test_dict_carries_the_host_facts(self):
+        found = R.pressure_dict(R.parse_pressure(LOADAVG, MEMINFO, 2))
+        self.assertEqual(
+            {key: found[key] for key in ("ncpu", "load_1min")},
+            {"ncpu": 2, "load_1min": 0.8},
+        )
+        self.assertEqual(found["mem_total_mb"], round(8000000 / 1024, 1))
+        self.assertEqual(found["mem_available_mb"], round(4400000 / 1024, 1))
+
+    def test_dict_rejects_a_non_integer_ncpu(self):
+        with self.assertRaises(R.LimitsError):
+            R.pressure_dict({"saturated": False, "ncpu": 2.5})
+
 
 class ReadPressure(unittest.TestCase):
     def test_reads_through_the_injected_reader(self):
@@ -973,6 +1007,10 @@ class CapacityReport(unittest.TestCase):
                 "saturated": False,
                 "cpu_some_avg10": None,
                 "memory_some_avg10": None,
+                "ncpu": None,
+                "load_1min": None,
+                "mem_total_mb": None,
+                "mem_available_mb": None,
             },
         )
 

@@ -202,7 +202,7 @@ class FullDocument(unittest.TestCase):
         self.assertEqual(
             doc,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "fleet_header": {
                     "host": HOST,
                     "now": T0,
@@ -307,6 +307,10 @@ class FullDocument(unittest.TestCase):
                         "saturated": False,
                         "cpu_some_avg10": None,
                         "memory_some_avg10": None,
+                        "ncpu": None,
+                        "load_1min": None,
+                        "mem_total_mb": None,
+                        "mem_available_mb": None,
                     },
                     "notes": [],
                 },
@@ -351,6 +355,46 @@ class FullDocument(unittest.TestCase):
         )
         self.assertEqual(doc["capacity"]["live"], 0)
         self.assertEqual(doc["capacity"]["by_project"], {})
+
+    def test_schema_three_carries_the_host_facts(self):
+        made = snapshot.resources_section(
+            view((entry("a1"), "live")),
+            HOST,
+            doc_limits(),
+            R.Pressure(
+                load_per_cpu=0.4,
+                mem_available_pct=55.0,
+                saturated=False,
+                ncpu=4,
+                load_1min=1.6,
+                mem_total_mb=7812.5,
+                mem_available_mb=4296.9,
+            ),
+            [],
+            lambda scope, name, project=None: None,
+            live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
+        )
+        doc = doc_of(
+            registry_view=view((entry("a1"), "live")),
+            resources_view=made,
+            drive_view={"last_exit": 0},
+        )
+        self.assertEqual(doc["schema_version"], 3)
+        self.assertEqual(
+            doc["resources"]["pressure"],
+            {
+                "load_per_cpu": 0.4,
+                "mem_available_pct": 55.0,
+                "saturated": False,
+                "cpu_some_avg10": None,
+                "memory_some_avg10": None,
+                "ncpu": 4,
+                "load_1min": 1.6,
+                "mem_total_mb": 7812.5,
+                "mem_available_mb": 4296.9,
+            },
+        )
 
     def test_stale_and_finished_free_the_slot(self):
         doc = doc_of(
@@ -592,6 +636,10 @@ def golden_section():
             saturated=False,
             cpu_some_avg10=0.02,
             memory_some_avg10=0.01,
+            ncpu=4,
+            load_1min=1.6,
+            mem_total_mb=7812.5,
+            mem_available_mb=4296.9,
         ),
         [],
         fake,
@@ -1148,7 +1196,7 @@ class CliExits(unittest.TestCase):
                 "drive",
             ],
         )
-        self.assertEqual(doc["schema_version"], 2)
+        self.assertEqual(doc["schema_version"], 3)
         self.assertEqual(len(doc["agents"]), 1)
         self.assertEqual(doc["drive"], {"last_exit": 0})
         self.assertEqual(doc["resources"]["schema_version"], 1)

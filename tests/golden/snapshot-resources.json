@@ -44,9 +44,13 @@
   "notes": [],
   "pressure": {
     "cpu_some_avg10": 0.02,
+    "load_1min": 1.6,
     "load_per_cpu": 0.4,
+    "mem_available_mb": 4296.9,
     "mem_available_pct": 55.0,
+    "mem_total_mb": 7812.5,
     "memory_some_avg10": 0.01,
+    "ncpu": 4,
     "saturated": false
   },
   "schema_version": 1
