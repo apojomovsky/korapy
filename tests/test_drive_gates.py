@@ -1381,6 +1381,22 @@ class MissingReviewRecordsTest(unittest.TestCase):
         found = drive.missing_review_records(finished, {}, rows, driven={"blue": ("app",)})
         self.assertEqual(found, [("app", 7, "drive-r-1")])
 
+    def test_a_row_outside_a_two_project_union_lists_nothing(self):
+        finished = {("third", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("third", 7): row(repo="third", number=7)}
+        found = drive.missing_review_records(
+            finished, {}, rows, driven={"blue": ("app",), "green": ("other",)}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_row_in_the_second_project_repo_still_lists(self):
+        finished = {("other", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("other", 7): row(repo="other", number=7)}
+        found = drive.missing_review_records(
+            finished, {}, rows, driven={"blue": ("app",), "green": ("other",)}
+        )
+        self.assertEqual(found, [("other", 7, "drive-r-1")])
+
     def test_only_unheld_open_rows_list_in_ticket_order(self):
         finished = {
             ("app", 9): ("drive-r-9", "reviewer", "ok"),
