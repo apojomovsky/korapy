@@ -103,10 +103,13 @@ through; neither answers which tracker repo an entry feeds.
   away with the fallback).
 - PROPOSED `doctor.load_board_sites` (the only production
   caller of `sites_from_settings`): takes the same required
-  `git` seam and threads it through, so the report assembly
-  passes production git as it already does for
-  `load_repo_sites`. Today it calls `sites_from_settings`
-  with no seam.
+  keyword-only `git` seam (no default) and threads it into
+  `sites_from_settings`. The report-path call site
+  `production_env` (`load_board_sites(settings_error)`) passes
+  `git=production_git`, the same runner `load_repo_sites`
+  receives two lines below, so there is no second default.
+  Today `load_board_sites` calls `sites_from_settings` with
+  no seam.
 - PROPOSED `doctor._repo_site`: replaces
   `resolved["tracker.repo"] or detect.remote_slug(origin)`
   with the helper over its `git` seam. A problem becomes
@@ -166,22 +169,27 @@ git seam, no network, no real clones:
 
 ## 6. Migration risk
 
-Low. Entries with `tracker.repo` set resolve byte-identical;
-only entries omitting it with an unresolvable or divergent
-origin change behavior: boarddoctor stops reporting a guessed
-short-name site (now an error naming the entry) and doctor
-stops reporting a guessed origin-slug site (now a warn row
-with the cause). Both new readings name the entry and the
-reason, and both travel existing error channels, so no caller
-needs a new branch. No exit code changes: 4 is already the
-configuration-error code on the strict paths, and doctor rows
-already warn.
+Low. Entries with a well-formed `tracker.repo` set resolve
+byte-identical; only entries omitting it with an unresolvable
+or divergent origin change behavior, plus one explicit-value
+case: a malformed explicit `tracker.repo` now warns in doctor
+instead of reaching the tracker adapter. Boarddoctor stops
+reporting a guessed short-name site (now an error naming the
+entry) and doctor stops reporting a guessed origin-slug site
+(now a warn row with the cause). Both new readings name the
+entry and the reason, and both travel existing error channels,
+so no caller needs a new branch. No exit code changes: 4 is
+already the configuration-error code on the strict paths, and
+doctor rows already warn.
 
 ## 7. Implementation tickets
 
 One ticket moves the helper (rename, public, same contract),
 one per doctor caller: `sites_from_settings` plus its sole
 caller `load_board_sites` threading the required `git` seam,
+plus the report-path call site `production_env` passing
+`git=production_git` (the same runner `load_repo_sites`
+receives two lines below, so there is no second default),
 and `_repo_site` (helper delegation plus the three silent
 branches), plus the agreement test and guard above. Docs
 freshness: no user-visible surface changes, so `commands.md`,
