@@ -35,13 +35,16 @@ touched by a read (section 6).
 ## 1. What the API serves, and what it does not
 
 The single source of truth is the `korapy snapshot --json` document
-(schema version 2 today): `schema_version`, `fleet_header` (host, now,
+(schema version 3 today): `schema_version`, `fleet_header` (host, now,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
 runtime, role, profile, model, state, started_at, last_seen, note),
 `quota` (per
 provider state, windows, read_at, stale, mark, reader, error),
 `capacity` (total_cap, repo_cap, live, by_project, pending), `disk`
-(per path totals or per path error). `GET /v1/snapshot` returns that
+(per path totals or per path error), `resources` (charged and measured
+use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
+`mem_total_mb` and `mem_available_mb` the dashboard gauges divide by).
+`GET /v1/snapshot` returns that
 document unchanged, built by the same `snapshot.build` with the same
 injected views, so the CLI and the API can never disagree.
 

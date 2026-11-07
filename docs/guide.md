@@ -533,6 +533,26 @@ Startup prints that URL; `--port N` overrides `serve.port` for one
 run, and `--port 0` picks a free port for a second or throwaway
 instance. A wider bind needs `--allow-remote` and a token file, and
 a held port exits 2 with the `--port` fix in the message.
+`--snapshot-file PATH` serves a saved snapshot document instead of
+the live host, so the page can be developed and screenshotted
+without a running fleet; `docs/assets/dashboard-fixture.json` is a
+committed example. Board, tail, events and journal still read the
+live host in fixture mode.
+
+The page is vanilla JS and CSS, no framework. A sticky strip names
+fleet counts, the loop state, quota freshness, host load per core and
+disk free. Below it, the agents table lists what runs now (live rows
+highlighted, finished runs behind a toggle for six hours) with a
+filter box; an empty table names the loop state instead of showing
+blank. CPU, memory and disk gauges show the actual host values with
+the share the loop reserved drawn as a tick inside; quota reads as
+bars per window with a reset countdown and a dated stale badge. The
+attention band lists only items that need a human, or "nothing needs
+you". The page polls on an interval with an "updated Ns ago" stamp,
+keeps the last data with its age when a poll fails, and renders the
+last good snapshot from local storage at once on load. Keys: `j`/`k`
+move between agent rows, Enter opens the row, `/` focuses the
+filter, `?` lists the keys; every key action also works by click.
 
 `coord events` lists what is open (`--all` includes resolved rows);
 `coord wait` blocks until an unresolved event exists (or the timeout,
