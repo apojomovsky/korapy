@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 
-from korapy import accounts, admission, drive, projects, quota_ledger
+from korapy import accounts, admission, drive, projects, quota, quota_ledger
 from tests.test_drive import driven_for, policy_source, stored
 
 
@@ -537,6 +537,54 @@ class PassRefreshLockBranchTest(unittest.TestCase):
         self.assertIn("app#7: start", out)
         with open(self.ledger_file(), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), before)
+
+    def test_consecutive_passes_never_age_a_reading_past_the_bound(self):
+        quota_ledger.save({"readings": {}, "marks": {}})
+        reader = CountingReader()
+        pool = [provider()]
+        threshold = quota.refresh_after_for({"worker": ["provider-a/model"]}, pool)
+        self.assertEqual(threshold, AGE / 2.0)
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        found = [self.project("blue", entry)]
+        for step in range(5):
+            now = T0 + step * 300
+            code, _, _ = self.run_pass(
+                store,
+                found,
+                quotas=self.quotas(),
+                pool=pool,
+                quota_refresh_after_s=threshold,
+                quota_load_reader=loader_for(reader),
+                now=now,
+            )
+            self.assertEqual(code, 0)
+            reread = quota_ledger.load()
+            age = now - reread["readings"]["provider-a"]["read_at"]
+            self.assertLessEqual(age, AGE)
+        self.assertEqual(reader.calls, 3)
+
+    def test_quota_refresh_lands_before_a_store_failure(self):
+        quota_ledger.save({"readings": {}, "marks": {}})
+        reader = CountingReader()
+        pool = [provider()]
+        threshold = quota.refresh_after_for({"worker": ["provider-a/model"]}, pool)
+        store = stored(self.db, [("app", 7, "open")])
+        store.close()
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        code, _, _ = self.run_pass(
+            store,
+            [self.project("blue", entry)],
+            quotas=self.quotas(),
+            pool=pool,
+            quota_refresh_after_s=threshold,
+            quota_load_reader=loader_for(reader),
+        )
+        self.assertEqual(code, drive.USAGE)
+        self.assertEqual(reader.calls, 1)
+        reread = quota_ledger.load()
+        self.assertEqual(reread["readings"]["provider-a"]["read_at"], T0)
 
 
 if __name__ == "__main__":

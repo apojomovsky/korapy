@@ -15,9 +15,9 @@ import sqlite3
 import sys
 import time
 
-from korapy import board, drive
+from korapy import accounts, board, drive
 from korapy import hub as hubmod
-from korapy import paths, projects, settings, syncli, trackers, units
+from korapy import paths, projects, quota, settings, syncli, trackers, units
 
 
 class HubMode:
@@ -263,7 +263,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             max_starts = host_settings["drive.max_starts_per_day"]
             hold_label = host_settings["board.hold_label"]
             hub_url = host_settings["hub.url"]
-            quota_refresh_after_s = host_settings["quota.refresh_after_s"]
+            quota_refresh_override = quota.refresh_override(host_settings)
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
@@ -397,6 +397,16 @@ def cmd_drive(args: argparse.Namespace) -> int:
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
+        try:
+            quota_pool, _ = accounts.pool()
+        except accounts.AccountsError as problem:
+            print(f"korapy drive: {problem}", file=sys.stderr)
+            return drive.USAGE
+        quota_refresh_after_s = quota.refresh_after_for(
+            drive.union_quota_chains(registered, quota_pool),
+            quota_pool,
+            override=quota_refresh_override,
+        )
         return drive.run_pass(
             plan=False,
             store=store,
