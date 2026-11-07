@@ -113,6 +113,21 @@ host config and `[[repo]]` entries cannot set it. A bad pattern is a
 configuration error, and `korapy leakcheck` scans a branch's messages,
 branch name, body and added lines against the list.
 
+## Hygiene rules
+
+A project declares its own host hygiene rules in the ops root's
+`korapy.toml` as top-level `[hygiene.<name>]` tables, one table per
+rule. Each rule names the repo it belongs to and exactly one kind:
+`dir` (`base` plus `path` with an `age`, `count` or `size` selector),
+`image` (a repo-scoped `prefix` with the `unreferenced` selector), or
+`session` (`base` plus `path` with `retention_days`). Tables are
+strict: an unknown key, a bad selector, a prefix that does not start
+with the rule's repo, and overlapping image prefixes are all
+configuration errors (exit 4) that refuse the whole load. Roots must
+sit strictly below their base and never touch protected ground
+(home, clones, worktree roots, state, sessions, cache, ledgers).
+Details: [`15-project-hygiene.md`](15-project-hygiene.md).
+
 ## Settings
 
 One row per registered setting: the key, its built-in default, and
