@@ -245,6 +245,10 @@ class ResolveFinishedTest(unittest.TestCase):
 
     def test_short_cross_pass_entries_read_as_unreviewed(self):
         self.assertEqual(
+            drive.resolve_finished({("app", 7): None}, {}),
+            {("app", 7): (None, None, None)},
+        )
+        self.assertEqual(
             drive.resolve_finished({("app", 7): ()}, {}),
             {("app", 7): (None, None, None)},
         )
