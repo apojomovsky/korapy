@@ -18,6 +18,7 @@
 | [`13-agent-ergonomics.md`](13-agent-ergonomics.md) | agent ergonomics: wait, events, the review-report reader, merge, and the gate |
 | [`14-heavy-lane.md`](14-heavy-lane.md) | the heavy lane: weighted slots, learned costs and pressure-aware admission for bursty work |
 | [`15-project-hygiene.md`](15-project-hygiene.md) | project-declared hygiene rules: dev images, build caches, scratch and old sessions for gc and disk |
+| [`16-loop-review-record.md`](16-loop-review-record.md) | reviewers that end with prose and no record: prompt-first checklist plus one loop resume |
 | [`guide.md`](guide.md) | the operator's guide: running korapy on one host and driving a fleet with it |
 | [`adr/`](adr/) | decision records |
 
