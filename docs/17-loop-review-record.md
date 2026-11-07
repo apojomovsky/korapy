@@ -1,4 +1,4 @@
-# 16: reviewers that end with prose and no record
+# 17: reviewers that end with prose and no record
 
 Status: design, awaiting maintainer approval. No code ships with
 this doc. It decides how the loop recovers when a reviewer
