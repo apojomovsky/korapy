@@ -28,7 +28,7 @@ any new exit code.
 
 ## 1. The problem
 
-Four code paths answer "which tracker repo does this `[[repo]]`
+Three code paths answer "which tracker repo does this `[[repo]]`
 entry feed", and they agree only when `tracker.repo` is set.
 When it is unset they diverge:
 
@@ -64,14 +64,18 @@ it. Teaching `settings` a subprocess seam would break its
 layering (file reads only). `detect` keeps `remote_slug` as the
 URL parser; it stops being a second answer to this fact.
 
-An unresolvable origin fails closed everywhere. Strict callers
-(the drive pass via `root_short_map` raising `SettingsError`,
-sync, mirror, launch, `trackers.production_trackers`) refuse
-with exit 4, configuration or usage error, as today. Report
-callers render the same problem instead of raising: `doctor`
-emits its warn row (section 3), `boarddoctor` returns its
-existing `([], error)` channel (section 3). No new exit code,
-no new row kind.
+An unresolvable origin fails closed at entry-to-tracker
+resolution. Strict callers (the drive pass via `root_short_map`
+raising `SettingsError`, sync, mirror, launch,
+`trackers.production_trackers`) refuse with exit 4,
+configuration or usage error, as today. Report callers render
+the same problem instead of raising: `doctor` emits its warn
+row (section 3), `boarddoctor` returns its existing
+`([], error)` channel (section 3). No new exit code, no new
+row kind. Outside that resolution `short_to_tracker` stays
+fail-soft (it catches `SettingsError` and returns `{}`) and
+`reviewrecord.local_repo` keeps passing unknown plain names
+through; neither answers which tracker repo an entry feeds.
 
 ## 3. Every current resolver and its delegation
 
@@ -91,12 +95,18 @@ no new row kind.
   `repo_operators`): already on the helper. Rename only.
 - PROPOSED `boarddoctor.sites_from_settings`: replaces
   `loaded["tracker.repo"] or name` with the helper, taking a
-  `git` seam (production passes `syncli._git`, tests a fake).
-  A problem returns `([], error)` naming the entry, the same
-  channel as its existing settings failures, which
-  `doctor.load_board_sites` already propagates. No `BoardSite`
-  shape change (its `repo` comment admitting "or the entry
-  name" goes away with the fallback).
+  required keyword-only `git` seam (no default; production
+  passes `syncli._git`, tests a fake). A problem returns
+  `([], error)` naming the entry, the same channel as its
+  existing settings failures. No `BoardSite` shape change
+  (its `repo` comment admitting "or the entry name" goes
+  away with the fallback).
+- PROPOSED `doctor.load_board_sites` (the only production
+  caller of `sites_from_settings`): takes the same required
+  `git` seam and threads it through, so the report assembly
+  passes production git as it already does for
+  `load_repo_sites`. Today it calls `sites_from_settings`
+  with no seam.
 - PROPOSED `doctor._repo_site`: replaces
   `resolved["tracker.repo"] or detect.remote_slug(origin)`
   with the helper over its `git` seam. A problem becomes
@@ -104,7 +114,14 @@ no new row kind.
   under the existing never-raise contract. Explicit values
   gain the `is_repo_name` check, so a malformed explicit
   `tracker.repo` now warns here instead of reaching the
-  tracker adapter.
+  tracker adapter. The three earlier silent branches route
+  through the helper too, each becoming a `cause=` warn row:
+  no `clone.path`, the `No such remote` failure, and the
+  empty-origin read (today each returns a silent
+  `RepoSite(name, None)` with no cause and never reaches any
+  resolver). With the helper the no-`clone.path` entry warns
+  naming the entry, and the two unreadable-origin entries
+  warn naming the path and the reason.
 - Reviewed, no change: `mergecli`, `reviewcli` and `gccli`
   call `ghforge.origin_repo(os.getcwd(), ...)` for the forge
   repo of the working clone (where to open a PR, which repo
@@ -163,9 +180,11 @@ already warn.
 ## 7. Implementation tickets
 
 One ticket moves the helper (rename, public, same contract),
-one per doctor caller (seam threading plus rows), plus the
-agreement test and guard above. Docs freshness: no
-user-visible surface changes, so `commands.md`,
+one per doctor caller: `sites_from_settings` plus its sole
+caller `load_board_sites` threading the required `git` seam,
+and `_repo_site` (helper delegation plus the three silent
+branches), plus the agreement test and guard above. Docs
+freshness: no user-visible surface changes, so `commands.md`,
 `configuration.md`, the guide and the README stay as they
 are; this doc is the record.
 
