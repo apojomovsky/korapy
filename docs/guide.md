@@ -171,9 +171,11 @@ seconds (default: now plus the cooldown); `unmark` releases it early.
 Every reading prints its age, and a stale one says why: `never ran`,
 `reader failed`, or `too old`. A dead reader shows in `korapy quota`
 and the doctor but does not stop the fleet. The dispatch pass
-refreshes readings older than the `quota.refresh_after_s` setting
-(default 900 seconds) by itself, recording failures the same way the
-verb does, so admission and the dashboard keep seeing a fresh ledger.
+refreshes readings older than its refresh age (half the strictest
+stale bound, or the `quota.refresh_after_s` setting when explicitly
+set) by itself at the start of the pass, recording failures the same
+way the verb does, so admission and the dashboard keep seeing a fresh
+ledger.
 
 Then the host budget. With no `[resources.host]` table nothing is
 enforced: launches set no slice properties and the doctor warns, as in
