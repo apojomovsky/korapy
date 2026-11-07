@@ -292,6 +292,22 @@ class MissingReviewRecordPassTest(unittest.TestCase):
         ]
         self.assertEqual(len(logged), 1)
 
+    def test_a_finished_reviewer_on_a_foreign_ticket_logs_no_missing_record_line(self):
+        store = stored(self.db, [("foreign", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("foreign", 7, REVIEWER, HOST, now=NOW - 10.0)
+        code, out, err, launcher, _ = self.run_missing(
+            store,
+            None,
+            fake_tracker=FakeTracker([reading(repo="foreign", number=7, updated_at=1900.0)]),
+            agent_tickets={REVIEWER_UNIT: ("foreign", 7)},
+            finished_for={("foreign", 7): (REVIEWER_UNIT, "reviewer", "ok")},
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("reviewer finished without a review record", out)
+        self.assertNotIn("review missing", out)
+
     def test_a_recorded_review_stays_on_the_normal_path(self):
         store = self.reviewed_store()
         code, out, err, launcher, _ = self.run_missing(store, lows_record())

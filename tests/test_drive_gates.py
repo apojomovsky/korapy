@@ -1369,6 +1369,18 @@ class MissingReviewRecordsTest(unittest.TestCase):
         found = drive.missing_review_records(None, {}, {("app", 7): row()})
         self.assertEqual(found, [])
 
+    def test_a_row_outside_the_driven_repos_lists_nothing(self):
+        finished = {("foreign", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("foreign", 7): row(repo="foreign", number=7)}
+        found = drive.missing_review_records(finished, {}, rows, driven={"blue": ("app",)})
+        self.assertEqual(found, [])
+
+    def test_a_row_inside_the_driven_repos_still_lists(self):
+        finished = {("app", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("app", 7): row(repo="app", number=7)}
+        found = drive.missing_review_records(finished, {}, rows, driven={"blue": ("app",)})
+        self.assertEqual(found, [("app", 7, "drive-r-1")])
+
     def test_only_unheld_open_rows_list_in_ticket_order(self):
         finished = {
             ("app", 9): ("drive-r-9", "reviewer", "ok"),
@@ -1384,6 +1396,18 @@ class MissingReviewRecordsTest(unittest.TestCase):
             drive.missing_review_records(finished, {}, rows),
             [("app", 8, "drive-r-8"), ("app", 9, "drive-r-9")],
         )
+
+    def test_log_skips_a_row_outside_the_driven_repos(self):
+        out = io.StringIO()
+        count = drive.log_missing_reviews(
+            out,
+            {("foreign", 7): ("drive-r-1", "reviewer", "ok")},
+            {},
+            {("foreign", 7): row(repo="foreign", number=7)},
+            driven={"blue": ("app",)},
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":
