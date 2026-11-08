@@ -10,6 +10,7 @@ from korapy import (
     agentcli,
     boardcli,
     coordcli,
+    decisioncli,
     deps,
     diskcli,
     doctor,
@@ -244,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)
+    decisioncli.add_parser(sub)
     diskcli.add_parser(sub)
     drivehub.add_parser(sub)
     freezecli.add_parser(sub)

@@ -698,6 +698,35 @@ the diff so it is reproducible rather than hand-picked:
 korapy budget --repo REPO
 ```
 
+A ticket waiting on a human carries `needs-decision`; the loop never
+starts it until the maintainer answers. Answer with an `Options:` block
+on the ticket, then record the chosen answer so a later reader finds it
+without reading chat:
+
+```sh
+korapy decision record REPO N --decision TEXT --why TEXT --project NAME
+korapy decision record REPO N --decision TEXT --why TEXT --reversible yes --confidence high --settles TEXT --open TEXT --reopen-when TEXT --follow-up 8 --project NAME
+```
+
+The first form records a plain decision; the second shows the optional
+fields for a partial decision or a deferral with a trigger (`--settles`
+what it settles for now, `--open` what stays open, `--reopen-when` the
+trigger, `--follow-up N` each follow-up ticket, repeatable). The verb
+first probes the ticket read-only, then writes
+`decisions/YYYY-MM-DD-<slug>.md` in the ops root, then posts one
+comment carrying the decision line, removes `needs-decision` so the
+loop picks the ticket back up, and appends a `decision` entry to the
+coordinator logbook. A local failure before the file lands runs no
+tracker write, so the retry starts fresh; a retry that finds its file
+replays only what is missing (it lists the ticket comments and posts
+only when the decision line is absent as a whole line, removing an
+already-removed label succeeds, and a missing logbook entry is
+appended), reusing the first filename whatever date the retry runs on.
+The file is written once and the comment posts once. Each TEXT flag
+stays one line: an embedded newline is a usage error. Record one
+decision at a time: the verb takes no lock. Exit 0 recorded, 4 usage,
+3 tracker unreachable.
+
 The agent-facing version of this section is `skills/coordinator.md`:
 the same verbs, exit codes and gate rules, written for the reviewer
 prompt instead of the operator.
