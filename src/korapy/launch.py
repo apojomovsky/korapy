@@ -38,10 +38,10 @@ from korapy import pushenv, settings, units, worktrees
 from korapy.runtimes import muse
 from korapy.runtimes import tail as runtime_tail
 
-#: The run time limit handed to the runtime, in seconds for the unit's
-#: RuntimeMaxSec. It is the same limit as runtimes.DEFAULT_MAX_TIME ("3h");
-#: a test asserts the two agree.
-RUNTIME_MAX_S = 3 * 60 * 60
+#: The default run time limit in seconds for the unit's RuntimeMaxSec,
+#: parsed from runtimes.DEFAULT_MAX_TIME ("3h"); a test asserts the two
+#: agree. Configured limits resolve through `max_time_for`, never here.
+RUNTIME_MAX_S = int(accounts.parse_duration(runtimes.DEFAULT_MAX_TIME, "agents.max_time"))
 
 #: Appended to an admission error when the live agent is a registered one.
 REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
@@ -56,6 +56,72 @@ ROLE_FILE = "role"
 
 settings.register("clone.path", str, "", "the repository's main clone (relative to the ops root)")
 settings.register("clone.default_branch", str, "main", "the default branch of the clone")
+
+
+def _check_max_time(value):
+    """A wall-clock duration, unchanged: `<n>[s|m|h|d]`, bare is seconds."""
+    accounts.parse_duration(value, "agents.max_time")
+    return value
+
+
+def _check_reviewer_max_time(value):
+    """A reviewer wall-clock duration, unchanged: `<n>[s|m|h|d]`, bare is seconds."""
+    accounts.parse_duration(value, "agents.reviewer_max_time")
+    return value
+
+
+settings.register(
+    "agents.max_time",
+    str,
+    runtimes.DEFAULT_MAX_TIME,
+    "wall-clock limit for one agent run, like 3h (bare is seconds)",
+    check=_check_max_time,
+)
+settings.register(
+    "agents.reviewer_max_time",
+    str,
+    runtimes.DEFAULT_MAX_TIME,
+    "wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time",
+    check=_check_reviewer_max_time,
+)
+
+
+def max_time_for(resolved, reviewer=False):
+    """The `(duration text, seconds)` capping one run: the reviewer limit for reviewers.
+
+    The one resolver for the wall-clock limit. The launch and resume
+    paths pass the text to the runtime and the seconds to the unit's
+    RuntimeMaxSec; nothing else reads these keys. `reviewer_max_time`
+    wins for reviewers only when it was set, so reviewers otherwise
+    follow `agents.max_time`.
+    """
+    key = "agents.max_time"
+    if reviewer and resolved.values["agents.reviewer_max_time"].origin != settings.DEFAULT:
+        key = "agents.reviewer_max_time"
+    text = resolved[key]
+    if not isinstance(text, str):
+        raise LaunchError(f"{key} must be a duration like 3h, not {text!r}")
+    try:
+        seconds = int(accounts.parse_duration(text, key))
+    except ValueError as err:
+        raise LaunchError(str(err)) from None
+    if seconds < 1:
+        raise LaunchError(f"{key} must be a positive duration, got {text!r}")
+    return text, seconds
+
+
+def _close_outcome(started_at, limit_s, now):
+    """The outcome closing a dead unit: timed-out past its wall-clock limit, else ok.
+
+    Pure: an unreadable start reads ok, never timed-out.
+    """
+    if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
+        return "ok"
+    try:
+        elapsed = float(now) - float(started_at)
+    except (TypeError, ValueError, OverflowError):
+        return "ok"
+    return "timed-out" if elapsed >= limit_s else "ok"
 
 
 class LaunchError(Exception):
@@ -678,29 +744,37 @@ def select_profile(
     )
 
 
-def _close_previous(tgt, number, list_fn):
+def _close_previous(tgt, number, list_fn, now_fn=None):
     """Mark done the registry entries of this ticket's earlier generations.
 
     Only entries whose units are no longer live are closed: a unit still
     live keeps its entry, and admission still refuses the ticket for it.
     Unknown or already finished ids are skipped, so a session logged
-    before launch wrote registry entries relaunches cleanly. Returns the
-    units closed.
+    before launch wrote registry entries relaunches cleanly. A unit
+    that ran past its wall-clock limit closes as timed-out, so the
+    dashboard shows why it ended; anything else closes as ok. Returns
+    the units closed.
     """
     logged = []
+    roles = {}
     for session in _leaves(tgt, number):
         for unit in units.started_units(session.path):
             if unit not in logged:
                 logged.append(unit)
+                roles[unit] = session.role
     if not logged:
         return []
     live = {name for name, active, _sub in list_fn(tgt.prefix) if active in units.LIVE_STATES}
+    now = (now_fn or time.time)()
     closed = []
     for unit in logged:
         if unit in live:
             continue
+        _, limit_s = max_time_for(tgt.resolved, reviewer=(roles[unit] == "reviewer"))
+        found = registry.entry(unit)
+        started = found.get("started_at") if found is not None else None
         try:
-            registry.done(unit)
+            registry.done(unit, outcome=_close_outcome(started, limit_s, now))
         except registry.RegistryError:
             continue
         except OSError as err:
@@ -878,7 +952,7 @@ def launch(
     # nothing can push refuses here (exit 4), before any worktree, unit
     # or registry entry exists for it.
     push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
-    _close_previous(tgt, number, list_fn)
+    _close_previous(tgt, number, list_fn, now_fn=now_fn)
 
     with units.spawn_lock():
         decided = admit(
@@ -950,12 +1024,13 @@ def launch(
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
             try:
+                limit_text, limit_s = max_time_for(tgt.resolved, reviewer=reviewer)
                 if session_id is None:
                     command = adapter.argv(
                         session,
                         prompt,
                         model=model,
-                        max_time=runtimes.DEFAULT_MAX_TIME,
+                        max_time=limit_text,
                         reviewer=reviewer,
                     )
                 else:
@@ -963,7 +1038,7 @@ def launch(
                         session,
                         prompt,
                         model=model,
-                        max_time=runtimes.DEFAULT_MAX_TIME,
+                        max_time=limit_text,
                         reviewer=reviewer,
                         session_id=session_id,
                     )
@@ -976,7 +1051,7 @@ def launch(
                 session,
                 command,
                 env,
-                RUNTIME_MAX_S,
+                limit_s,
                 **_slice_props(
                     decided,
                     resources.config(tgt.resolved).roles,
@@ -1240,7 +1315,7 @@ def resume(
         raise LaunchError(
             f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
         )
-    _close_previous(tgt, number, list_fn)
+    _close_previous(tgt, number, list_fn, now_fn=now_fn)
     # Decided like at launch, before the first lock: a clone nothing
     # can push refuses here (exit 4), before any worktree or unit exists.
     push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
@@ -1341,12 +1416,13 @@ def resume(
             tgt.prefix, tgt.repo, number, max(_next_unit_gen(_leaves(tgt, number)), 1)
         )
         try:
+            limit_text, limit_s = max_time_for(tgt.resolved, reviewer=(recorded == "reviewer"))
             command = adapter.argv(
                 session,
                 message,
                 model=model,
                 resume=handle,
-                max_time=runtimes.DEFAULT_MAX_TIME,
+                max_time=limit_text,
                 reviewer=(recorded == "reviewer"),
             )
             env = _env(adapter, session, unit, extra=push_extra)
@@ -1358,7 +1434,7 @@ def resume(
             session,
             command,
             env,
-            RUNTIME_MAX_S,
+            limit_s,
             **_slice_props(
                 decided,
                 resources.config(tgt.resolved).roles,

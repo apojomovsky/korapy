@@ -39,7 +39,7 @@ LOCK_NAME = ".lock"
 #: in the same order, plus the names of agents korapy never launches:
 #: `codex` for foreign agents and `human` for coordinators and reviewers.
 RUNTIMES = (*runtimes.NAMES, "codex", "human")
-OUTCOMES = ("ok", "failed", "stopped")
+OUTCOMES = ("ok", "failed", "stopped", "timed-out")
 #: A finished or gone file is deleted after this long.
 RETAIN_S = 24 * 60 * 60
 
@@ -168,6 +168,18 @@ def _load_files(directory):
 def load_all(path=None):
     """Every readable entry, oldest start first. Corrupt files are skipped."""
     return [entry for _, entry in _load_files(agents_dir(path))]
+
+
+def entry(agent_id, *, path=None):
+    """The registry entry for `agent_id`, or None when unknown.
+
+    The one reader the close paths use to learn a run's start: callers
+    that only close never list the whole directory.
+    """
+    found = _read(_file_for(agents_dir(path), agent_id))
+    if found is None or found.get("id") != agent_id:
+        return None
+    return found
 
 
 def pid_alive(pid):

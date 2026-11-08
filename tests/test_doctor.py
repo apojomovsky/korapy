@@ -252,6 +252,60 @@ class EachCheckFailingAlone(unittest.TestCase):
         self.assertIn("finished=0", found[0].detail)
 
 
+NOW = 1_800_000_000.0
+
+
+def finished_entry(run_s, gap_s=0.0):
+    return {
+        "id": "agent-1",
+        "started_at": NOW - gap_s - run_s,
+        "ended_at": NOW - gap_s,
+        "outcome": "ok",
+    }
+
+
+class MaxTime(unittest.TestCase):
+    def test_no_row_without_a_limit_reading(self):
+        rows = ((finished_entry(4 * 3600), registry.FINISHED),)
+        checks = doctor.run_checks(env(registry_rows=rows))
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_no_row_without_finished_runs(self):
+        checks = doctor.run_checks(
+            env(registry_rows=((live_entry(), registry.LIVE),), max_time_s=3600.0)
+        )
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_ok_when_the_limit_covers_the_longest_run(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (finished_entry(2 * 3600), registry.FINISHED),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+
+    def test_warn_when_the_limit_is_shorter_than_the_longest_run(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (finished_entry(4 * 3600), registry.FINISHED),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("agents.max_time", found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_live_entries_do_not_count(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (dict(live_entry(), started_at=NOW - 5 * 3600), registry.LIVE),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+
+
 class Rendering(unittest.TestCase):
     def test_json_parses_with_schema_version_1(self):
         checks = doctor.run_checks(env(account_problems=("boom",)))

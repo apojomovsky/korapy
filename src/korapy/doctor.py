@@ -34,6 +34,7 @@ from korapy import (
     heavy,
     host_ledger,
     hub,
+    launch,
     paths,
     pressure,
     profiles,
@@ -132,6 +133,10 @@ class Env(NamedTuple):
     reader_errors: Sequence[tuple[str, str, str]]
     registry_rows: Sequence[tuple[Mapping, str]]
     registry_error: str | None = None
+    #: The resolved `agents.max_time` in seconds for the max-time row.
+    #: None means the caller has no reading, and then the report carries
+    #: no max-time row.
+    max_time_s: float | None = None
     deps_error: str | None = None
     #: Roles with invalid prompt overrides, as "role: problem".
     prompts_invalid: Sequence[str] = ()
@@ -472,6 +477,80 @@ def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = Non
         f"{detail}; {unticketed} live agents hold no ticket",
         "the agent should register its ticket (`korapy agent register --repo REPO --number N`)",
     )
+
+
+def _format_span(seconds) -> str:
+    """`seconds` as a short span: "45s", "30m", "4h", "2d". Pure."""
+    try:
+        secs = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def check_max_time(limit_s, rows) -> list[Check]:
+    """The wall-clock row: warn when the limit is shorter than the longest
+    recent finished run from the registry.
+
+    Pure over the resolved limit and the registry rows. None means the
+    caller has no reading: no row. No finished run with a readable span
+    means nothing to compare: no row either. Otherwise one row: ok when
+    the limit covers the longest run, warn when a recent run outran it,
+    so the operator raises the limit before the unit starts killing
+    agents that were nearly done.
+    """
+    if limit_s is None:
+        return []
+    longest = None
+    for entry, state in rows or ():
+        if state != registry.FINISHED:
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        start, end = entry.get("started_at"), entry.get("ended_at")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+        ):
+            continue
+        try:
+            run = float(end) - float(start)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if run < 0:
+            continue
+        longest = run if longest is None else max(longest, run)
+    if longest is None:
+        return []
+    if longest <= limit_s:
+        return [
+            Check(
+                "agents.max_time",
+                "ok",
+                f"the wall-clock limit ({_format_span(limit_s)}) covers "
+                f"the longest recent finished run ({_format_span(longest)})",
+                "",
+            )
+        ]
+    return [
+        Check(
+            "agents.max_time",
+            "warn",
+            f"the wall-clock limit ({_format_span(limit_s)}) is shorter than "
+            f"the longest recent finished run ({_format_span(longest)})",
+            "raise `agents.max_time` in korapy.toml, then run `korapy doctor` again",
+        )
+    ]
 
 
 def _check_prompts(invalid: Sequence[str], stale_roles: Sequence[str], error: str | None) -> Check:
@@ -886,6 +965,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
+        *check_max_time(env.max_time_s, env.registry_rows),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_repos(env.repo_sites),
@@ -1875,9 +1955,14 @@ def production_env() -> Env:
         except settings.SettingsError as err:
             settings_error = str(err)
             registry_cfg = registry.default_config()
+        try:
+            _, max_time_s = launch.max_time_for(resolved)
+        except launch.LaunchError:
+            max_time_s = None
     else:
         prefix = str(settings.REGISTRY["agents.unit_prefix"].default)
         registry_cfg = registry.default_config()
+        max_time_s = None
     try:
         account_problems = accounts.check()
     except (paths.PathError, accounts.AccountsError) as err:
@@ -1930,6 +2015,7 @@ def production_env() -> Env:
         reader_errors=load_readers(),
         registry_rows=registry_rows,
         registry_error=registry_error,
+        max_time_s=max_time_s,
         prompts_invalid=prompts_invalid,
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
