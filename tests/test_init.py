@@ -312,6 +312,9 @@ TAIL = """# Defaults: uncomment to override.
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 # drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
 #
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
+#
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.commits.conventional = true  # enforce Conventional Commits
@@ -452,6 +455,9 @@ commits.conventional = false
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 # drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
+#
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template

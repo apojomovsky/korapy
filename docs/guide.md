@@ -402,19 +402,35 @@ Each repo syncs and mirrors through its own tracker. The pass holds
 the single-instance lock and exits 2 when another pass holds it. In
 hub mode the hub claim comes first, and an unreachable hub exits 3.
 
-To freeze the loop without touching the timer, write the pause file.
-Its first line is the reason humans see:
+To freeze the loop without touching the timer, hold it with
+`korapy freeze`. `start` stops new starts at once, waits reporting
+each poll until no agent is live, and records the freeze with its
+reason; `--until` names the tickets whose close ends the freeze by
+itself on the next pass (closed tickets, not the merge itself),
+and `end` resumes by hand:
+
+```sh
+korapy freeze start --until myrepo#7 --reason sweep
+korapy drive --plan
+korapy freeze end
+```
+
+What you should see while the freeze stands is
+`korapy drive: paused: frozen: sweep` and exit 1, with
+nothing started. The state lives directly in the state dir
+(`drive.freeze` beside `drive.pause` and `drive.lock`); the dashboard
+names the freeze and a freeze past `freeze.max_age_s` warns in
+`korapy doctor`, so one left on after a crash never blocks starts
+silently.
+
+For a bare pause with no drain and no record, write the pause file
+yourself. Its first line is the reason humans see:
 
 ```sh
 echo "deploy freeze, back soon" > ~/.local/state/korapy/drive.pause
 korapy drive --plan
 rm ~/.local/state/korapy/drive.pause
 ```
-
-What you should see while the file exists is
-`korapy drive: paused: deploy freeze, back soon` and exit 1, with
-nothing started. The file lives directly in the state dir
-(`drive.pause` beside `drive.lock`); remove it to resume.
 
 Repeat the pass on a cadence with the user timer:
 

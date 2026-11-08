@@ -16,6 +16,7 @@ import sys
 import time
 
 from korapy import accounts, board, drive
+from korapy import freeze
 from korapy import hub as hubmod
 from korapy import paths, projects, quota, settings, syncli, trackers, units
 
@@ -334,6 +335,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 err=sys.stderr,
                 hold_label=hold_label,
                 pause_path=drive.pause_path(),
+                freeze_path=freeze.freeze_path(),
                 projects_fn=lambda: registered,
                 agent_states=planned_states,
                 finished_for=planned_finished,
@@ -430,6 +432,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             finished_for=finished_for,
             journal_path=drive.journal_path(),
             pause_path=drive.pause_path(),
+            freeze_path=freeze.freeze_path(),
             day_path=drive.day_path(),
             max_starts=max_starts,
             hub=hub,

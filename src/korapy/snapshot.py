@@ -689,6 +689,7 @@ def collect_kwargs() -> dict:
         admission,
         coordevents,
         drive,
+        freeze,
         projects,
         quota_ledger,
         quotacli,
@@ -728,6 +729,7 @@ def collect_kwargs() -> dict:
             max_starts=resolved["drive.max_starts_per_day"],
             journal_path=drive.journal_path(),
             pause_path=drive.pause_path(),
+            freeze_path=freeze.freeze_path(),
             day_path=drive.day_path(),
             lock_path=drive.lock_path(),
         )
