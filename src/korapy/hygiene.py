@@ -417,7 +417,7 @@ def _below_any(resolved, roots):
 
 
 def _eligible(rule, entries, roots, notes):
-    """`(kept_unreadable, entries)` after the symlink and escape drops.
+    """`(kept, live)` after the symlink and escape drops.
 
     Symlinks are never candidates and never followed; anything resolving
     outside every declared root is dropped with a note. Both drops are
@@ -489,10 +489,10 @@ def _plan_count(rule, live, *, notes):
     assert rule.keep is not None
     ordered = sorted(live, key=_by_mtime_name)
     survivors = ordered[-rule.keep :] if rule.keep else []
-    safe = {id(found) for found in ordered[: len(ordered) - len(survivors)]}
+    safe = {found.path for found in ordered[: len(ordered) - len(survivors)]}
     rows = []
     for found in live:
-        if id(found) in safe:
+        if found.path in safe:
             rows.append(
                 Candidate(
                     HYGIENE_DIR,
