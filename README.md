@@ -2,7 +2,7 @@
   <img src="docs/assets/korapy-logo.svg" alt="korapy" width="200">
 </p>
 
-# korapy
+# Korapy
 
 korapy runs fleets of headless coding agents on Linux hosts. It claims
 tickets from a board, launches one agent per ticket under a shared

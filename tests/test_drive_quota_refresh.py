@@ -536,7 +536,7 @@ class PoolNoneRefreshTest(unittest.TestCase):
         self.assertEqual(code, drive.USAGE)
         self.assertIn("accounts: gone", err)
 
-    def test_a_none_pool_plan_pass_lists_no_providers(self):
+    def test_a_none_pool_plan_pass_with_covered_quotas_lists_no_providers(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         entry = self.write_policy("blue_policy", [("app", 7, "start")])
@@ -725,6 +725,32 @@ class PassRefreshLockBranchTest(unittest.TestCase):
         )
         self.assertEqual(code, drive.USAGE)
         self.assertEqual(reader.calls, 1)
+        reread = quota_ledger.load()
+        self.assertEqual(reread["readings"]["provider-a"]["read_at"], T0)
+
+    def test_a_none_pool_refreshes_through_the_ledger_lock(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        old = {
+            "windows": {"weekly": {"used_pct": 10.0, "resets_at": None}},
+            "read_at": T0 - 6 * 86400,
+        }
+        quota_ledger.save({"readings": {"provider-a": old}, "marks": {}})
+        reader = CountingReader()
+        with mock.patch.object(accounts, "providers", return_value=[provider()]) as listed:
+            code, out, err = self.run_pass(
+                store,
+                [self.project("blue", entry)],
+                quotas=self.quotas(),
+                quota_refresh_after_s=AGE,
+                quota_load_reader=loader_for(reader),
+            )
+        self.assertEqual(listed.call_count, 1)
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        self.assertNotIn("quota", err)
         reread = quota_ledger.load()
         self.assertEqual(reread["readings"]["provider-a"]["read_at"], T0)
 
