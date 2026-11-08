@@ -134,9 +134,9 @@ class RecordTest(unittest.TestCase):
             body = handle.read()
         self.assertIn(f"Decision: {DECISION}", body)
         kinds = [call[0] for call in self.fake.calls]
-        self.assertEqual(kinds, ["item", "remove_label", "comments", "comment"])
+        self.assertEqual(kinds, ["item", "comments", "comment", "remove_label"])
         self.assertEqual(
-            self.fake.calls[1], ("remove_label", TRACKER_REPO, NUMBER, "needs-decision")
+            self.fake.calls[3], ("remove_label", TRACKER_REPO, NUMBER, "needs-decision")
         )
         comment = [call[3] for call in self.fake.calls if call[0] == "comment"][0]
         self.assertIn(f"Decision on {REPO}#{NUMBER}: {DECISION}", comment)
@@ -155,13 +155,14 @@ class RecordTest(unittest.TestCase):
         self.assertTrue(second.already)
         self.assertEqual(second.path, first.path)
         replayed = [call[0] for call in self.fake.calls[len(calls) :]]
-        self.assertEqual(replayed, ["item", "remove_label", "comments"])
+        self.assertEqual(replayed, ["item", "comments", "remove_label"])
         posted = [body for bodies in self.fake.posted_comments.values() for body in bodies]
         self.assertEqual(len(posted), 1)
         self.assertEqual(len(coord.read_entries(root=self.coords)), 1)
 
     def test_conflicting_slug_is_a_usage_error(self):
         self.record()
+        self.fake.add(reading(repo=TRACKER_REPO, number=9, updated_at=T0.timestamp()))
         with self.assertRaises(decision.UsageError):
             self.record(number=9)
 
@@ -393,7 +394,7 @@ class ExactTicketLineTest(unittest.TestCase):
 
 
 class FileFirstOrderingTest(unittest.TestCase):
-    """The file lands before any tracker call, so a local failure posts nothing."""
+    """The file lands before any tracker write, so a local failure posts nothing."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -417,7 +418,8 @@ class FileFirstOrderingTest(unittest.TestCase):
                     coord_root=self.coords,
                     now=T0,
                 )
-        self.assertEqual(self.fake.calls, [])
+        kinds = [call[0] for call in self.fake.calls]
+        self.assertEqual(kinds, ["item"])
 
     def test_retry_after_write_failure_comments_once(self):
         real_write = decision._write_file
@@ -596,6 +598,97 @@ class HolderFallbackTest(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             decisioncli._holder_and_generation(Boom(), "/tmp/x")
+
+
+class PrefixDecisionTest(unittest.TestCase):
+    """A shorter decision is never "already present" inside a longer one."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def record(self, **over):
+        params = {
+            "repo": REPO,
+            "tracker_repo": TRACKER_REPO,
+            "number": NUMBER,
+            "why": WHY,
+            "tracker": self.fake,
+            "ops_root": self.ops,
+            "coord_root": self.coords,
+            "now": T0,
+        }
+        params.update(over)
+        return decision.record(**params)
+
+    def test_prefix_decision_posts_its_own_comment_and_log_entry(self):
+        first = self.record(decision="Ship it")
+        second = self.record(decision="Ship")
+        self.assertFalse(first.already)
+        self.assertFalse(second.already)
+        self.assertNotEqual(first.path, second.path)
+        bodies = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 2)
+        entries = coord.read_entries(root=self.coords)
+        self.assertEqual(len(entries), 2)
+
+
+class PublishOrderTest(unittest.TestCase):
+    """The comment posts before the label leaves, so a failed post keeps it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def test_comment_posts_before_label_removal(self):
+        decision.record(
+            repo=REPO,
+            tracker_repo=TRACKER_REPO,
+            number=NUMBER,
+            decision=DECISION,
+            why=WHY,
+            tracker=self.fake,
+            ops_root=self.ops,
+            coord_root=self.coords,
+            now=T0,
+        )
+        kinds = [call[0] for call in self.fake.calls]
+        self.assertEqual(kinds, ["item", "comments", "comment", "remove_label"])
+
+
+class UnknownTicketTest(unittest.TestCase):
+    """A read-only probe runs before the file write: no orphan records."""
+
+    def test_unknown_ticket_writes_no_file(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ops = os.path.join(tmp.name, "ops")
+        coords = os.path.join(tmp.name, "coords")
+        os.makedirs(ops)
+        fake = FakeTracker([], labels=[(TRACKER_REPO, ("needs-decision",))])
+        with self.assertRaises(tracker.TrackerError):
+            decision.record(
+                repo=REPO,
+                tracker_repo=TRACKER_REPO,
+                number=NUMBER,
+                decision=DECISION,
+                why=WHY,
+                tracker=fake,
+                ops_root=ops,
+                coord_root=coords,
+                now=T0,
+            )
+        base = os.path.join(ops, "decisions")
+        names = os.listdir(base) if os.path.isdir(base) else []
+        self.assertEqual(names, [])
 
 
 if __name__ == "__main__":

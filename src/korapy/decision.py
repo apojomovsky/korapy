@@ -6,15 +6,17 @@ agent) finds without reading chat: a markdown file under the ops root's
 line, the ``needs-decision`` label removed, and a ``decision`` entry in
 the coordinator logbook.
 
-Ordering and retry: the file lands first, and only then do the tracker
-calls and the logbook entry follow. A local failure before the file
-lands runs no tracker call, so the retry starts fresh. A retry that
-finds its file replays only what is missing: it lists the ticket
-comments and posts only when the decision line is absent, removing an
-absent label succeeds, and a missing logbook entry is appended. The
-file is written once and the comment posts once, whatever date the
-retry runs on: the retry reuses the first filename, never a recomputed
-one.
+Ordering and retry: a read-only ticket probe runs first, then the
+file lands, and only then do the tracker calls and the logbook entry
+follow. A local failure before the file lands runs no tracker write,
+so the retry starts fresh. A retry that finds its file replays only
+what is missing: it lists the ticket comments and posts only when the
+decision line is absent as a whole line, the comment posts before the
+label leaves, removing an absent label succeeds, and a missing
+logbook entry is appended. The file is written once and the comment
+posts once, whatever date the retry runs on: the retry reuses the
+first filename, never a recomputed one. One operator at a time: the
+verb takes no lock.
 """
 
 import datetime
@@ -239,14 +241,14 @@ def _recorded_lines(path):
 
 
 def _comment_present(tracker, tracker_repo, number, line):
-    """Whether the ticket already carries ``line`` in one comment."""
-    return any(line in body for body in tracker.comments(tracker_repo, number))
+    """Whether one ticket comment carries ``line`` as a whole line."""
+    return any(line in body.splitlines() for body in tracker.comments(tracker_repo, number))
 
 
-def _logbook_present(coord_root, line):
-    """Whether the logbook already holds a decision entry for ``line``."""
+def _logbook_present(coord_root, entry_text):
+    """Whether the logbook already holds exactly ``entry_text`` as one entry."""
     return any(
-        entry.get("kind") == "decision" and line in (entry.get("text") or "")
+        entry.get("kind") == "decision" and entry_text in (entry.get("text") or "").splitlines()
         for entry in coord.read_entries(root=coord_root)
     )
 
@@ -274,14 +276,14 @@ def _publish(
 
     ``filename`` is the basename of the record file, first write or
     retry alike, so the comment always names the file on disk.
-    ``item`` proves the ticket is reachable, ``comments`` finds the
-    decision line a retry already posted, ``remove_label`` clears
-    ``needs-decision`` (removing an absent label succeeds), and the
-    logbook entry is appended only when missing.
+    ``record`` already probed the ticket with ``item``; here
+    ``comments`` finds the decision line a retry already posted, the
+    comment posts before ``remove_label`` clears ``needs-decision``
+    (so a failed post keeps the label and the retry still converges),
+    removing an absent label succeeds, and the logbook entry is
+    appended only when missing.
     """
     line = decision_line(repo, number, text)
-    tracker.item(tracker_repo, number)
-    tracker.remove_label(tracker_repo, number, iface.NEEDS_DECISION)
     if not _comment_present(tracker, tracker_repo, number, line):
         tracker.comment(
             tracker_repo,
@@ -301,7 +303,8 @@ def _publish(
             ),
         )
     entry_text = f"{line} ({DECISIONS_DIRNAME}/{filename})"
-    if not _logbook_present(coord_root, line):
+    tracker.remove_label(tracker_repo, number, iface.NEEDS_DECISION)
+    if not _logbook_present(coord_root, entry_text):
         coord.append_entry(
             "decision",
             entry_text,
@@ -334,16 +337,20 @@ def record(
 ):
     """Record one decision: file, ticket comment, label removal, logbook.
 
-    The file lands first; the one tracker call set per record follows
-    (``item``, ``remove_label``, ``comments``, and ``comment`` only
-    when the decision line is absent), and the logbook entry last. A
-    local failure before the file lands runs no tracker call, so the
-    retry starts fresh; a retry that finds its file replays only what
-    is missing and returns it with ``already`` set. A ``TrackerError``
-    leaves the file without its comment or log entry, and the retry
-    completes it. A file with the same slug for another ticket is a
-    ``UsageError``: the operator rewords the decision instead of
-    overwriting a record.
+    A read-only ``item`` probe runs first and proves the ticket is
+    reachable, so a deleted ticket writes no orphan file. The file
+    lands next; the one tracker call set per record follows
+    (``comments``, ``comment`` only when the decision line is absent
+    as a whole line, then ``remove_label``), and the logbook entry
+    last. A local failure before the file lands runs no tracker
+    write, so the retry starts fresh; a retry that finds its file
+    replays only what is missing and returns it with ``already`` set.
+    A ``TrackerError`` leaves the file without its comment or log
+    entry, and the retry completes it. A file with the same slug for
+    another ticket is a ``UsageError``: the operator rewords the
+    decision instead of overwriting a record. One operator at a time:
+    the verb takes no lock, so two concurrent records of the same
+    decision can each post.
     """
     text, reason, slug = _check_args(number, decision, why, reversible, confidence)
     for follow in follow_ups:
@@ -352,6 +359,7 @@ def record(
                 f"korapy decision record --follow-up wants ticket numbers, got {follow!r}"
             )
     opt_settles, opt_open, opt_reopen = _opt(settles), _opt(still_open), _opt(reopen_when)
+    tracker.item(tracker_repo, number)
     existing = find_recorded(ops_root, slug)
     if existing is not None:
         lines = _recorded_lines(existing)
