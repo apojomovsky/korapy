@@ -448,7 +448,7 @@ class DeclaredRootsCase(unittest.TestCase):
 
     def test_root_none_with_dir_rule_is_refused(self):
         rules = hygiene.check_table({"x": dir_rule()}, "korapy.toml")
-        with self.assertRaisesRegex(settings.SettingsError, "x"):
+        with self.assertRaisesRegex(settings.SettingsError, r"\[hygiene\.x\]"):
             hygiene.declared_roots(rules, root=None, env=self.env)
 
     def test_root_none_with_image_only_reads_as_no_roots(self):
@@ -1066,10 +1066,10 @@ class SessionPlanScopeCase(unittest.TestCase):
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 
-#: The one join of a rule's base and path, as (module stem, function).
+#: The one join of a rule's base and path, as (ROOT-relative path, function).
 #: `declared_roots` owns it; a second join anywhere else is the
 #: AGENTS.md one-fact-one-place bug, even when the two agree today.
-HYGIENE_JOIN_ALLOW = {("hygiene", "declared_roots")}
+HYGIENE_JOIN_ALLOW = {("hygiene.py", "declared_roots")}
 
 
 def _enclosing_names(tree):
@@ -1126,12 +1126,22 @@ def _rule_path_joins(path):
     return _rule_path_joins_in(ast.parse(path.read_text(encoding="utf-8")))
 
 
+def _allow_key(path):
+    """The guard allow-list key: the `ROOT`-relative path, never the stem.
+
+    Stems collide across `src/korapy/*.py` and `src/korapy/github/*.py`
+    (`board.py` exists in both), so a stem key would admit or excuse the
+    wrong file.
+    """
+    return path.relative_to(ROOT).as_posix()
+
+
 class ResolverGuardTest(unittest.TestCase):
     def test_no_second_base_plus_path_join_exists(self):
         problems = []
         for path in sorted(ROOT.rglob("*.py")):
             for func, lineno in _rule_path_joins(path):
-                if (path.stem, func) not in HYGIENE_JOIN_ALLOW:
+                if (_allow_key(path), func) not in HYGIENE_JOIN_ALLOW:
                     problems.append(f"{path.relative_to(ROOT)}:{lineno} {func}")
         self.assertEqual(problems, [], f"second base plus path join: {problems}")
 
@@ -1139,7 +1149,7 @@ class ResolverGuardTest(unittest.TestCase):
         seen = set()
         for path in sorted(ROOT.rglob("*.py")):
             for func, _ in _rule_path_joins(path):
-                seen.add((path.stem, func))
+                seen.add((_allow_key(path), func))
         for entry in HYGIENE_JOIN_ALLOW:
             self.assertIn(entry, seen, f"stale allow-list entry: {entry}")
 
@@ -1158,6 +1168,9 @@ class ResolverGuardTest(unittest.TestCase):
     def test_a_plain_base_plus_path_join_passes(self):
         tree = ast.parse("def resolve_policy(base, path):\n    return os.path.join(base, path)\n")
         self.assertEqual(_rule_path_joins_in(tree), [])
+
+    def test_allow_keys_distinguish_same_stem_files(self):
+        self.assertNotEqual(_allow_key(ROOT / "board.py"), _allow_key(ROOT / "github" / "board.py"))
 
     def test_the_resolver_join_itself_is_found(self):
         tree = ast.parse(
