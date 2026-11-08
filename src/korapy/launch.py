@@ -38,11 +38,6 @@ from korapy import pushenv, settings, units, worktrees
 from korapy.runtimes import muse
 from korapy.runtimes import tail as runtime_tail
 
-#: The default run time limit in seconds for the unit's RuntimeMaxSec,
-#: parsed from runtimes.DEFAULT_MAX_TIME ("3h"); a test asserts the two
-#: agree. Configured limits resolve through `max_time_for`, never here.
-RUNTIME_MAX_S = int(accounts.parse_duration(runtimes.DEFAULT_MAX_TIME, "agents.max_time"))
-
 #: Appended to an admission error when the live agent is a registered one.
 REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
 
@@ -751,9 +746,12 @@ def _close_previous(tgt, number, list_fn, now_fn=None):
     live keeps its entry, and admission still refuses the ticket for it.
     Unknown or already finished ids are skipped, so a session logged
     before launch wrote registry entries relaunches cleanly. A unit
-    that ran past its wall-clock limit closes as timed-out, so the
-    dashboard shows why it ended; anything else closes as ok. Returns
-    the units closed.
+    that ran past the wall-clock limit it launched under closes as
+    timed-out, so the dashboard shows why it ended; anything else
+    closes as ok. The limit is the one recorded on the entry at launch,
+    never the setting at close time; entries that record none (from
+    before limits were recorded, or registered by hand) fall back to
+    the current setting. Returns the units closed.
     """
     logged = []
     roles = {}
@@ -770,11 +768,13 @@ def _close_previous(tgt, number, list_fn, now_fn=None):
     for unit in logged:
         if unit in live:
             continue
-        _, limit_s = max_time_for(tgt.resolved, reviewer=(roles[unit] == "reviewer"))
         found = registry.entry(unit)
         started = found.get("started_at") if found is not None else None
+        recorded = found.get("max_time_s") if found is not None else None
+        if isinstance(recorded, bool) or not isinstance(recorded, (int, float)) or recorded < 1:
+            _, recorded = max_time_for(tgt.resolved, reviewer=(roles[unit] == "reviewer"))
         try:
-            registry.done(unit, outcome=_close_outcome(started, limit_s, now))
+            registry.done(unit, outcome=_close_outcome(started, recorded, now))
         except registry.RegistryError:
             continue
         except OSError as err:
@@ -784,7 +784,7 @@ def _close_previous(tgt, number, list_fn, now_fn=None):
     return closed
 
 
-def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
+def _register_started(tgt, unit, number, model, role=None, *, runtime, profile, limit_s):
     """Register the unit before it starts, so agent list and snapshot show it.
 
     The ticket names the registered project of the ops root, so the
@@ -794,7 +794,11 @@ def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
     profile's name, so snapshot shows the recorded profile. Both are
     required keyword arguments: every launch resolves one profile since
     the cutover, and registering a None runtime would fail closed in
-    the registry instead of running the recorded setup.
+    the registry instead of running the recorded setup. `limit_s` is the
+    wall-clock limit in seconds the unit launches under, recorded so the
+    close path attributes the timeout from it, never from the setting at
+    close time. It is required too: the launch already resolved it for
+    the unit's RuntimeMaxSec.
     Raises LaunchError naming the unit when the registry cannot record
     it; the unit is not running yet.
     """
@@ -808,6 +812,7 @@ def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
             model=model,
             role=role,
             profile=profile,
+            max_time_s=limit_s,
         )
     except (registry.RegistryError, OSError) as err:
         raise LaunchError(f"cannot register the agent {unit}: {err}") from None
@@ -1071,6 +1076,7 @@ def launch(
             role,
             runtime=session_runtime,
             profile=selection.profile.name,
+            limit_s=limit_s,
         )
         try:
             _ensure_slices(decided, run)
@@ -1450,6 +1456,7 @@ def resume(
             recorded,
             runtime=session_runtime,
             profile=profile_name,
+            limit_s=limit_s,
         )
         try:
             _ensure_slices(decided, run)

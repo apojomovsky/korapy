@@ -264,6 +264,10 @@ def finished_entry(run_s, gap_s=0.0):
     }
 
 
+def reviewer_entry(run_s, gap_s=0.0):
+    return {**finished_entry(run_s, gap_s), "role": "reviewer"}
+
+
 class MaxTime(unittest.TestCase):
     def test_no_row_without_a_limit_reading(self):
         rows = ((finished_entry(4 * 3600), registry.FINISHED),)
@@ -304,6 +308,44 @@ class MaxTime(unittest.TestCase):
         checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
         found = [check for check in checks if check.name == "agents.max_time"]
         self.assertEqual([check.status for check in found], ["ok"])
+
+    def test_reviewer_runs_read_the_worker_limit_without_an_override(self):
+        rows = ((reviewer_entry(4 * 3600), registry.FINISHED),)
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertNotIn("agents.reviewer_max_time", names(checks))
+
+    def test_warn_when_a_reviewer_run_outruns_the_reviewer_limit(self):
+        rows = ((reviewer_entry(50 * 60), registry.FINISHED),)
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        found = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("agents.reviewer_max_time", found[0].fix)
+
+    def test_ok_when_reviewer_runs_fit_the_reviewer_limit(self):
+        rows = ((reviewer_entry(20 * 60), registry.FINISHED),)
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        found = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_each_role_reads_its_own_limit(self):
+        rows = (
+            (finished_entry(2 * 3600), registry.FINISHED),
+            (reviewer_entry(50 * 60), registry.FINISHED),
+        )
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        worker = [check for check in checks if check.name == "agents.max_time"]
+        reviewing = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in worker], ["ok"])
+        self.assertEqual([check.status for check in reviewing], ["warn"])
 
 
 class Rendering(unittest.TestCase):

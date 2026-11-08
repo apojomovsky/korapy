@@ -226,7 +226,7 @@ class TargetTest(OpsCase):
 
     def test_the_runtime_limit_matches_the_runtime_default(self):
         self.assertEqual(runtimes.DEFAULT_MAX_TIME, "3h")
-        self.assertEqual(launch.RUNTIME_MAX_S, 3 * 3600)
+        self.assertEqual(launch.max_time_for(self.target("lib").resolved), ("3h", 3 * 3600))
 
 
 class MaxTimeTest(OpsCase):
@@ -264,8 +264,49 @@ class MaxTimeTest(OpsCase):
         self.assertEqual(
             settings.REGISTRY["agents.reviewer_max_time"].default, runtimes.DEFAULT_MAX_TIME
         )
-        self.assertEqual(launch.RUNTIME_MAX_S, 3 * 3600)
         self.assertEqual(launch.max_time_for(self.target("lib").resolved), ("3h", 3 * 3600))
+
+    def test_the_launch_records_its_limit_on_the_registry_entry(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 4 * 3600)
+
+    def test_a_reviewer_launch_records_the_reviewer_limit(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        unit, _ = self.start(number=6, role="reviewer")
+        self.assertEqual(self.entry(unit)["max_time_s"], 30 * 60)
+
+    def retime(self, old, new):
+        path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn(old, content)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content.replace(old, new))
+
+    def test_close_previous_uses_the_launch_limit_after_the_setting_is_raised(self):
+        self.set_max_time('max_time = "30m"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 30 * 60)
+        self.system.finish(unit)
+        self.retime('max_time = "30m"', 'max_time = "4h"')
+        closed = launch._close_previous(
+            self.target("lib"), 5, self.system.list_fn, now_fn=lambda: time.time() + 31 * 60
+        )
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "timed-out")
+
+    def test_close_previous_uses_the_launch_limit_after_the_setting_is_lowered(self):
+        self.set_max_time('max_time = "4h"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 4 * 3600)
+        self.system.finish(unit)
+        self.retime('max_time = "4h"', 'max_time = "30m"')
+        closed = launch._close_previous(
+            self.target("lib"), 5, self.system.list_fn, now_fn=lambda: time.time() + 3600
+        )
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "ok")
 
     def test_the_reviewer_limit_defaults_to_the_worker_limit(self):
         self.set_max_time('max_time = "4h"')

@@ -137,6 +137,10 @@ class Env(NamedTuple):
     #: None means the caller has no reading, and then the report carries
     #: no max-time row.
     max_time_s: float | None = None
+    #: The resolved `agents.reviewer_max_time` in seconds for the reviewer
+    #: max-time row. None means it follows `agents.max_time`, and then
+    #: the report carries no reviewer row.
+    reviewer_max_time_s: float | None = None
     deps_error: str | None = None
     #: Roles with invalid prompt overrides, as "role: problem".
     prompts_invalid: Sequence[str] = ()
@@ -496,19 +500,11 @@ def _format_span(seconds) -> str:
     return f"{hours // 24}d"
 
 
-def check_max_time(limit_s, rows) -> list[Check]:
-    """The wall-clock row: warn when the limit is shorter than the longest
-    recent finished run from the registry.
+def _longest_run(rows) -> float | None:
+    """The longest finished span in `rows`, or None when none reads.
 
-    Pure over the resolved limit and the registry rows. None means the
-    caller has no reading: no row. No finished run with a readable span
-    means nothing to compare: no row either. Otherwise one row: ok when
-    the limit covers the longest run, warn when a recent run outran it,
-    so the operator raises the limit before the unit starts killing
-    agents that were nearly done.
+    Pure: only finished rows with a readable non-negative span count.
     """
-    if limit_s is None:
-        return []
     longest = None
     for entry, state in rows or ():
         if state != registry.FINISHED:
@@ -530,26 +526,72 @@ def check_max_time(limit_s, rows) -> list[Check]:
         if run < 0:
             continue
         longest = run if longest is None else max(longest, run)
+    return longest
+
+
+def _max_time_rows(name, limit_s, rows, run_noun) -> list[Check]:
+    """The one wall-clock row for `run_noun` runs: ok when the limit covers
+    the longest, warn when a recent run outran it.
+
+    Pure over the resolved limit and the registry rows. None means the
+    caller has no reading: no row. No finished run with a readable span
+    means nothing to compare: no row either.
+    """
+    if limit_s is None:
+        return []
+    longest = _longest_run(rows)
     if longest is None:
         return []
     if longest <= limit_s:
         return [
             Check(
-                "agents.max_time",
+                name,
                 "ok",
-                f"the wall-clock limit ({_format_span(limit_s)}) covers "
-                f"the longest recent finished run ({_format_span(longest)})",
+                f"the {run_noun}wall-clock limit ({_format_span(limit_s)}) covers "
+                f"the longest recent finished {run_noun}run ({_format_span(longest)})",
                 "",
             )
         ]
     return [
         Check(
-            "agents.max_time",
+            name,
             "warn",
-            f"the wall-clock limit ({_format_span(limit_s)}) is shorter than "
-            f"the longest recent finished run ({_format_span(longest)})",
-            "raise `agents.max_time` in korapy.toml, then run `korapy doctor` again",
+            f"the {run_noun}wall-clock limit ({_format_span(limit_s)}) is shorter than "
+            f"the longest recent finished {run_noun}run ({_format_span(longest)})",
+            f"raise `{name}` in korapy.toml, then run `korapy doctor` again",
         )
+    ]
+
+
+def check_max_time(limit_s, rows, reviewer_limit_s=None) -> list[Check]:
+    """The wall-clock rows: warn when a limit is shorter than the longest
+    recent finished run from the registry.
+
+    Pure over the resolved limits and the registry rows. Without a
+    reviewer override every finished run reads against `agents.max_time`,
+    one row. With one, worker runs read against `agents.max_time` and
+    reviewer runs (entries with the reviewer role) against
+    `agents.reviewer_max_time`, one row per role that has a finished
+    run, so a reviewer limit that would now kill reviewer runs warns
+    even when the worker limit covers them. Either row warns so the
+    operator raises the limit before the unit starts killing agents
+    that were nearly done.
+    """
+    if reviewer_limit_s is None:
+        return _max_time_rows("agents.max_time", limit_s, rows, "")
+    worker = [
+        (entry, state)
+        for entry, state in (rows or ())
+        if not (isinstance(entry, Mapping) and entry.get("role") == "reviewer")
+    ]
+    reviewing = [
+        (entry, state)
+        for entry, state in (rows or ())
+        if isinstance(entry, Mapping) and entry.get("role") == "reviewer"
+    ]
+    return [
+        *_max_time_rows("agents.max_time", limit_s, worker, ""),
+        *_max_time_rows("agents.reviewer_max_time", reviewer_limit_s, reviewing, "reviewer "),
     ]
 
 
@@ -965,7 +1007,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
-        *check_max_time(env.max_time_s, env.registry_rows),
+        *check_max_time(env.max_time_s, env.registry_rows, env.reviewer_max_time_s),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_repos(env.repo_sites),
@@ -1959,10 +2001,17 @@ def production_env() -> Env:
             _, max_time_s = launch.max_time_for(resolved)
         except launch.LaunchError:
             max_time_s = None
+        try:
+            _, reviewer_max_time_s = launch.max_time_for(resolved, reviewer=True)
+        except launch.LaunchError:
+            reviewer_max_time_s = None
+        if reviewer_max_time_s == max_time_s:
+            reviewer_max_time_s = None
     else:
         prefix = str(settings.REGISTRY["agents.unit_prefix"].default)
         registry_cfg = registry.default_config()
         max_time_s = None
+        reviewer_max_time_s = None
     try:
         account_problems = accounts.check()
     except (paths.PathError, accounts.AccountsError) as err:
@@ -2016,6 +2065,7 @@ def production_env() -> Env:
         registry_rows=registry_rows,
         registry_error=registry_error,
         max_time_s=max_time_s,
+        reviewer_max_time_s=reviewer_max_time_s,
         prompts_invalid=prompts_invalid,
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
