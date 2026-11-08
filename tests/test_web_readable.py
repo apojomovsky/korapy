@@ -61,7 +61,8 @@ def build_doc():
 
 
 class SnapshotSchemaUnchanged(ServeCase):
-    """The page may reword everything; the document may change nothing."""
+    """Ticket 651 grows the document: the panel sections and the new
+    row and header facts below. Anything else still changes nothing."""
 
     def test_top_level_and_header_keys_are_stable(self):
         self.assertEqual(
@@ -75,13 +76,23 @@ class SnapshotSchemaUnchanged(ServeCase):
                 "resources",
                 "disk",
                 "drive",
+                "attention",
+                "plan",
             },
         )
 
     def test_fleet_header_keys_are_stable(self):
         self.assertEqual(
             set(build_doc()["fleet_header"]),
-            {"host", "now", "agents_live", "agents_stale", "agents_finished"},
+            {
+                "host",
+                "now",
+                "tz_offset_s",
+                "now_iso",
+                "agents_live",
+                "agents_stale",
+                "agents_finished",
+            },
         )
 
 
@@ -297,12 +308,15 @@ class VisualPass(unittest.TestCase):
     def test_shipped_bytes_stay_under_the_maintainer_cap(self):
         # Ticket 659 split the gauge figures (short figure plus small
         # detail line, and durations for running-for) and the cap with
-        # it: 160 KB total, still no framework, no build step, no images.
+        # it: 160 KB total. Ticket 651 adds the data panels (derived
+        # states, plan band, honest quota, peek caption, sort menu,
+        # placeholders) and the cap with it: 170 KB total, still no
+        # framework, no build step, no images.
         total = sum(
             len(resources.files("korapy").joinpath(f"web/{name}").read_bytes())
             for name in ("index.html", "app.css", "app.js", "api.js", "fmt.js", "views.js")
         )
-        self.assertLessEqual(total, 160 * 1024)
+        self.assertLessEqual(total, 170 * 1024)
 
 
 if __name__ == "__main__":

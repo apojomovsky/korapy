@@ -119,6 +119,58 @@ export function canonicalJson(value) {
   return text === undefined ? "null" : text;
 }
 
+// Idle seconds in words: "idle 42s". The panel's own fact, not an
+// age: it names how long the agent has sat without a heartbeat.
+// Unknown stays unknown, never a busy zero.
+export function formatIdle(value) {
+  if (value === null || value === undefined) {
+    return "unknown";
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return String(value);
+  }
+  const secs = Math.max(0, Math.round(value));
+  if (secs < 60) {
+    return "idle " + secs + "s";
+  }
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) {
+    return "idle " + mins + "m";
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return "idle " + hours + "h";
+  }
+  return "idle " + Math.floor(hours / 24) + "d";
+}
+
+// A stamp carrying the machine's local offset, sliced for display:
+// the server stamps the offset, the page only formats it in local
+// wall-clock time. Unknown stays unknown, never a converted guess.
+export function formatLocalTime(value) {
+  const ms = typeof value === "string" ? parseIso(value) : parseEpoch(value);
+  if (ms === null || ms === undefined) {
+    return "unknown";
+  }
+  if (typeof ms !== "number") {
+    return String(ms);
+  }
+  const at = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    pad(at.getFullYear() % 100) +
+    "-" +
+    pad(at.getMonth() + 1) +
+    "-" +
+    pad(at.getDate()) +
+    " " +
+    pad(at.getHours()) +
+    ":" +
+    pad(at.getMinutes()) +
+    " local"
+  );
+}
+
 // A retention window in words for the finished toggle caption:
 // "6 hours". Anything unparseable reads as "a while", never zero.
 export function formatRetentionWindow(ms) {

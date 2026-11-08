@@ -24,8 +24,10 @@ import {
   formatBytes,
   formatCpu,
   formatDuration,
+  formatIdle,
   formatLoadDetail,
   formatLoadFigure,
+  formatLocalTime,
   formatMem,
   formatMemDetail,
   formatMemFigure,
@@ -57,8 +59,10 @@ export function el(tag, text, attrs) {
 }
 
 // The footer line: backend mode, API version, document schema and
-// server time. Server facts, kept out of the visual centre.
-export function renderShell({ mode, api, version, seenMs, serverNowMs }) {
+// server time. Server facts, kept out of the visual centre. The
+// clock stamp carries the machine's local offset from the snapshot;
+// the page only slices it into local wall-clock time, never converts.
+export function renderShell({ mode, api, version, seenMs, serverNowMs, nowIso }) {
   const modeNode = document.getElementById("mode");
   modeNode.textContent = mode + " mode";
   const apiNode = document.getElementById("api");
@@ -70,6 +74,9 @@ export function renderShell({ mode, api, version, seenMs, serverNowMs }) {
   }
   if (typeof serverNowMs === "number") {
     parts.push("server time " + formatAge(serverNowMs, seenMs));
+  }
+  if (typeof nowIso === "string" && nowIso !== "") {
+    parts.push("server clock " + formatLocalTime(nowIso));
   }
   line.textContent = "";
   line.appendChild(document.createTextNode(parts.join(", ")));
@@ -289,7 +296,11 @@ function quotaWindow(id, window, info, nowMs) {
     return wrap;
   }
   wrap.appendChild(meter(used / 100, quotaMeterState(info), "window " + String(id)));
-  wrap.appendChild(el("span", " " + formatResetLine(window.resets_at, nowMs)));
+  const windowSource =
+    window !== null && typeof window === "object" && window.source === "estimate"
+      ? " (estimate)"
+      : "";
+  wrap.appendChild(el("span", " " + formatResetLine(window.resets_at, nowMs) + windowSource));
   return wrap;
 }
 
@@ -316,6 +327,16 @@ function quotaProvider(name, info, nowMs) {
   }
   line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + read)));
   group.appendChild(line);
+  // Honest quota: where the number came from. Estimates wear the
+  // word estimate, never a measured meter; unknown stays unknown.
+  const source = typeof info.source === "string" && info.source !== "" ? info.source : "unknown";
+  group.appendChild(
+    el(
+      "p",
+      "source: " + source + (source === "estimate" ? " (estimate)" : ""),
+      { class: "desc" },
+    ),
+  );
   // The operator mark: a blocked provider names when the mark lifts,
   // in local wall-clock time with the countdown, like the resets.
   const mark = info.mark && typeof info.mark === "object" ? info.mark : null;
@@ -332,8 +353,22 @@ function quotaProvider(name, info, nowMs) {
       ),
     );
   }
-  if (typeof info.error === "string" && info.error !== "") {
-    group.appendChild(el("p", "reader error: " + info.error));
+  // A failed read names its failure, trimmed by the server to a
+  // bounded line; the full text stays in the snapshot for the CLI.
+  const trimmed =
+    typeof info.error_trimmed === "string" && info.error_trimmed !== ""
+      ? info.error_trimmed
+      : null;
+  const failure =
+    trimmed !== null
+      ? trimmed
+      : typeof info.error === "string" && info.error !== ""
+        ? info.error
+        : null;
+  if (failure !== null && failure !== "none" && failure !== "unknown") {
+    group.appendChild(el("p", "reader error: " + failure));
+  } else if (info.read_failed) {
+    group.appendChild(el("p", "reader error: unknown"));
   }
   const windows = info.windows && typeof info.windows === "object" ? info.windows : null;
   if (windows === null) {
@@ -790,7 +825,11 @@ function agentText(row, nowMs) {
     row.repo === null || row.repo === undefined || row.number === null || row.number === undefined
       ? "no ticket"
       : String(row.repo) + "#" + String(row.number);
-  const bits = [ticket, String(row.state)];
+  // The derived panel state leads: what the agent is doing, then its
+  // registry liveness. Unknown rows read unknown, never a guess.
+  const derived =
+    typeof row.derived === "string" && row.derived !== "" ? row.derived : "unknown";
+  const bits = [ticket, String(row.state) + "/" + derived];
   if (row.runtime !== null && row.runtime !== undefined) {
     bits.push(String(row.runtime));
   }
@@ -804,7 +843,10 @@ function agentText(row, nowMs) {
     bits.push("started " + age(row.started_at, nowMs));
   }
   bits.push("seen " + age(row.last_seen, nowMs));
-  return { line: bits.join("  "), note: row.note };
+  const doing = typeof row.doing === "string" && row.doing !== "" ? row.doing : "unknown";
+  const idle =
+    row.idle_s === null || row.idle_s === undefined ? "unknown" : formatIdle(row.idle_s);
+  return { line: bits.join("  "), note: row.note, doing, idle };
 }
 
 // One agent row as table cells: id, ticket, role, runtime, state,
@@ -848,25 +890,42 @@ function agentRow(row, nowMs) {
     row.runtime === null || row.runtime === undefined ? "no runtime" : String(row.runtime),
   );
   cell("c-runtime", runtimeNode);
+  // The derived panel state: what the agent is doing, not just its
+  // registry liveness. The dot keeps the registry state as its class;
+  // the words name the derived fact, unknown when the row predates it.
+  const derived =
+    typeof row.derived === "string" && row.derived !== "" ? row.derived : "unknown";
   const stateNode = document.createElement("span");
   stateNode.setAttribute("class", "state state-" + String(row.state));
+  stateNode.setAttribute("title", "registry: " + String(row.state));
   const dot = document.createElement("span");
   dot.setAttribute("class", "dot");
   dot.setAttribute("aria-hidden", "true");
   stateNode.appendChild(dot);
-  stateNode.appendChild(document.createTextNode(cleanText(String(row.state))));
+  stateNode.appendChild(document.createTextNode(cleanText(derived)));
   cell("c-state", stateNode);
   // Running for takes a duration, not an age: "4h", never "4h ago".
   const running = formatDuration(parseEpoch(row.started_at), nowMs);
   cell("c-running", el("span", running));
-  const seen =
+  // Idle time is the panel's own fact: how long since the heartbeat.
+  // The last-seen age answers the same question, so the idle words
+  // lead and the exact age rides the tooltip.
+  const seenAge =
     row.last_seen === null || row.last_seen === undefined ? "not reported" : age(row.last_seen, nowMs);
-  cell("c-seen", el("span", seen));
-  const note =
-    row.note === null || row.note === undefined || String(row.note) === ""
-      ? "-"
-      : String(row.note);
-  cell("c-note", el("span", note));
+  const idle =
+    row.idle_s === null || row.idle_s === undefined ? "unknown" : formatIdle(row.idle_s);
+  const seenNode = el("span", idle);
+  seenNode.setAttribute("title", "last seen " + seenAge);
+  cell("c-seen", seenNode);
+  // The one-line doing intent, trimmed by the server. The full note
+  // rides the tooltip; unknown reads unknown, never a blank.
+  const doing =
+    typeof row.doing === "string" && row.doing !== "" ? row.doing : "unknown";
+  const doingNode = el("span", doing);
+  if (row.note !== null && row.note !== undefined && String(row.note) !== "") {
+    doingNode.setAttribute("title", String(row.note));
+  }
+  cell("c-note", doingNode);
   return tr;
 }
 
@@ -877,7 +936,7 @@ function agentTable(rows, nowMs) {
   table.setAttribute("class", "agents");
   const head = document.createElement("thead");
   const headerRow = document.createElement("tr");
-  for (const name of ["id", "ticket", "role", "runtime", "state", "running for", "last seen", "note"]) {
+  for (const name of ["id", "ticket", "role", "runtime", "state", "running for", "idle", "doing"]) {
     headerRow.appendChild(el("th", name));
   }
   head.appendChild(headerRow);
@@ -963,6 +1022,78 @@ export function getAgentFilter() {
   return agentFilter;
 }
 
+// The agent sort menu: urgency (the server's order, most urgent
+// first, never re-sorted client-side so rows never jump between
+// polls), longest idle first, or the legacy project order. Unknown
+// idle sorts last, never first.
+export const AGENT_SORT_MODES = ["urgency", "idle", "project"];
+
+let agentSort = "urgency";
+
+export function setAgentSort(value) {
+  agentSort = AGENT_SORT_MODES.includes(value) ? value : "urgency";
+}
+
+export function getAgentSort() {
+  return agentSort;
+}
+
+export function sortAgentRows(rows, mode) {
+  const list = [...rows];
+  if (mode === "idle") {
+    const idleOf = (row) =>
+      row && typeof row.idle_s === "number" && Number.isFinite(row.idle_s) ? row.idle_s : -1;
+    list.sort((a, b) => idleOf(b) - idleOf(a));
+    return list;
+  }
+  if (mode === "project") {
+    const keyOf = (row) => [
+      (row && row.project) || "",
+      (row && row.repo) || "",
+      row && row.number !== null && row.number !== undefined ? 0 : 1,
+      (row && row.number) || 0,
+      (row && row.id) || "",
+    ];
+    list.sort((a, b) => {
+      const ka = keyOf(a);
+      const kb = keyOf(b);
+      for (let i = 0; i < ka.length; i++) {
+        if (ka[i] < kb[i]) {
+          return -1;
+        }
+        if (ka[i] > kb[i]) {
+          return 1;
+        }
+      }
+      return 0;
+    });
+    return list;
+  }
+  return list;
+}
+
+function agentSortMenu() {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "agent-sort");
+  const caption = document.createElement("label");
+  caption.setAttribute("for", "agent-sort");
+  caption.textContent = "sort";
+  const box = document.createElement("select");
+  box.setAttribute("id", "agent-sort");
+  for (const mode of AGENT_SORT_MODES) {
+    const opt = document.createElement("option");
+    opt.setAttribute("value", mode);
+    opt.textContent = mode;
+    if (mode === agentSort) {
+      opt.setAttribute("selected", "selected");
+    }
+    box.appendChild(opt);
+  }
+  wrap.appendChild(caption);
+  wrap.appendChild(box);
+  return wrap;
+}
+
 function agentFilterInput() {
   const wrap = document.createElement("div");
   wrap.setAttribute("class", "agent-filter");
@@ -1028,8 +1159,10 @@ function matchesAgentFilter(row, needle) {
     row.role,
     row.runtime,
     row.state,
+    row.derived,
     row.model,
     row.note,
+    row.doing,
   ]
     .map((part) => (part === null || part === undefined ? "" : String(part)))
     .join(" ")
@@ -1078,6 +1211,7 @@ function agentsSection(doc, project, nowMs) {
   const section = card("Agents", desc, false, tip);
   section.appendChild(projectSelect(project, snapshotProjects(doc)));
   section.appendChild(agentFilterInput());
+  section.appendChild(agentSortMenu());
   const rows = Array.isArray(agents) ? agents : [];
   const needle = agentFilter.trim().toLowerCase();
   const kept = rows.filter(
@@ -1098,17 +1232,23 @@ function agentsSection(doc, project, nowMs) {
     );
     return section;
   }
-  // Server order is already (project, repo, number, id); regroup
-  // without re-sorting so rows never jump between polls.
+  // Urgency is the server's order: regroup without re-sorting so
+  // rows never jump between polls. The other modes re-sort first;
+  // project mode also returns to alphabetical groups.
+  const ordered = sortAgentRows(kept, agentSort);
   const groups = new Map();
-  for (const row of kept) {
+  for (const row of ordered) {
     const key = project === null ? String(row.project || "") : project;
     if (!groups.has(key)) {
       groups.set(key, []);
     }
     groups.get(key).push(row);
   }
-  for (const [name, group] of [...groups.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+  const entries = [...groups.entries()];
+  if (agentSort === "project") {
+    entries.sort((a, b) => (a[0] < b[0] ? -1 : 1));
+  }
+  for (const [name, group] of entries) {
     section.appendChild(agentGroup(name, group, nowMs));
   }
   return section;
@@ -1373,6 +1513,32 @@ export function attentionItems(doc, nowMs) {
   if (pressure !== null && pressure.saturated) {
     items.push("the host is saturated: " + pressureText(pressure));
   }
+  // The attention panel: built from the store and the doctor, never
+  // a GitHub call. Unknown reads unknown; a missing panel still
+  // reports that it could not be read.
+  const panel = doc && !isErrorSection(doc.attention) ? doc.attention : null;
+  if (panel === null || panel === undefined) {
+    items.push("the attention state could not be read");
+  } else if (panel.state === "unknown") {
+    items.push("the attention state is unknown: the event queue has no reading yet");
+  } else if (panel.state === "error") {
+    items.push("the attention state could not be read");
+  } else {
+    for (const item of Array.isArray(panel.needs_decision) ? panel.needs_decision : []) {
+      const ref = item && item.ref !== null && item.ref !== undefined ? String(item.ref) : "no ref";
+      const question =
+        item && typeof item.question === "string" && item.question !== ""
+          ? item.question
+          : "unknown";
+      items.push("needs decision " + ref + ": " + question);
+    }
+    for (const item of Array.isArray(panel.ready_to_merge) ? panel.ready_to_merge : []) {
+      const ref = item && item.ref !== null && item.ref !== undefined ? String(item.ref) : "no ref";
+      const reason =
+        item && typeof item.reason === "string" && item.reason !== "" ? item.reason : "unknown";
+      items.push("ready to merge " + ref + ": " + reason);
+    }
+  }
   for (const [section, label] of [
     ["fleet_header", "fleet"],
     ["agents", "agents"],
@@ -1389,6 +1555,17 @@ export function attentionItems(doc, nowMs) {
   return items;
 }
 
+// How many rows the coordinator owns without a human: the dim
+// fold-up beside the needs-you list. Unknown stays unknown, never a
+// reassuring zero.
+export function coordinatorHandled(doc) {
+  const panel = doc && !isErrorSection(doc.attention) ? doc.attention : null;
+  if (panel === null || panel === undefined) {
+    return null;
+  }
+  return typeof panel.coordinator_handled === "number" ? panel.coordinator_handled : null;
+}
+
 function attentionCard(doc, nowMs) {
   const section = card(
     "Needs you",
@@ -1403,29 +1580,152 @@ function attentionCard(doc, nowMs) {
   section.setAttribute("class", items.length === 0 ? "card quiet" : "card alert");
   if (items.length === 0) {
     section.appendChild(el("p", "nothing needs you"));
-    return section;
+  } else {
+    const list = document.createElement("ul");
+    for (const item of items) {
+      const row = document.createElement("li");
+      row.appendChild(el("span", item));
+      list.appendChild(row);
+    }
+    section.appendChild(list);
   }
-  const list = document.createElement("ul");
-  for (const item of items) {
-    const row = document.createElement("li");
-    row.appendChild(el("span", item));
-    list.appendChild(row);
+  // The coordinator's share sits dimmed behind a fold-up: handled,
+  // never hidden, never asking for a human.
+  const handled = coordinatorHandled(doc);
+  if (handled !== null && handled > 0) {
+    const fold = document.createElement("details");
+    fold.setAttribute("class", "handled");
+    const head = document.createElement("summary");
+    head.textContent = "handled by the coordinator (" + String(handled) + ")";
+    fold.appendChild(head);
+    fold.appendChild(
+      el("p", "The coordinator owns these rows: no human action needed.", {
+        class: "desc",
+      }),
+    );
+    section.appendChild(fold);
   }
-  section.appendChild(list);
+  // The doctor has no panel reader yet: the band says so instead of
+  // guessing at failing rows.
+  const panel = doc && !isErrorSection(doc.attention) ? doc.attention : null;
+  if (panel !== null && panel !== undefined && panel.doctor_failing === "unknown") {
+    section.appendChild(
+      el("p", "doctor checks: not reported yet", { class: "desc dim" }),
+    );
+  }
   return section;
 }
+// The plan band: the next starts the loop would make, with the
+// reason each waits. Built from the drive journal and the capacity
+// the snapshot already polls, never a dry-run pass. An empty fleet
+// names the next pass; unknown reads unknown.
+export function planItems(doc) {
+  const plan = doc && !isErrorSection(doc.plan) ? doc.plan : null;
+  if (plan === null || plan === undefined) {
+    return ["the plan is unknown: the drive journal could not be read"];
+  }
+  if (plan.state === "unknown") {
+    return ["the plan is unknown: the drive journal has no reading yet"];
+  }
+  if (plan.state === "error") {
+    return ["the plan could not be read"];
+  }
+  const lines = [];
+  for (const item of Array.isArray(plan.next) ? plan.next : []) {
+    const wait =
+      item && typeof item.wait === "string" && item.wait !== ""
+        ? item.wait
+        : item && typeof item.waits === "string" && item.waits !== ""
+          ? item.waits
+          : "unknown";
+    lines.push("next start waits: " + wait);
+  }
+  return lines;
+}
+
+function planCard(doc, nowMs) {
+  const section = card(
+    "Plan",
+    "The next starts the loop would make, and why each waits.",
+  );
+  const lines = planItems(doc);
+  const plan = doc && !isErrorSection(doc.plan) ? doc.plan : null;
+  if (plan !== null && plan !== undefined && plan.state === "error") {
+    return errorCard(
+      "Plan",
+      "The next starts the loop would make, and why each waits.",
+      plan,
+      "The drive journal could not be read. Check the host with korapy doctor.",
+    );
+  }
+  if (lines.length === 0) {
+    const remaining =
+      plan !== null && plan !== undefined && typeof plan.starts_remaining === "number"
+        ? plan.starts_remaining
+        : null;
+    if (remaining === 0) {
+      section.appendChild(el("p", "no starts left today"));
+    } else {
+      section.appendChild(el("p", "nothing waiting to start"));
+    }
+  } else {
+    const list = document.createElement("ul");
+    for (const line of lines) {
+      const row = document.createElement("li");
+      row.appendChild(el("span", line));
+      list.appendChild(row);
+    }
+    section.appendChild(list);
+  }
+  // The empty fleet names its next pass: the countdown from the last
+  // one, never a bare unknown.
+  if (plan !== null && plan !== undefined && plan.state === "ready") {
+    const wait = plan.next_pass_in_s;
+    section.appendChild(
+      el(
+        "p",
+        typeof wait === "number"
+          ? "next pass in " + String(wait) + "s"
+          : "next pass: not reported",
+        { class: "desc" },
+      ),
+    );
+  }
+  return section;
+}
+
+// Placeholders for the panels after these: named now so the layout
+// reserves their place, drawn as planned instead of blank space.
+const PLANNED_PANELS = [
+  "external contributions",
+  "in-flight review",
+  "board sync lag",
+  "quota gate and pacing share",
+];
+
+function placeholdersCard() {
+  const section = card("Later", "Panels planned after these.", false, "Reserved places, not data.");
+  section.setAttribute("class", "card quiet");
+  for (const name of PLANNED_PANELS) {
+    section.appendChild(el("p", name + ": planned", { class: "desc dim" }));
+  }
+  return section;
+}
+
 export function renderOverview(doc, { project, nowMs, notice }) {
   renderTabs("overview");
   renderStrip(doc, { nowMs });
   const banner = document.getElementById("attention");
   banner.replaceChildren(attentionCard(doc, nowMs));
   const cards = [
+    planCard(doc, nowMs),
     cpuCard(doc.resources),
     memoryCard(doc.resources),
     diskCard(doc.disk),
     quotaCard(doc.quota, nowMs),
     capacityCard(doc.capacity),
     driveCard(doc.drive, nowMs),
+    placeholdersCard(),
   ];
   const agents = agentsSection(doc, project, nowMs);
   document.getElementById("detail").hidden = true;
@@ -1479,6 +1779,8 @@ export function renderDetail(row, { nowMs }) {
   if (shown.note !== null && shown.note !== undefined && String(shown.note) !== "") {
     lines.push(el("p", "note: " + String(shown.note)));
   }
+  lines.push(el("p", "doing: " + shown.doing));
+  lines.push(el("p", "idle: " + shown.idle));
   lines.push(el("p", "id: " + fieldValue(info.id)));
   lines.push(el("p", "project: " + (project === null ? "none" : project)));
   lines.push(el("p", "profile: " + fieldValue(info.profile)));
@@ -1497,6 +1799,13 @@ export function renderDetail(row, { nowMs }) {
   document.getElementById("board").hidden = true;
   const back = document.getElementById("detail-back");
   back.setAttribute("href", backHref);
+  // The peek pane is read-only and bounded: the server caps the
+  // lines, the page never edits them.
+  if (ticketed) {
+    lines.push(
+      el("p", "peek: read-only, bounded by the server", { class: "desc dim" }),
+    );
+  }
   document.getElementById("detail-fields").replaceChildren(...lines);
   document.getElementById("tail-controls").hidden = !ticketed;
   document.getElementById("tail").hidden = !ticketed;

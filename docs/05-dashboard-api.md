@@ -35,15 +35,23 @@ touched by a read (section 6).
 ## 1. What the API serves, and what it does not
 
 The single source of truth is the `korapy snapshot --json` document
-(schema version 3 today): `schema_version`, `fleet_header` (host, now,
+(schema version 4 today): `schema_version`, `fleet_header` (host, now,
+`tz_offset_s` and `now_iso` carrying the machine's local offset,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
-runtime, role, profile, model, state, started_at, last_seen, note),
+runtime, role, profile, model, state, the panel facts `derived`,
+`idle_s` and `doing`, started_at, last_seen, note),
 `quota` (per
-provider state, windows, read_at, stale, mark, reader, error),
+provider state, windows, read_at, stale, mark, reader, error, plus the
+honest-panel facts `source`, `read_failed` and `error_trimmed`),
 `capacity` (total_cap, repo_cap, live, by_project, pending), `disk`
 (per path totals or per path error), `resources` (charged and measured
 use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
-`mem_total_mb` and `mem_available_mb` the dashboard gauges divide by).
+`mem_total_mb` and `mem_available_mb` the dashboard gauges divide by),
+`attention` (needs-decision questions, ready-to-merge rows and the
+coordinator-handled count from the event queue, `unknown` when the
+queue has no reading) and `plan` (the next starts with their waits
+and the next-pass countdown, `unknown` when the drive journal has no
+reading).
 `GET /v1/snapshot` returns that
 document unchanged, built by the same `snapshot.build` with the same
 injected views, so the CLI and the API can never disagree.
