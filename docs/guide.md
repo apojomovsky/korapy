@@ -553,7 +553,7 @@ empty table names the loop state instead of showing blank. CPU,
 memory and disk sit in one row of equal gauge cards showing the
 actual host values, with the share the loop reserved drawn as a tick
 inside the CPU and memory bars (the loop reserves no disk, so its
-bars carry no tick); quota and capacity sit in the next row, quota
+bar carries no tick); quota and capacity sit in the next row, quota
 as bars per window with a reset countdown and a dated stale badge.
 Backend mode, API and schema versions and the server time read as a
 small footer line. The page polls on an interval with an "updated Ns

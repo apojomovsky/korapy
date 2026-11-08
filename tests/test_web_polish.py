@@ -34,10 +34,10 @@ class StripTitle(unittest.TestCase):
         self.assertNotIn('card("fleet"', web_text("views.js"))
 
     def test_agents_list_keeps_its_title(self):
-        self.assertIn('card("agents"', web_text("views.js"))
+        self.assertIn('card("Agents"', web_text("views.js"))
 
     def test_strip_names_live_stale_and_finished(self):
-        body = function_body(web_text("views.js"), "stripText")
+        body = function_body(web_text("views.js"), "stripSegments")
         for bit in ("agents_live", "agents_stale", "agents_finished"):
             self.assertIn(bit, body)
 

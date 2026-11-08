@@ -183,9 +183,10 @@ host value as a large number with a thin bar, from the
 `resources` section's `pressure`, with the share the loop
 reserved for its agents from `charged` drawn as a tick inside the
 bar and labelled as such; millicores as cores and MB as GB),
-disks (a headline with the tightest path's free of total plus a
-meter per path in `disk.paths`; no reservation is tracked for
-disk, so its bars carry no tick; the per-agent `agents` rows
+disks (a headline with the tightest path's free of total plus the
+one bar for that path, every entry of `disk.paths` below as a small
+line with no bar; no reservation is tracked for
+disk, so its bar carries no tick; the per-agent `agents` rows
 stay out of version one, section 11), and the dispatch loop card
 (`paused` with `pause_reason`, `last_pass_at` age, `last_exit`
 in words, `starts_today` of `max_starts_per_day` as a labelled

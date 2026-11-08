@@ -128,10 +128,20 @@ export function hideToken() {
   document.getElementById("token-msg").textContent = "";
 }
 
-function card(title, desc, wrong) {
+function card(title, desc, wrong, tip) {
   const section = document.createElement("section");
   section.setAttribute("class", wrong ? "card error" : "card");
-  section.appendChild(el("h2", title));
+  const head = el("h2", title);
+  // The longer text rides as a tooltip, so the caption stays one short line.
+  if (tip !== null && tip !== undefined && String(tip) !== "") {
+    head.appendChild(document.createTextNode(" "));
+    const info = document.createElement("span");
+    info.setAttribute("class", "info");
+    info.setAttribute("title", String(tip));
+    info.textContent = "i";
+    head.appendChild(info);
+  }
+  section.appendChild(head);
   if (desc !== null && desc !== undefined && String(desc) !== "") {
     section.appendChild(el("p", String(desc), { class: "desc" }));
   }
@@ -196,11 +206,13 @@ function meter(frac, word, label, markerFrac) {
     "aria-label",
     label + " " + (pct === null ? "unknown" : String(pct) + "%") + ", " + state,
   );
+  // One bar style page-wide: rounded ends on attributes, like the widths.
   const back = document.createElementNS(SVG_NS, "rect");
   back.setAttribute("x", "0");
   back.setAttribute("y", "0");
   back.setAttribute("width", String(BAR_WIDTH));
   back.setAttribute("height", String(BAR_HEIGHT));
+  back.setAttribute("rx", "5");
   back.setAttribute("fill", "none");
   back.setAttribute("stroke", "currentColor");
   svg.appendChild(back);
@@ -210,6 +222,7 @@ function meter(frac, word, label, markerFrac) {
     fill.setAttribute("y", "0");
     fill.setAttribute("width", String(Math.round((pct / 100) * BAR_WIDTH)));
     fill.setAttribute("height", String(BAR_HEIGHT));
+    fill.setAttribute("rx", "5");
     fill.setAttribute("fill", "currentColor");
     svg.appendChild(fill);
   }
@@ -338,16 +351,18 @@ function quotaProvider(name, info, nowMs) {
 }
 
 function quotaCard(quota, nowMs) {
-  const desc = "What the providers last reported. A reading older than its freshness bound counts as stale; refresh it with korapy quota refresh.";
+  const desc = "What the providers last reported.";
+  const tip =
+    "A reading older than its freshness bound counts as stale; refresh it with korapy quota refresh.";
   if (isErrorSection(quota)) {
     return errorCard(
-      "quota",
+      "Quota",
       desc,
       quota,
       "Quota readings could not be collected. Check the host with korapy doctor.",
     );
   }
-  const section = card("quota", desc);
+  const section = card("Quota", desc, false, tip);
   const providers = quota && quota.providers ? quota.providers : {};
   const names = Object.keys(providers).sort();
   if (names.length === 0) {
@@ -383,35 +398,17 @@ function pressureText(pressure) {
   return bits.join(", ");
 }
 
-// One host gauge: the actual host value as a bar with the reserved
-// share as a tick inside. `term` builds the dt node (CPU keeps its
-// abbreviation), `help` is the tooltip, `fracText` the numbers line,
-// `frac` the bar, `marker` the tick, `reserved` the reservation line.
-// Severity rides the bar band; overload itself is the server's
-// `saturated` verdict in the attention band, never a second cut here.
-function hostGauge(term, help, fracText, frac, label, marker, reserved) {
+// One host gauge: the host value as a large number with one bar,
+// the reserved share as a tick inside. Every host card shares this
+// shape so the three read as one row. Severity rides the bar band.
+function hostGauge(help, fracText, frac, label, marker, reserved) {
   const wrap = document.createElement("div");
-  wrap.setAttribute("class", "field");
+  wrap.setAttribute("class", "gauge-body");
   wrap.setAttribute("title", help);
-  wrap.appendChild(term);
-  const shown = document.createElement("dd");
-  shown.appendChild(document.createTextNode(cleanText(fracText)));
-  const barRow = document.createElement("div");
-  barRow.appendChild(meter(frac, frac === null ? "unknown" : bandFor(frac), label, marker));
-  shown.appendChild(barRow);
-  shown.appendChild(document.createTextNode(cleanText(" " + reserved)));
-  wrap.appendChild(shown);
-  const list = document.createElement("dl");
-  list.setAttribute("class", "fields");
-  list.appendChild(wrap);
-  return list;
-}
-
-function cpuTerm() {
-  const term = document.createElement("dt");
-  term.appendChild(el("abbr", "CPU", { title: "central processing unit" }));
-  term.appendChild(document.createTextNode(", host load"));
-  return term;
+  wrap.appendChild(el("p", fracText, { class: "giant" }));
+  wrap.appendChild(meter(frac, frac === null ? "unknown" : bandFor(frac), label, marker));
+  wrap.appendChild(el("p", reserved, { class: "reserved" }));
+  return wrap;
 }
 
 function cpuGauge(pressure, charged) {
@@ -431,8 +428,7 @@ function cpuGauge(pressure, charged) {
   const budgetCpu =
     typeof charged === "object" && charged !== null ? charged.cpu_m : null;
   return hostGauge(
-    cpuTerm(),
-    "Host load from the kernel, per core. The tick inside is the processor share the loop reserved for its agents.",
+    "Host load from the kernel, per core. The tick inside is the share the loop reserved for its agents.",
     formatLoad(load1min, ncpu),
     load,
     "host CPU load",
@@ -445,26 +441,34 @@ function cpuGauge(pressure, charged) {
 
 function memoryGauge(pressure, charged) {
   const info = pressure && typeof pressure === "object" ? pressure : {};
-  const total = typeof info.mem_total_mb === "number" ? info.mem_total_mb : null;
-  const avail = typeof info.mem_available_mb === "number" ? info.mem_available_mb : null;
-  const frac = total !== null && avail !== null && total > 0 ? (total - avail) / total : null;
+  const totalMb = typeof info.mem_total_mb === "number" ? info.mem_total_mb : null;
+  const availMb = typeof info.mem_available_mb === "number" ? info.mem_available_mb : null;
+  // An impossible reading (available above total, or below zero) is
+  // a broken meter: the bar renders unknown, never a healthy zero.
+  let frac = null;
+  if (
+    totalMb !== null &&
+    availMb !== null &&
+    totalMb > 0 &&
+    availMb >= 0 &&
+    availMb <= totalMb
+  ) {
+    frac = (totalMb - availMb) / totalMb;
+  }
   let marker = null;
   if (
     charged !== null &&
     typeof charged.memory_mb === "number" &&
-    typeof total === "number" &&
-    total > 0
+    typeof totalMb === "number" &&
+    totalMb > 0
   ) {
-    marker = charged.memory_mb / total;
+    marker = charged.memory_mb / totalMb;
   }
-  const term = document.createElement("dt");
-  term.appendChild(document.createTextNode("Memory, host used"));
   const budgetMem =
     typeof charged === "object" && charged !== null ? charged.memory_mb : null;
   return hostGauge(
-    term,
-    "Host memory used, from MemTotal and MemAvailable. The tick inside is the memory the loop reserved for its agents.",
-    formatMemUsed(total, avail),
+    "Host memory used, from MemTotal and MemAvailable. The tick inside is the share the loop reserved for its agents.",
+    formatMemUsed(totalMb, availMb),
     frac,
     "host memory used",
     marker,
@@ -479,8 +483,8 @@ function memoryGauge(pressure, charged) {
 // tick inside and labelled as such. A missing reading renders as
 // not reported, never zero.
 function cpuCard(resources) {
-  const desc =
-    "Host load from the kernel, per core. The tick inside is the share the loop reserved for its agents.";
+  const desc = "Host load from the kernel, per core.";
+  const tip = "The tick inside is the share the loop reserved for its agents.";
   if (isErrorSection(resources)) {
     return errorCard(
       "CPU",
@@ -489,7 +493,15 @@ function cpuCard(resources) {
       "Resource use could not be measured. Check the host with korapy doctor.",
     );
   }
-  const section = card("CPU", desc);
+  const section = card("CPU", desc, false, tip);
+  // The title keeps its abbreviation tooltip beside the info marker.
+  const head = section.querySelector("h2");
+  if (head !== null && head.firstChild !== null) {
+    const abbr = document.createElement("abbr");
+    abbr.setAttribute("title", "central processing unit");
+    abbr.textContent = "CPU";
+    head.replaceChild(abbr, head.firstChild);
+  }
   section.setAttribute("class", "card gauge");
   const info = resources && typeof resources === "object" ? resources : {};
   const charged = info.charged && typeof info.charged === "object" ? info.charged : null;
@@ -502,17 +514,17 @@ function cpuCard(resources) {
 }
 
 function memoryCard(resources) {
-  const desc =
-    "Host memory used from MemTotal and MemAvailable. The tick inside is the share the loop reserved for its agents.";
+  const desc = "Host memory used from MemTotal and MemAvailable.";
+  const tip = "The tick inside is the share the loop reserved for its agents.";
   if (isErrorSection(resources)) {
     return errorCard(
-      "memory",
+      "Memory",
       desc,
       resources,
       "Resource use could not be measured. Check the host with korapy doctor.",
     );
   }
-  const section = card("memory", desc);
+  const section = card("Memory", desc, false, tip);
   section.setAttribute("class", "card gauge");
   const info = resources && typeof resources === "object" ? resources : {};
   const charged = info.charged && typeof info.charged === "object" ? info.charged : null;
@@ -528,13 +540,13 @@ function capacityCard(capacity) {
   const desc = "How many agents this host may run.";
   if (isErrorSection(capacity)) {
     return errorCard(
-      "capacity",
+      "Capacity",
       desc,
       capacity,
       "Admission settings or the registry could not be read. Check the host with korapy doctor.",
     );
   }
-  const section = card("capacity", desc);
+  const section = card("Capacity", desc);
   const info = capacity && typeof capacity === "object" ? capacity : {};
   const live =
     typeof info.live === "number" && Number.isFinite(info.live)
@@ -595,17 +607,17 @@ function capacityCard(capacity) {
 }
 
 function diskCard(disk) {
-  const desc =
-    "Free space on the state and cache disks. No reservation is tracked for disk, so these bars carry no tick.";
+  const desc = "Free space on the state and cache disks.";
+  const tip = "No reservation is tracked for disk, so this bar carries no tick.";
   if (isErrorSection(disk)) {
     return errorCard(
-      "disk",
+      "Disk",
       desc,
       disk,
       "Disk use could not be read. Check the host with korapy doctor.",
     );
   }
-  const section = card("disk", desc);
+  const section = card("Disk", desc, false, tip);
   section.setAttribute("class", "card gauge");
   const info = disk && typeof disk === "object" ? disk : {};
   const paths = Array.isArray(info.paths) ? info.paths : [];
@@ -613,9 +625,7 @@ function diskCard(disk) {
     section.appendChild(el("p", "no disk paths reported"));
     return section;
   }
-  // The headline names the tightest disk; the list below names every
-  // path. The bar is the actual filesystem use, with no tick: the
-  // loop reserves no disk.
+  // One bar for the tightest disk; every path below as a small line.
   let tightest = null;
   for (const item of paths) {
     if (
@@ -649,16 +659,12 @@ function diskCard(disk) {
     }
   }
   const list = document.createElement("ul");
+  list.setAttribute("class", "disks");
   for (const item of paths) {
     const row = document.createElement("li");
     if (item && typeof item.error === "string") {
       row.appendChild(el("span", String(item.path) + ": " + item.error));
     } else if (item && typeof item.total === "number" && item.total > 0) {
-      const used = typeof item.used === "number" ? item.used / item.total : null;
-      if (used !== null) {
-        row.appendChild(meter(used, bandFor(used), String(item.path)));
-        row.appendChild(document.createTextNode(" "));
-      }
       row.appendChild(
         el(
           "span",
@@ -685,13 +691,13 @@ function driveCard(drive, nowMs) {
   const desc = "The drive pass: sync boards, claim tickets, start agents.";
   if (isErrorSection(drive)) {
     return errorCard(
-      "dispatch loop",
+      "Dispatch loop",
       desc,
       drive,
       "The drive journal could not be read. Check the host with korapy doctor.",
     );
   }
-  const section = card("dispatch loop", desc);
+  const section = card("Dispatch loop", desc);
   const info = drive && typeof drive === "object" ? drive : {};
   if (info.paused) {
     const reason =
@@ -1057,17 +1063,17 @@ function emptyAgentsText(doc, project, nowMs) {
 
 function agentsSection(doc, project, nowMs) {
   const agents = doc ? doc.agents : null;
-  const desc =
-    "Agents on this host right now. Live and stale agents first; finished entries sit behind a toggle.";
+  const desc = "Agents on this host right now.";
+  const tip = "Live and stale agents first; finished entries sit behind a toggle.";
   if (isErrorSection(agents)) {
     return errorCard(
-      "agents",
+      "Agents",
       desc,
       agents,
       "The agent registry could not be read, so no agent rows can be shown. Check the host with korapy doctor.",
     );
   }
-  const section = card("agents", desc);
+  const section = card("Agents", desc, false, tip);
   section.appendChild(projectSelect(project, snapshotProjects(doc)));
   section.appendChild(agentFilterInput());
   const rows = Array.isArray(agents) ? agents : [];
@@ -1190,78 +1196,125 @@ function countWord(value, singular) {
   return String(value) + " " + singular;
 }
 
-// The top status strip: one line that reads at a glance, always
-// visible. Fleet counts, the loop state, quota freshness, host load
-// per core, disk free. Every number traces to a snapshot field;
-// a missing source reads as unknown, never as a healthy zero.
-function stripText(doc, nowMs) {
-  const bits = [];
+// The top status strip: real segments, not a text run. One pill per
+// fact (fleet, loop, quota, load, disk), each with a status dot and
+// words, so the state reads without colour too. Every number traces
+// to a snapshot field; a missing source reads as unknown, never as
+// a healthy zero. The one resolver for the strip.
+function stripSegments(doc, nowMs) {
+  const segs = [];
   const header = okSection(doc, "fleet_header");
   if (header !== null) {
-    bits.push(
-      countWord(header.agents_live, "live") +
+    segs.push({
+      label: "Fleet",
+      text:
+        countWord(header.agents_live, "live") +
         ", " +
         countWord(header.agents_stale, "stale") +
         ", " +
         countWord(header.agents_finished, "finished"),
-    );
+      state: "ok",
+    });
   } else {
-    bits.push("fleet unknown");
+    segs.push({ label: "Fleet", text: "fleet unknown", state: "unknown" });
   }
   const loop = okSection(doc, "drive");
   if (loop !== null) {
+    let text;
+    let state = "ok";
     if (loop.paused) {
       const reason =
         typeof loop.pause_reason === "string" && loop.pause_reason !== ""
           ? loop.pause_reason
           : "no reason recorded";
-      bits.push("loop paused: " + reason);
+      text = "loop paused: " + reason;
+      state = "low";
     } else {
-      bits.push("loop running, last pass " + age(loop.last_pass_at, nowMs));
+      text = "loop running, last pass " + age(loop.last_pass_at, nowMs);
     }
+    // Half a budget is no budget: one half missing reads as not
+    // reported instead of dropping the segment silently.
     if (
       typeof loop.starts_today === "number" &&
       typeof loop.max_starts_per_day === "number"
     ) {
-      bits.push("starts " + String(loop.starts_today) + "/" + String(loop.max_starts_per_day));
+      text +=
+        ", starts today " +
+        String(loop.starts_today) +
+        " of " +
+        String(loop.max_starts_per_day);
+    } else if (
+      typeof loop.starts_today === "number" ||
+      typeof loop.max_starts_per_day === "number"
+    ) {
+      text += ", starts not reported";
     }
+    segs.push({ label: "Loop", text, state });
   } else {
-    bits.push("loop unknown");
+    segs.push({ label: "Loop", text: "loop unknown", state: "unknown" });
   }
   const quota = okSection(doc, "quota");
   if (quota !== null) {
     const providers = quota.providers && typeof quota.providers === "object" ? quota.providers : {};
     const names = Object.keys(providers).sort();
     if (names.length === 0) {
-      bits.push("quota: no providers");
+      segs.push({ label: "Quota", text: "quota: no providers", state: "unknown" });
     } else {
       const staleNames = names.filter((name) => (providers[name] || {}).stale);
       if (staleNames.length > 0) {
-        bits.push("quota stale: " + staleNames.join(", "));
+        segs.push({
+          label: "Quota",
+          text: "quota stale: " + staleNames.join(", "),
+          state: "low",
+        });
       } else {
-        bits.push("quota fresh");
+        segs.push({ label: "Quota", text: "quota fresh", state: "ok" });
       }
     }
   } else {
-    bits.push("quota unknown");
+    segs.push({ label: "Quota", text: "quota unknown", state: "unknown" });
   }
   const resources = okSection(doc, "resources");
   const pressure = resources && resources.pressure ? resources.pressure : null;
   if (pressure !== null && typeof pressure.load_per_cpu === "number") {
-    bits.push("load " + pressure.load_per_cpu.toFixed(2) + "/cpu");
+    segs.push({
+      label: "Load",
+      text: "load " + pressure.load_per_cpu.toFixed(2) + "/cpu",
+      state: bandFor(pressure.load_per_cpu),
+    });
   } else {
-    bits.push("load unknown");
+    segs.push({ label: "Load", text: "load unknown", state: "unknown" });
   }
   const disk = okSection(doc, "disk");
   const paths = disk !== null && Array.isArray(disk.paths) ? disk.paths : [];
   let free = null;
+  let worst = null;
   for (const item of paths) {
     if (item && typeof item.free === "number" && (free === null || item.free < free)) {
       free = item.free;
     }
+    if (
+      item &&
+      typeof item.used === "number" &&
+      typeof item.total === "number" &&
+      item.total > 0
+    ) {
+      const frac = item.used / item.total;
+      if (worst === null || frac > worst) {
+        worst = frac;
+      }
+    }
   }
-  bits.push(free === null ? "disk unknown" : "disk " + formatBytes(free) + " free");
-  return bits.join("  ·  ");
+  if (free === null) {
+    segs.push({ label: "Disk", text: "disk unknown", state: "unknown" });
+  } else {
+    segs.push({
+      label: "Disk",
+      text: "disk " + formatBytes(free) + " free",
+      state: worst === null ? "ok" : bandFor(worst),
+    });
+  }
+  return segs;
 }
 
 export function renderStrip(doc, { nowMs }) {
@@ -1270,7 +1323,17 @@ export function renderStrip(doc, { nowMs }) {
     return;
   }
   node.textContent = "";
-  node.appendChild(document.createTextNode(cleanText(stripText(doc, nowMs))));
+  for (const part of stripSegments(doc, nowMs)) {
+    const pill = document.createElement("span");
+    pill.setAttribute("class", "seg seg-" + part.state);
+    const dot = document.createElement("span");
+    dot.setAttribute("class", "dot");
+    dot.setAttribute("aria-hidden", "true");
+    pill.appendChild(dot);
+    pill.appendChild(el("strong", part.label));
+    pill.appendChild(el("span", " " + part.text));
+    node.appendChild(pill);
+  }
 }
 
 // The attention band: only items that need a human. Built from the
@@ -1326,8 +1389,10 @@ export function attentionItems(doc, nowMs) {
 
 function attentionCard(doc, nowMs) {
   const section = card(
-    "needs you",
-    "Only items that need a human. The coordinator owns the rest.",
+    "Needs you",
+    "Only items that need a human.",
+    false,
+    "The coordinator owns the rest.",
   );
   const items = attentionItems(doc, nowMs);
   // The banner carries its own tone: amber when something needs a

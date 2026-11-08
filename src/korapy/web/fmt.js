@@ -251,7 +251,9 @@ export function formatLoad(load1min, ncpu) {
 }
 
 // Host memory used from the totals: "used 3.5 of 7.8 GB (45%)". A
-// missing half reads as not reported, never as empty or full.
+// missing half reads as not reported, never as empty or full. An
+// impossible reading (available above total, or below zero) is a
+// broken meter, not an idle host, so it reads as not reported too.
 export function formatMemUsed(totalMb, availMb) {
   if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
     return "not reported";
@@ -264,6 +266,9 @@ export function formatMemUsed(totalMb, availMb) {
     totalMb <= 0
   ) {
     return String(totalMb) + " of " + String(availMb);
+  }
+  if (availMb > totalMb || availMb < 0) {
+    return "not reported";
   }
   const usedMb = Math.max(0, totalMb - availMb);
   const pct = Math.round((usedMb / totalMb) * 100);

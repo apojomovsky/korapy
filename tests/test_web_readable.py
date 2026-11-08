@@ -89,7 +89,7 @@ class AgentCount(unittest.TestCase):
     """Point 1: the strip headlines live, stale and finished counts."""
 
     def test_strip_headlines_live_stale_and_finished(self):
-        body = function_body(web_text("views.js"), "stripText")
+        body = function_body(web_text("views.js"), "stripSegments")
         for bit in ("agents_live", "agents_stale", "agents_finished"):
             self.assertIn(bit, body)
 
@@ -192,7 +192,7 @@ class DriveSection(unittest.TestCase):
 
     def test_drive_is_named_the_dispatch_loop(self):
         views = web_text("views.js")
-        self.assertIn("dispatch loop", views)
+        self.assertIn("Dispatch loop", views)
 
     def test_drive_fields_are_labelled_with_help(self):
         views = web_text("views.js")
@@ -235,7 +235,8 @@ class SectionHelp(unittest.TestCase):
     def test_abbreviations_carry_tooltips(self):
         views = web_text("views.js")
         self.assertIn('"abbr"', views)
-        self.assertIn("title:", views)
+        self.assertIn("central processing unit", views)
+        self.assertIn('setAttribute("title"', views)
 
     def test_error_cards_say_what_to_do(self):
         views = web_text("views.js")

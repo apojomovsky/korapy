@@ -45,12 +45,12 @@ class Strip(unittest.TestCase):
         self.assertIn("export function renderStrip(", web_text("views.js"))
 
     def test_strip_names_loop_quota_load_and_disk(self):
-        body = function_body(web_text("views.js"), "stripText")
+        body = function_body(web_text("views.js"), "stripSegments")
         for bit in ("loop running, last pass", "starts ", "quota fresh", "load ", "/cpu", "free"):
             self.assertIn(bit, body)
 
     def test_strip_never_reports_a_missing_source_as_zero(self):
-        body = function_body(web_text("views.js"), "stripText")
+        body = function_body(web_text("views.js"), "stripSegments")
         for bit in (
             "fleet unknown",
             "loop unknown",
@@ -76,9 +76,18 @@ class Strip(unittest.TestCase):
         self.assertNotIn("fleet_header", body)
 
     def test_strip_names_the_finished_count(self):
-        body = function_body(web_text("views.js"), "stripText")
+        body = function_body(web_text("views.js"), "stripSegments")
         self.assertIn("agents_finished", body)
         self.assertIn("finished", body)
+
+    def test_strip_renders_segments_with_dots(self):
+        body = function_body(web_text("views.js"), "renderStrip")
+        self.assertIn("stripSegments(doc", body)
+        self.assertIn('"seg seg-"', body)
+        self.assertIn('"dot"', body)
+        css = web_text("app.css")
+        for bit in (".seg", ".seg-ok", ".seg-low", ".seg-unknown", "#strip"):
+            self.assertIn(bit, css)
 
 
 class AgentsFirst(unittest.TestCase):
@@ -154,7 +163,12 @@ class RealGauges(unittest.TestCase):
 
     def test_disk_card_says_no_reservation_is_tracked(self):
         body = function_body(web_text("views.js"), "diskCard")
-        self.assertIn("reservation is tracked for disk, so these bars carry no tick", body)
+        self.assertIn("reservation is tracked for disk, so this bar carries no tick", body)
+
+    def test_disk_lists_paths_without_bars(self):
+        body = function_body(web_text("views.js"), "diskCard")
+        self.assertIn('"disks"', body)
+        self.assertNotIn("row.appendChild(meter(", body)
 
 
 class HonestQuota(unittest.TestCase):
@@ -192,7 +206,7 @@ class PlainLabels(unittest.TestCase):
     def test_cpu_and_memory_cards_replace_the_host_card(self):
         views = web_text("views.js")
         self.assertIn('card("CPU"', views)
-        self.assertIn('card("memory"', views)
+        self.assertIn('card("Memory"', views)
         self.assertNotIn('card("host"', views)
 
     def test_abbreviations_keep_tooltips(self):
@@ -513,6 +527,94 @@ class ShellProvidesEveryPollNode(unittest.TestCase):
 
     def test_shell_has_the_connection_banner(self):
         self.assertIn('id="banner"', web_text("index.html"))
+
+
+class ImpossibleMemoryReadsUnknown(unittest.TestCase):
+    """Round 3: available above total is unknown, never a healthy gauge."""
+
+    def test_format_mem_used_rejects_available_above_total(self):
+        body = function_body(web_text("fmt.js"), "formatMemUsed")
+        self.assertIn("not reported", body)
+        self.assertIn("availMb > totalMb", body)
+
+    def test_memory_gauge_treats_impossible_reading_as_unknown(self):
+        body = function_body(web_text("views.js"), "memoryGauge")
+        self.assertIn("availMb <= totalMb", body)
+        self.assertIn("let frac = null", body)
+
+
+class UniformHostCards(unittest.TestCase):
+    """Round 3: the three host cards share one shape, one bar style."""
+
+    def test_gauges_render_a_giant_number_not_a_labelled_field(self):
+        body = function_body(web_text("views.js"), "hostGauge")
+        self.assertIn('"giant"', body)
+        self.assertIn("meter(", body)
+        self.assertIn("marker", body)
+        self.assertNotIn('createElement("dt"', body)
+        self.assertNotIn('createElement("dl"', body)
+
+    def test_gauge_help_stays_a_tooltip(self):
+        self.assertIn('setAttribute("title"', function_body(web_text("views.js"), "hostGauge"))
+
+    def test_one_bar_style_for_gauges_and_quota(self):
+        css = web_text("app.css")
+        self.assertNotIn("height: 6px", css)
+        meter = re.search(r"\.meter svg \{[^}]*\}", css)
+        assert meter is not None, "no .meter svg rule"
+        self.assertIn("height: 10px", meter.group(0))
+        self.assertIn("border-radius", meter.group(0))
+        self.assertIn('setAttribute("rx"', web_text("views.js"))
+
+    def test_host_titles_read_as_sentences(self):
+        views = web_text("views.js")
+        for title in (
+            'card("Memory"',
+            'card("Disk"',
+            'card("Quota"',
+            'card("Capacity"',
+            'card("Dispatch loop"',
+            'card("Agents"',
+        ):
+            self.assertIn(title, views)
+
+
+class ShortCaptions(unittest.TestCase):
+    """Round 3: one short caption per panel, the rest in a tooltip."""
+
+    def test_cards_carry_an_info_marker_with_the_long_text(self):
+        body = function_body(web_text("views.js"), "card")
+        self.assertIn('"info"', body)
+        self.assertIn('setAttribute("title"', body)
+        self.assertIn(".info", web_text("app.css"))
+
+    def test_panel_captions_are_single_short_lines(self):
+        views = web_text("views.js")
+        for caption in (
+            "Host load from the kernel, per core.",
+            "Host memory used from MemTotal and MemAvailable.",
+            "Free space on the state and cache disks.",
+            "What the providers last reported.",
+            "How many agents this host may run.",
+            "The drive pass: sync boards, claim tickets, start agents.",
+            "Agents on this host right now.",
+            "Only items that need a human.",
+        ):
+            self.assertIn(caption, views)
+            self.assertLessEqual(len(caption), 70, caption)
+
+
+class StartsBudgetHalfMissing(unittest.TestCase):
+    """Round 3: one half of the starts budget reads not reported."""
+
+    def test_strip_spells_starts_today_in_words(self):
+        body = function_body(web_text("views.js"), "stripSegments")
+        self.assertIn("starts today", body)
+        self.assertIn(" of ", body)
+
+    def test_half_missing_budget_reads_not_reported(self):
+        body = function_body(web_text("views.js"), "stripSegments")
+        self.assertIn("starts not reported", body)
 
 
 class StripWrapsAndScale(unittest.TestCase):
