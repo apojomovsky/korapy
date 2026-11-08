@@ -51,6 +51,7 @@ import {
   renderTailMissing,
   renderTailPaused,
   setAgentFilter,
+  setAgentSort,
   showToken,
   toast,
 } from "./views.js";
@@ -58,7 +59,7 @@ import {
 // The document schema this shell renders. Newer documents proceed
 // (additive); older or missing ones render as unsupported. Pinned
 // by the suite against the server's own schema number.
-const EXPECTED_SCHEMA_VERSION = 3;
+const EXPECTED_SCHEMA_VERSION = 4;
 
 let seenMs = null;
 let failures = 0;
@@ -299,6 +300,10 @@ function enterStopped(message) {
 }
 
 function shellFor(config, doc) {
+  const header =
+    doc && typeof doc.fleet_header === "object" && doc.fleet_header !== null
+      ? doc.fleet_header
+      : null;
   return {
     mode: config.mode,
     api: config.api,
@@ -307,11 +312,12 @@ function shellFor(config, doc) {
     serverNowMs:
       typeof doc.now === "number"
         ? doc.now * 1000
-        : typeof doc.fleet_header === "object" &&
-            doc.fleet_header !== null &&
-            typeof doc.fleet_header.now === "number"
-          ? doc.fleet_header.now * 1000
+        : header !== null && typeof header.now === "number"
+          ? header.now * 1000
           : null,
+    // The clock stamp carries the machine's local offset; the page
+    // only slices it (see renderShell), never converts it.
+    nowIso: header !== null && typeof header.now_iso === "string" ? header.now_iso : null,
   };
 }
 
@@ -840,12 +846,23 @@ function bindViewActions(config, getToken) {
   // on the same overview route the pills used to link to.
   document.getElementById("view").addEventListener("change", (event) => {
     const target = event.target;
-    if (!(target instanceof HTMLElement) || target.id !== "project-select") {
+    if (!(target instanceof HTMLElement)) {
       return;
     }
-    const value = target.value;
-    if (typeof value === "string" && value.startsWith("#")) {
-      window.location.hash = value;
+    if (target.id === "project-select") {
+      const value = target.value;
+      if (typeof value === "string" && value.startsWith("#")) {
+        window.location.hash = value;
+      }
+      return;
+    }
+    // The sort menu re-renders in place: the poll loop rebuilds the
+    // select, which re-applies the kept choice, so focus survives.
+    if (target.id === "agent-sort" && target instanceof HTMLSelectElement) {
+      setAgentSort(target.value);
+      if (routeFromHash().name === "overview" && lastDoc !== null && !outdated) {
+        renderCurrent(config, getToken());
+      }
     }
   });
   document.getElementById("view").addEventListener("click", (event) => {

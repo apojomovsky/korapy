@@ -618,12 +618,29 @@ a thin accent on the live edge instead of a heavy fill. */
 }
 
 .project-select,
-.agent-filter {
+.agent-filter,
+.agent-sort {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem 1rem;
   align-items: center;
   margin: 0.5rem 0;
+}
+
+/* Dim secondary lines: the coordinator fold-up, doctor notes and
+reserved places read quieter than data, never hidden. */
+.desc.dim {
+  color: var(--muted);
+}
+
+details.handled {
+  margin-top: 0.5rem;
+  color: var(--muted);
+}
+
+details.handled summary {
+  cursor: pointer;
+  min-height: 44px;
 }
 
 .agent-filter input {
@@ -637,7 +654,8 @@ a thin accent on the live edge instead of a heavy fill. */
   border-radius: 10px;
 }
 
-.project-select select {
+.project-select select,
+.agent-sort select {
   min-height: 44px;
   padding: 0.5rem;
   font: inherit;
