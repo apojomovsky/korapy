@@ -87,6 +87,7 @@ class FakeTracker:
         self.write_errors = {}
         self.comment_errors = {}
         self.label_errors = {}
+        self.remove_errors = {}
         self.repo_labels = {repo: set(names) for repo, names in labels}
         self.refused = set(refused)
         self.ensure_error = ensure_error
@@ -163,6 +164,17 @@ class FakeTracker:
         self.calls.append(("add_label", repo, number, label))
         if (repo, number) in self.label_errors:
             raise self.label_errors[(repo, number)]
+
+    def remove_label(self, repo, number, label):
+        """Record one decision label removal; programmed errors raise.
+
+        Removing a label the item does not carry is a no-op, the way
+        the adapter reads a 404 answer.
+        """
+        self.calls.append(("remove_label", repo, number, label))
+        if (repo, number) in self.remove_errors:
+            raise self.remove_errors[(repo, number)]
+        self.repo_labels.setdefault(repo, set()).discard(label)
 
     def missing_labels(self, repo):
         """Names of the bootstrap labels absent on ``repo``; a programmed error raises."""

@@ -222,6 +222,18 @@ class Tracker(Protocol):
         """
         ...
 
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """Remove one decision label from an item, for the decision protocol only.
+
+        The decision verb calls this with the single needs-decision label;
+        any other name is refused with ``ValueError``. Removing a label the
+        item does not carry succeeds, so a retry converges instead of
+        failing on its own earlier write. A failed call raises
+        ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
+        with the seconds to wait.
+        """
+        ...
+
     def ensure_labels(self, repo: str) -> LabelReport:
         """Create the missing bootstrap labels on ``repo``, leave the rest alone.
 

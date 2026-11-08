@@ -682,6 +682,29 @@ the diff so it is reproducible rather than hand-picked:
 korapy budget --repo REPO
 ```
 
+A ticket waiting on a human carries `needs-decision`; the loop never
+starts it until the maintainer answers. Answer with an `Options:` block
+on the ticket, then record the chosen answer so a later reader finds it
+without reading chat:
+
+```sh
+korapy decision record REPO N --decision TEXT --why TEXT --project NAME
+korapy decision record REPO N --decision TEXT --why TEXT --reversible yes --confidence high --settles TEXT --open TEXT --reopen-when TEXT --follow-up 8 --project NAME
+```
+
+The first form records a plain decision; the second shows the optional
+fields for a partial decision or a deferral with a trigger (`--settles`
+what it settles for now, `--open` what stays open, `--reopen-when` the
+trigger, `--follow-up N` each follow-up ticket, repeatable). The verb
+writes `decisions/YYYY-MM-DD-<slug>.md` in the ops root, posts one
+comment carrying the decision line, removes `needs-decision` so the
+loop picks the ticket back up, and appends a `decision` entry to the
+coordinator logbook. The tracker calls run before the file and the
+logbook entry, so a tracker failure leaves neither behind and a retry
+converges: removing an already-removed label succeeds and the comment
+posts once, and a retry after a recorded decision finds its file and
+writes nothing. Exit 0 recorded, 4 usage, 3 tracker unreachable.
+
 The agent-facing version of this section is `skills/coordinator.md`:
 the same verbs, exit codes and gate rules, written for the reviewer
 prompt instead of the operator.
