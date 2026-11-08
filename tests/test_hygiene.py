@@ -888,6 +888,31 @@ class SessionPlanProofCase(unittest.TestCase):
         self.assertIn("live listing failed", found.proof)
         self.assertTrue(any("unreadable" in note for note in notes), f"no unreadable note: {notes}")
 
+    def test_ticket_with_a_live_entry_among_finished_ones_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7), live_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "hygiene-session")
+        self.assertFalse(found.safe)
+        self.assertIn("still open", found.proof)
+
+    def test_done_tickets_agree_with_disk(self):
+        from korapy import disk as disk_mod
+
+        entries = [
+            finished_entry("acme", 7),
+            live_entry("acme", 7),
+            finished_entry("acme", 8),
+            finished_entry("acme", 8, ended_ago=200),
+            finished_entry("acme", 9, ended_ago=2 * DAY),
+        ]
+        self.assertEqual(hygiene._done_tickets(entries, NOW), disk_mod._done_tickets(entries, NOW))
+        self.assertEqual(hygiene._done_tickets(entries, NOW), {("acme", 8), ("acme", 9)})
+
 
 class SessionPlanScopeCase(unittest.TestCase):
     def test_other_repo_leaf_is_skipped_with_a_note(self):
