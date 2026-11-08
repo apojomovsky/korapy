@@ -820,10 +820,22 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
     ends = [item for item in tail if item["event"] == "pass_end"]
     end = ends[-1] if ends else None
     skipped: dict[str, int] = {}
+    waits: list[dict[str, str]] = []
     for item in tail:
         if item["event"] == "skip":
             code = item.get("code") or "skip"
             skipped[str(code)] = skipped.get(str(code), 0) + 1
+            # One named wait per skipped ticket, in journal order: the
+            # plan band names the ticket and the reason instead of a
+            # bare count. Entries keep the journal's own words; the
+            # dashboard strips the ticket prefix when it renders.
+            waits.append(
+                {
+                    "ticket": item.get("ticket"),
+                    "code": str(code),
+                    "reason": item.get("reason"),
+                }
+            )
     today = _day_string(now)
     used = read_day_count(day_path, today)
     reason = pause_reason(pause_path)
@@ -839,6 +851,7 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
         "max_starts_per_day": max_starts,
         "started": sum(1 for item in tail if item["event"] == "start"),
         "skipped_by_reason": skipped,
+        "waits": waits,
         "released": sum(1 for item in tail if item["event"] == "release"),
         "gave_up": sum(1 for item in tail if item["event"] == "give_up"),
     }

@@ -101,7 +101,7 @@ class PlanBand(unittest.TestCase):
         body = function_body(views, "planCard")
         for bit in ("planItems(doc)", "next pass in ", "unknown"):
             self.assertIn(bit, body)
-        self.assertIn("next start waits: ", function_body(views, "planItems"))
+        self.assertIn("starts next pass", function_body(views, "planItems"))
 
     def test_empty_fleet_states_are_named(self):
         body = function_body(web_text("views.js"), "planCard")
@@ -161,25 +161,6 @@ class PeekAndClock(unittest.TestCase):
         body = function_body(web_text("fmt.js"), "formatLocalTime")
         self.assertIn(".exec(value)", body)
         self.assertNotIn("parseIso(value)", body)
-
-
-class PlannedPlaceholders(unittest.TestCase):
-    """Reserved places for the panels after these."""
-
-    def test_placeholders_name_all_four(self):
-        views = web_text("views.js")
-        for name in (
-            "external contributions",
-            "in-flight review",
-            "board sync lag",
-            "quota gate and pacing share",
-        ):
-            self.assertIn(name, views)
-        self.assertIn(": planned", views)
-
-    def test_overview_renders_them(self):
-        body = function_body(web_text("views.js"), "renderOverview")
-        self.assertIn("placeholdersCard()", body)
 
 
 class SchemaGate(unittest.TestCase):

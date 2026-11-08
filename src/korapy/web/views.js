@@ -1602,9 +1602,13 @@ function attentionCard(doc, nowMs) {
   return section;
 }
 // The plan band: the next starts the loop would make, with the
-// reason each waits. Built from the drive journal and the capacity
-// the snapshot already polls, never a dry-run pass. An empty fleet
-// names the next pass; unknown reads unknown.
+// ticket and reason each waits. Built from the drive journal and
+// the capacity the snapshot already polls, never a dry-run pass.
+// Each row names its ticket ("repo#41 waits: ceiling reached");
+// identical rows collapse into the first with a count; free slots
+// name no ticket ("slot free, starts next pass") because the source
+// does not say which ticket takes a free slot. An empty fleet names
+// the next pass; unknown reads unknown.
 export function planItems(doc) {
   const plan = doc && !isErrorSection(doc.plan) ? doc.plan : null;
   if (plan === null || plan === undefined) {
@@ -1618,13 +1622,34 @@ export function planItems(doc) {
   }
   const lines = [];
   for (const item of Array.isArray(plan.next) ? plan.next : []) {
+    if (item === null || typeof item !== "object") {
+      continue;
+    }
     const wait =
-      item && typeof item.wait === "string" && item.wait !== ""
-        ? item.wait
-        : item && typeof item.waits === "string" && item.waits !== ""
-          ? item.waits
+      typeof item.waits === "string" && item.waits !== ""
+        ? item.waits
+        : typeof item.wait === "string" && item.wait !== ""
+          ? item.wait
           : "unknown";
-    lines.push("next start waits: " + wait);
+    const count =
+      typeof item.count === "number" && Number.isFinite(item.count) && item.count > 1
+        ? Math.floor(item.count)
+        : 1;
+    const ticket =
+      typeof item.ticket === "string" && item.ticket !== "" ? item.ticket : null;
+    if (ticket !== null) {
+      lines.push(
+        ticket + " waits: " + wait + (count > 1 ? " (" + String(count) + " tickets)" : ""),
+      );
+    } else if (wait === "slot free") {
+      lines.push(
+        count > 1 ? String(count) + " slots free, start next pass" : "slot free, starts next pass",
+      );
+    } else if (count > 1) {
+      lines.push(String(count) + " tickets wait: " + wait);
+    } else {
+      lines.push("1 ticket waits: " + wait);
+    }
   }
   return lines;
 }
@@ -1680,24 +1705,6 @@ function planCard(doc, nowMs) {
   return section;
 }
 
-// Placeholders for the panels after these: named now so the layout
-// reserves their place, drawn as planned instead of blank space.
-const PLANNED_PANELS = [
-  "external contributions",
-  "in-flight review",
-  "board sync lag",
-  "quota gate and pacing share",
-];
-
-function placeholdersCard() {
-  const section = card("Later", "Panels planned after these.", false, "Reserved places, not data.");
-  section.setAttribute("class", "card quiet");
-  for (const name of PLANNED_PANELS) {
-    section.appendChild(el("p", name + ": planned", { class: "desc dim" }));
-  }
-  return section;
-}
-
 export function renderOverview(doc, { project, nowMs, notice }) {
   renderTabs("overview");
   renderStrip(doc, { nowMs });
@@ -1711,7 +1718,6 @@ export function renderOverview(doc, { project, nowMs, notice }) {
     quotaCard(doc.quota, nowMs),
     capacityCard(doc.capacity),
     driveCard(doc.drive, nowMs),
-    placeholdersCard(),
   ];
   const agents = agentsSection(doc, project, nowMs);
   document.getElementById("detail").hidden = true;

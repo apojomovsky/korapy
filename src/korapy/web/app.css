@@ -335,11 +335,14 @@ something needs a human, quiet otherwise. */
   padding-left: 1.25rem;
 }
 
-/* The overview cards: gauges first in one row of equal cards,
-quota and capacity in the next, up to three across on wide screens. */
+/* The overview cards: gauges first, then quota, capacity and the
+loop, up to three across on wide screens. Rows align to each
+card's own content: a short card never stretches to the tallest
+in its row and leaves empty space. */
 #cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr));
+  align-items: start;
   gap: 1rem;
   padding: 1rem 0;
 }

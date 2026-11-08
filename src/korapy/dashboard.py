@@ -199,7 +199,8 @@ def attention(events):
     """The attention band from unresolved event rows (pure).
 
     `events` is `coordevents.unresolved` rows, None when uncollected,
-    or the exception reading them raised. `needs_decision` carries the
+    or the exception reading them raised. Anything else (a wrong-typed
+    source or a row that is not a dict) reads `error`, never `ready`. `needs_decision` carries the
     question rows, `ready_to_merge` the held-merge rows, each with its
     ref and one line of evidence. `coordinator_handled` counts the rows
     the coordinator owns (`coordinator-review`). Failing doctor rows
@@ -222,6 +223,15 @@ def attention(events):
             "coordinator_handled": 0,
             "items": [],
             "error": str(events) or repr(events),
+        }
+    if not isinstance(events, (list, tuple)) or any(not isinstance(row, dict) for row in events):
+        return {
+            "state": "error",
+            "needs_decision": [],
+            "ready_to_merge": [],
+            "coordinator_handled": 0,
+            "items": [],
+            "error": f"attention events is {type(events).__name__}, want a list of rows",
         }
     needs = []
     merges = []
@@ -250,17 +260,38 @@ def attention(events):
     }
 
 
+def _wait_words(ticket, reason):
+    """The journal reason without its `ticket: ` prefix (pure).
+
+    The pass journals reasons as full sentences (`repo#41: day cap
+    reached ...`); the band names the ticket separately, so the row
+    carries only the words after the prefix. A missing or empty
+    reason reads `unknown reason`, never a blank.
+    """
+    if not isinstance(reason, str) or not reason:
+        return "unknown reason"
+    prefix = f"{ticket}: "
+    if reason.startswith(prefix):
+        stripped = reason[len(prefix) :]
+        return stripped if stripped else "unknown reason"
+    return reason
+
+
 def plan_projection(drive_view, now):
     """The plan band from the drive section (pure).
 
-    `next` names the starts the loop would make next: one row per free
-    slot while the daily budget holds, each carrying the reason it
-    waits (the top skip codes from the last pass, else `slot free`).
-    With no starts left the list is empty, so the panel reads the
-    empty state instead of naming starts that can never start.
-    `next_pass_in_s` counts down from the last pass on the 5-minute
-    timer cadence. A missing drive section reads `unknown`; a broken
-    one reads `error`. Neither invents candidates: with no pass data
+    `next` names the starts the loop would make next: one row per
+    waited ticket while the daily budget holds, each carrying the
+    ticket and the reason it waits (the named waits from the last
+    pass, else the skip codes, else `slot free`). Identical waits
+    collapse into one row with a count; free slots collapse into one
+    `slot free` row with a count. With no starts left the list is
+    empty, so the panel reads the empty state instead of naming starts
+    that can never start. `next_pass_in_s` counts down from the last
+    pass on the 5-minute timer cadence. A missing drive section reads
+    `unknown`; a broken one reads `error`. A wrong-typed section (or
+    wrong-typed counts inside it) reads `error` too, never an empty
+    ready list. Neither invents candidates: with no pass data
     the panel says it does not know.
     """
     if drive_view is None:
@@ -283,23 +314,83 @@ def plan_projection(drive_view, now):
             "starts_remaining": 0,
             "error": str(detail),
         }
-    try:
-        remaining = int(drive_view.get("starts_remaining", 0))
-    except (TypeError, ValueError):
+
+    def _shape_error(what):
+        return {
+            "state": "error",
+            "next": [],
+            "waits": [],
+            "next_pass_in_s": None,
+            "starts_remaining": 0,
+            "error": f"drive section {what}, want the drive_status dict",
+        }
+
+    if not isinstance(drive_view, dict):
+        return _shape_error(f"is {type(drive_view).__name__}")
+    raw_remaining = drive_view.get("starts_remaining", 0)
+    if raw_remaining is None:
         remaining = 0
+    elif isinstance(raw_remaining, bool) or not isinstance(raw_remaining, (int, float)):
+        try:
+            remaining = int(raw_remaining)
+        except (TypeError, ValueError):
+            return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
+    else:
+        try:
+            remaining = int(raw_remaining)
+        except (TypeError, ValueError, OverflowError):
+            return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
     remaining = max(0, remaining)
-    skipped = drive_view.get("skipped_by_reason") or {}
-    waits = sorted(skipped) if isinstance(skipped, dict) else []
+    skipped = drive_view.get("skipped_by_reason")
+    if skipped is None:
+        skipped = {}
+    if not isinstance(skipped, dict):
+        return _shape_error(f"skipped_by_reason is {type(skipped).__name__}")
+    for code, count in skipped.items():
+        if isinstance(count, bool) or not isinstance(count, int):
+            return _shape_error(f"skipped_by_reason[{code!r}] is {type(count).__name__}")
+    raw_waits = drive_view.get("waits")
+    if raw_waits is None:
+        # Sections that predate named waits: one row per skip code,
+        # ticketless, with the recorded count.
+        groups = [
+            {"ticket": None, "waits": str(code), "count": skipped[code]}
+            for code in sorted(skipped, key=str)
+            if skipped[code] > 0
+        ]
+    elif not isinstance(raw_waits, (list, tuple)) or any(
+        not isinstance(entry, dict) for entry in raw_waits
+    ):
+        return _shape_error(f"waits is {type(raw_waits).__name__}")
+    else:
+        # One row per waited ticket, in journal order; identical waits
+        # collapse into the first row with a count.
+        groups = []
+        seen: dict[str, dict] = {}
+        for entry in raw_waits:
+            ticket = entry.get("ticket")
+            if not isinstance(ticket, str) or not ticket:
+                ticket = "unknown ticket"
+            words = _wait_words(ticket, entry.get("reason"))
+            if words in seen:
+                seen[words]["count"] += 1
+            else:
+                row = {"ticket": ticket, "waits": words, "count": 1}
+                seen[words] = row
+                groups.append(row)
+    waits = sorted({str(row["waits"]) for row in groups})
+    groups = groups[:3]
     if not remaining:
         nxt = []
-    elif not waits:
-        nxt = [{"what": "start", "waits": "slot free"} for _ in range(min(remaining, 3))]
     else:
-        nxt = [{"what": "start", "waits": wait} for wait in waits[:3]]
-        if len(nxt) < min(remaining, 3):
-            nxt += [
-                {"what": "start", "waits": "slot free"} for _ in range(min(remaining, 3) - len(nxt))
-            ]
+        nxt = [dict({"what": "start"}, **row) for row in groups]
+        target = min(remaining, 3)
+        if len(nxt) < target:
+            # Free capacity names no ticket: the source does not say
+            # which ticket takes a free slot, so the row says so.
+            nxt.append(
+                {"what": "start", "ticket": None, "waits": "slot free", "count": target - len(nxt)}
+            )
     last = drive_view.get("last_pass_at")
     if isinstance(last, bool) or not isinstance(last, (int, float)):
         countdown = None
