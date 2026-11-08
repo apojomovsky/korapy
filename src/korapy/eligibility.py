@@ -51,12 +51,21 @@ class EligibilityError(ValueError):
 
 @dataclass(frozen=True)
 class LinkedPull:
-    """One pull request linked to a ticket, as plain data."""
+    """One pull request linked to a ticket, as plain data.
+
+    `updated_at` is the tracker's last-update time for the pull, as
+    epoch seconds. `merged_at` is when the pull merged, else 0.0; the
+    gate scopes a merged pull against the merge time, falling back to
+    `updated_at` only when the listing carries no merge time. Both
+    default to zero for rows built without a tracker read.
+    """
 
     number: int
     state: str = ""
     checks: str = ""
     review: str = ""
+    updated_at: float = 0.0
+    merged_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -70,6 +79,9 @@ class TicketRow:
     it defaults to () for rows built without a tracker read, such as plans.
     `pulls_error` carries the first error that read reported for the
     ticket, so skips can name the cause; it defaults to empty.
+    `claimed_at` is the current claim's start time as epoch seconds,
+    None when the ticket is unclaimed or the pass did not read claims;
+    the merged-pull check scopes old merges against it.
     """
 
     repo: str
@@ -83,6 +95,7 @@ class TicketRow:
     external: bool = False
     pulls: tuple | None = ()
     pulls_error: str = ""
+    claimed_at: float | None = None
     extra: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -91,6 +104,39 @@ class TicketRow:
             object.__setattr__(self, "extra", dict(extra))
         else:
             object.__setattr__(self, "extra", {})
+
+
+def merged_pull(row: TicketRow):
+    """The row's first in-scope merged linked pull, else None. Pure.
+
+    A pull merged since the ticket's current claim start means the
+    work landed during this round, so no new round starts on it,
+    whatever else the row says; a ticket with no claim withdraws the
+    same way. A pull merged before the claim start reads as
+    landed-before-this-round (a reopened ticket picked up again), so
+    it does not withdraw; a merge at exactly the claim start, or
+    with no readable time, withdraws, failing closed without an
+    ordering proof. The scope reads the merge time (`merged_at`),
+    falling back to the last-update time (`updated_at`) only when
+    the listing carries no merge time, so a comment on a long-merged
+    pull never re-arms the withdrawal. The first in-scope merge is
+    named, so the reason stays stable. A pull closed without merging
+    is not merged: the ticket still needs its round. Unreadable pulls
+    (None) read as no merged pull; readers refuse those rows on their
+    own check.
+    """
+    claimed_at = getattr(row, "claimed_at", None)
+    for pull in row.pulls or ():
+        if getattr(pull, "state", "") != "merged":
+            continue
+        if claimed_at is None:
+            return pull
+        merged_at = getattr(pull, "merged_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at <= 0:
+            merged_at = getattr(pull, "updated_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at >= claimed_at:
+            return pull
+    return None
 
 
 @dataclass(frozen=True)
@@ -109,7 +155,11 @@ class StartRequest:
 
 
 def row_from_item(
-    item: board.Item, *, pulls: tuple | None = (), pulls_error: str = ""
+    item: board.Item,
+    *,
+    pulls: tuple | None = (),
+    pulls_error: str = "",
+    claimed_at: float | None = None,
 ) -> TicketRow:
     """The policy view of one board store item. Pure.
 
@@ -117,8 +167,11 @@ def row_from_item(
     when that read failed, so readers fail closed); the store carries
     no pull rows, so callers pass what the pass read. `pulls_error` is
     the first error that read reported for the ticket, so skips can name
-    the cause. Board concepts ride along in extra, copied on read so no
-    two rows share one dict; a missing value reads as carrying nothing.
+    the cause. `claimed_at` is the current claim's start time, passed
+    beside the item because the store keeps claims outside the item;
+    None reads as unclaimed. Board concepts ride along in extra, copied
+    on read so no two rows share one dict; a missing value reads as
+    carrying nothing.
     """
     return TicketRow(
         repo=item.repo,
@@ -132,6 +185,7 @@ def row_from_item(
         external=item.external,
         pulls=pulls,
         pulls_error=pulls_error,
+        claimed_at=claimed_at,
         extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
@@ -141,6 +195,7 @@ def rows_from_items(
     *,
     pulls_by_key: Mapping[tuple[str, int], tuple | None] | None = None,
     pulls_errors: Mapping[tuple[str, int], str] | None = None,
+    claims_by_key: Mapping[tuple[str, int], float | None] | None = None,
 ) -> list[TicketRow]:
     """The policy view of every given item, in the given order. Pure.
 
@@ -150,17 +205,24 @@ def rows_from_items(
     map every row reads empty, which is what plans build: they never
     contact the tracker. `pulls_errors` maps (repo, number) to the
     first error that read reported, so skips can name the cause; a
-    ticket missing from it reads as reporting none.
+    ticket missing from it reads as reporting none. `claims_by_key`
+    maps (repo, number) to the current claim's start time; a ticket
+    missing from it reads as unclaimed.
     """
     rows = []
     for item in items:
         pulls: tuple | None = ()
         pulls_error = ""
+        claimed_at: float | None = None
         if pulls_by_key is not None:
             pulls = pulls_by_key.get((item.repo, item.number), ())
         if pulls_errors is not None:
             pulls_error = pulls_errors.get((item.repo, item.number), "")
-        rows.append(row_from_item(item, pulls=pulls, pulls_error=pulls_error))
+        if claims_by_key is not None:
+            claimed_at = claims_by_key.get((item.repo, item.number))
+        rows.append(
+            row_from_item(item, pulls=pulls, pulls_error=pulls_error, claimed_at=claimed_at)
+        )
     return rows
 
 
