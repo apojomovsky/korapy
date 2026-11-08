@@ -529,6 +529,20 @@ class DirPlanAgeCase(unittest.TestCase):
         self.assertFalse(found.safe)
         self.assertEqual(found.proof, "kept: touched 2d ago, rule keeps 7d")
 
+    def test_future_mtime_is_kept_with_zero_age(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/future", mtime=NOW + 2 * DAY, size=100)
+                ]
+            },
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertEqual(found.proof, "kept: touched 0d ago, rule keeps 7d")
+
     def test_boundary_age_is_kept(self):
         candidates, _notes = plan_rules(
             {"acme-scratch": dir_rule()},
@@ -932,6 +946,22 @@ class SessionPlanProofCase(unittest.TestCase):
                 any(f"rule {name}:" in note and "unreadable" in note for note in notes),
                 f"no unreadable note for {name}: {notes}",
             )
+
+    def test_unreadable_live_listing_notes_unproven_only_rule(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {
+                "/sessions/acme-old": [
+                    leaf("/sessions/acme-old", "scratch-notes", mtime=NOW - 40 * DAY)
+                ]
+            },
+            entries=[finished_entry("acme", 7)],
+            live=None,
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "unproven")
+        self.assertFalse(found.safe)
+        self.assertTrue(any("unreadable" in note for note in notes), f"no unreadable note: {notes}")
 
     def test_ticket_with_a_live_entry_among_finished_ones_is_kept(self):
         candidates, _notes = session_plan(
