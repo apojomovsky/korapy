@@ -319,7 +319,9 @@ def gate(
 
     Row state first (missing, non-open with closed reading as merged,
     a merged linked pull for every kind before external ownership,
-    then external, withdrawn), then claim
+    then external, withdrawn: the merged branch only fires on rows the
+    pass listed pulls for, so an external row the listing skipped logs
+    externally owned, never merged), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
     role, outcome)} for the newest finished entry per ticket), then the
@@ -334,14 +336,15 @@ def gate(
     (repo, number)) approves with no finding at or above
     `fix_threshold` is merge-ready too: no fix round opens for lows,
     and no fresh start launches on approved work. A ticket whose
-    linked pull already merged, or whose issue is closed, is
-    withdrawn with reason `merged`: no new round of any kind starts
-    on it, claimed or not, while a running unit is never stopped by
-    this verdict. A pull closed without merging is not merged: the
-    ticket still needs its round. A reopened issue whose old merged
-    link is still in place stays withdrawn until that link is
-    removed; scoping the signal to merges newer than the last round
-    is open work. None (the default)
+    issue is closed, or whose linked pull merged during the current
+    claim (or with no claim behind it), is withdrawn with reason
+    `merged`: no new round of any kind starts on it, claimed or not,
+    while a running unit is never stopped by this verdict. A merged
+    pull older than the claim start reads as landed-before-this-round:
+    a reopened ticket picked up again keeps its round. A ticket with
+    no claim withdraws on any merged link. A pull closed without
+    merging is not merged: the ticket still needs its round. None
+    (the default)
     reads the shared default threshold, so the gate follows it past
     import time; a falsy value falls back the same way. A finished reviewer
     with outcome `ok` and no review record for the ticket is a protocol
@@ -1473,7 +1476,11 @@ def pulls_index_for(tracker_factory):
         return (
             {
                 number: tuple(
-                    LinkedPull(number=item.number, state=item.state)
+                    LinkedPull(
+                        number=item.number,
+                        state=item.state,
+                        updated_at=getattr(item, "updated_at", 0.0),
+                    )
                     for item in pulls
                     if getattr(item, "kind", "pr") == "pr"
                 )
@@ -1685,7 +1692,23 @@ def _read_inputs(
     ), None
 
 
-def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None):
+def claim_starts(store, items):
+    """{(repo, number): claim start} for the claimed items. One query each.
+
+    The one builder of the claim-start map the rows carry: the store
+    keeps claims outside the items, and `claim_of` is its one resolver
+    for them. Unclaimed items map to None, which reads the same as
+    missing: no current claim. A store failure raises, and the caller
+    fails the pass instead of gating blind.
+    """
+    starts = {}
+    for item in items:
+        claim = store.claim_of(item.repo, item.number)
+        starts[(item.repo, item.number)] = claim.claimed_at if claim is not None else None
+    return starts
+
+
+def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None, claims_by_key=None):
     """{(repo, number): row} with this pass's releases applied. Pure.
 
     The gate and the missing-record log read the same map, so a freed
@@ -1694,19 +1717,24 @@ def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None):
     `pulls_by_key` carries the linked pulls the pass read through the
     tracker (None marks an unreadable ticket); with none every row
     reads empty. `pulls_errors` carries the first error per unreadable
-    ticket, so the rows name the cause. The gate reads the same row
-    pulls, so the two never disagree.
+    ticket, so the rows name the cause. `claims_by_key` carries each
+    claimed ticket's claim start for the merged-pull scope; a released
+    row reads as unclaimed, like a row missing from the map. The gate
+    reads the same row pulls, so the two never disagree.
     """
     by_key = {
         (row.repo, row.number): row
         for row in eligibility.rows_from_items(
-            items, pulls_by_key=pulls_by_key, pulls_errors=pulls_errors
+            items,
+            pulls_by_key=pulls_by_key,
+            pulls_errors=pulls_errors,
+            claims_by_key=claims_by_key,
         )
     }
     for key in released or ():
         prior = by_key.get(key)
         if prior is not None:
-            by_key[key] = replace(prior, agent="")
+            by_key[key] = replace(prior, agent="", claimed_at=None)
     return by_key
 
 
@@ -1732,6 +1760,7 @@ def _gate_all(
     fix_threshold=None,
     index_for=None,
     pulls_max_calls=None,
+    claims_by_key=None,
     driven,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
@@ -1758,8 +1787,11 @@ def _gate_all(
     the tracker) feeds the pass's one linked-pull map, which the
     eligibility rows and the gate rows share, so the policies and the
     gate read the same row pulls with no second lookup.
-    `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
-    setting) caps the listing calls for the pass. The map is built
+    `claims_by_key` ({(repo, number): claim start} from `claim_starts`,
+    None reads every row as unclaimed) scopes the merged-pull check to
+    merges newer than the claim start. `pulls_max_calls` (None reads
+    the `drive.pulls_max_calls` host setting) caps the listing calls
+    for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
     project wants, then only the fetchable ones (open, unheld or
     managed-held, and in a repository the pass drives) trigger one
@@ -1819,7 +1851,7 @@ def _gate_all(
                 continue
             for request in requests:
                 wanted.add((request.repo, request.number))
-        pre_by_key = _released_rows(items, released)
+        pre_by_key = _released_rows(items, released, claims_by_key=claims_by_key)
         fetch_keys = {
             key
             for key in wanted
@@ -1842,7 +1874,13 @@ def _gate_all(
                     f"{unchecked} ticket(s) left unchecked, starts refused",
                     file=out,
                 )
-    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key, pulls_errors=pull_errors)
+    by_key = _released_rows(
+        items,
+        released,
+        pulls_by_key=pulls_by_key,
+        pulls_errors=pull_errors,
+        claims_by_key=claims_by_key,
+    )
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     candidates = []
     for project in registered:
@@ -5079,6 +5117,11 @@ def _launching_pass(
         )
     else:
         reviews = None
+    try:
+        claims_by_key = claim_starts(store, _items)
+    except (board.StoreError, sqlite3.Error) as problem:
+        print(f"korapy drive: cannot read claims: {problem}", file=err)
+        return finish(USAGE)
     gated_rows, problems, eligible_keys, pulls_calls, pulls_limited = _gate_all(
         _items,
         registered,
@@ -5099,6 +5142,7 @@ def _launching_pass(
         reviews=reviews,
         index_for=index_for,
         pulls_max_calls=pulls_max_calls,
+        claims_by_key=claims_by_key,
         driven=driven,
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)

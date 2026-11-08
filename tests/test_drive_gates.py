@@ -6,6 +6,7 @@ to a temporary directory, and injected plain-data inputs for every
 host read, so nothing reaches the network, subprocesses or real dirs.
 """
 
+import calendar
 import inspect
 import io
 import os
@@ -19,7 +20,7 @@ from korapy.eligibility import LinkedPull, StartRequest, TicketRow
 from korapy.github import tracker as ghtracker
 from tests.test_drive import driven_for, policy_source, stored
 from tests.test_eligibility import item as board_item
-from tests.test_tracker import FakeRun, FakeTracker, pr_payload, reading
+from tests.test_tracker import FakeRun, FakeTracker, T0, pr_payload, reading
 
 
 def request(repo="app", number=7, kind="start", weight=0.0):
@@ -35,6 +36,7 @@ def row(
     labels=(),
     external=False,
     pulls=(),
+    claimed_at=None,
 ):
     return TicketRow(
         repo=repo,
@@ -45,6 +47,7 @@ def row(
         labels=labels,
         external=external,
         pulls=pulls,
+        claimed_at=claimed_at,
     )
 
 
@@ -983,7 +986,21 @@ class OpenPullGateTest(unittest.TestCase):
         self.assertIn("merged", gated.reason)
         self.assertIn("pull #9", gated.reason)
 
+    def test_a_fix_on_an_unclaimed_row_with_a_merged_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="fix",
+                row_=row(pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
     def test_a_merged_pull_names_merged_on_an_externally_owned_row(self):
+        # Gate order only: the pass never lists pulls for external rows,
+        # so production rows never carry both flags. The listed-row order
+        # still checks the merged link before external ownership.
         gated = gate(entry(row_=row(external=True, pulls=(LinkedPull(number=9, state="merged"),))))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("merged", gated.reason)
@@ -1255,7 +1272,10 @@ class RealPullsChainTest(unittest.TestCase):
 
     def test_a_merged_pull_reaches_the_row_as_merged(self):
         _, _, _, rows = self.tracked_rows()
-        self.assertEqual(rows["seven"].pulls, (LinkedPull(number=9, state="merged"),))
+        self.assertEqual(
+            rows["seven"].pulls,
+            (LinkedPull(number=9, state="merged", updated_at=float(T0)),),
+        )
 
     def test_a_closed_unmerged_pull_never_reaches_the_row(self):
         _, _, _, rows = self.tracked_rows()
@@ -1283,6 +1303,107 @@ class RealPullsChainTest(unittest.TestCase):
         _, _, _, rows = self.tracked_rows()
         gated = gate(entry(number=6, row_=rows["six"]))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class MergedScopeTest(unittest.TestCase):
+    """Merged scope through the production linked-pulls path.
+
+    The pass lists each repo once and builds every row from that one
+    map, so these tests program the tracker double (the merge time on
+    the pull, the claim start beside the row) and let the real
+    `pulls_index_for`, `linked_pulls_map`, `rows_from_items`, policy
+    and gate decide. A merge newer than the ticket's claim start
+    withdraws every kind; a merge older than the claim start reads as
+    landed-before-this-round, so a re-claimed ticket stays startable.
+    A ticket with no claim withdraws, as before.
+    """
+
+    MERGE_AT = 3000.0
+    CLAIM_AT = 2000.0
+
+    def scoped_rows(self, merge_at, claimed_at=CLAIM_AT, agent="drive-host-1-x"):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state="merged", updated_at=merge_at)]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        items = [board_item(number=7, agent=agent)]
+        claims = {("app", 7): claimed_at} if claimed_at is not None else None
+        return eligibility.rows_from_items(items, pulls_by_key=found, claims_by_key=claims)
+
+    def test_a_newer_merge_withdraws_a_claimed_fix(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT)
+        self.assertEqual(policies.basic([row_], now=1000.0), [])
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_an_older_merge_lets_the_reclaimed_round_proceed(self):
+        (row_,) = self.scoped_rows(self.CLAIM_AT - 1000.0)
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic([row_], now=1000.0)],
+            [("app", 7)],
+        )
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("merged", gated.reason)
+
+    def test_a_merge_with_no_claim_withdraws(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT, claimed_at=None, agent="")
+        self.assertEqual(policies.basic([row_], now=1000.0), [])
+        gated = gate(entry(number=7, row_=row_))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_the_pull_time_reaches_the_row(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT)
+        self.assertEqual(
+            row_.pulls, (LinkedPull(number=9, state="merged", updated_at=self.MERGE_AT),)
+        )
+
+
+class MergedScopeRealListingTest(unittest.TestCase):
+    """Merge time through the real adapter listing, faked `gh` below it.
+
+    One case end to end: the payload's `updated_at` on a merged pull
+    rides the parse, the per-repo index, the row and the gate, so an
+    older merge on a re-claimed ticket proceeds instead of withdrawing.
+    """
+
+    LISTING = "repos/app/pulls?state=all&sort=updated&direction=asc&per_page=100"
+    MERGE_ISO = "2026-11-07T12:00:00Z"
+
+    def tracked_row(self, claimed_at):
+        gh = FakeRun()
+        gh.add(
+            self.LISTING,
+            [
+                pr_payload(
+                    9,
+                    "Landed.\n\nCloses #7",
+                    state="closed",
+                    merged_at=self.MERGE_ISO,
+                    updated_at=self.MERGE_ISO,
+                ),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        index_for = drive.pulls_index_for(lambda repo: adapter)
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        items = [board_item(number=7, agent="drive-host-1-x")]
+        (row_,) = eligibility.rows_from_items(
+            items, pulls_by_key=found, claims_by_key={("app", 7): claimed_at}
+        )
+        return gh, row_
+
+    def test_an_older_merge_through_the_real_listing_proceeds(self):
+        merge_at = float(calendar.timegm((2026, 11, 7, 12, 0, 0, 0, 0, 0)))
+        gh, row_ = self.tracked_row(merge_at + 100.0)
+        self.assertEqual(gh.paths(), [self.LISTING])
+        self.assertEqual(row_.pulls, (LinkedPull(number=9, state="merged", updated_at=merge_at),))
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("merged", gated.reason)
 
 
 class ReviewThresholdGateTest(unittest.TestCase):

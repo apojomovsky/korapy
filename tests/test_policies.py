@@ -145,6 +145,16 @@ class SelectionTest(unittest.TestCase):
         pull = eligibility.LinkedPull(number=11, state="merged")
         self.assertEqual(selected([row(7, pulls=(pull,))]), [])
 
+    def test_merged_pull_newer_than_the_claim_start_is_withdrawn(self):
+        pull = eligibility.LinkedPull(number=11, state="merged", updated_at=3000.0)
+        claimed = row(7, agent="drive-host-1--app-7", claimed_at=2000.0, pulls=(pull,))
+        self.assertEqual(selected([claimed]), [])
+
+    def test_merged_pull_older_than_the_claim_start_is_selected(self):
+        pull = eligibility.LinkedPull(number=11, state="merged", updated_at=1000.0)
+        claimed = row(7, agent="drive-host-1--app-7", claimed_at=2000.0, pulls=(pull,))
+        self.assertEqual(selected([claimed]), [("app", 7)])
+
     def test_mixed_rows_select_only_the_startable_ones(self):
         rows = [
             row(1),

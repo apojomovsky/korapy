@@ -167,6 +167,66 @@ class RowPullsTest(unittest.TestCase):
         self.assertEqual(sorted(eligibility.KINDS), ["fix", "resume", "review", "start"])
 
 
+class MergedScopeTest(unittest.TestCase):
+    """merged_pull fires only for merges the current claim did not start after.
+
+    A merged pull with no claim behind it withdraws, as does one merged
+    during the current claim. A merged pull older than the claim start
+    reads as landed-before-this-round (a reopened ticket picked up
+    again), so the round proceeds. A merge at exactly the claim start
+    withdraws: without an ordering proof the gate fails closed.
+    """
+
+    def test_no_merged_pull_is_none(self):
+        row = eligibility.TicketRow(repo="app", number=7)
+        self.assertIsNone(eligibility.merged_pull(row))
+
+    def test_unclaimed_row_withdraws_on_any_merged_pull(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=1000.0)
+        row = eligibility.TicketRow(repo="app", number=7, pulls=(pull,))
+        self.assertIs(eligibility.merged_pull(row), pull)
+
+    def test_merge_newer_than_the_claim_start_withdraws(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=3000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
+        )
+        self.assertIs(eligibility.merged_pull(row), pull)
+
+    def test_merge_older_than_the_claim_start_is_ignored(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=1000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
+        )
+        self.assertIsNone(eligibility.merged_pull(row))
+
+    def test_merge_at_the_claim_start_withdraws_fail_closed(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=2000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
+        )
+        self.assertIs(eligibility.merged_pull(row), pull)
+
+    def test_first_in_scope_merge_is_named(self):
+        old = eligibility.LinkedPull(number=4, state="merged", updated_at=1000.0)
+        new = eligibility.LinkedPull(number=9, state="merged", updated_at=3000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(old, new)
+        )
+        self.assertIs(eligibility.merged_pull(row), new)
+
+    def test_row_from_item_defaults_to_no_claim(self):
+        self.assertIsNone(eligibility.row_from_item(item()).claimed_at)
+
+    def test_rows_from_items_carries_claim_starts(self):
+        rows = eligibility.rows_from_items(
+            [item(number=7), item(number=9)],
+            claims_by_key={("app", 7): 2000.0},
+        )
+        self.assertEqual(rows[0].claimed_at, 2000.0)
+        self.assertIsNone(rows[1].claimed_at)
+
+
 class LoaderTest(unittest.TestCase):
     def setUp(self):
         self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-"))

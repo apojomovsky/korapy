@@ -50,13 +50,16 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unheld, unblocked, with no open or merged linked pull, claimed or not:
-    a missing or non-string title reads as empty and a non-tuple labels
-    value reads as none, so odd data selects or skips without raising.
-    Unreadable pulls (None) are never selected: a ticket whose links
-    the pass could not read fails closed here, as in the gate. A
-    merged linked pull means the work already landed, so the ticket
-    stays withdrawn; a pull closed without merging still selects.
+    Open, unheld, unblocked, with no open or in-scope merged linked
+    pull, claimed or not: a missing or non-string title reads as empty
+    and a non-tuple labels value reads as none, so odd data selects or
+    skips without raising. Unreadable pulls (None) are never selected:
+    a ticket whose links the pass could not read fails closed here, as
+    in the gate. An in-scope merged linked pull means the work landed
+    during the current claim (or with no claim behind it), so the
+    ticket stays withdrawn; a merged pull older than the claim start
+    reads as landed-before-this-round and still selects, as does a
+    pull closed without merging.
     """
     if row.state != "open":
         return False

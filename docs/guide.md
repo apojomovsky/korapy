@@ -313,7 +313,8 @@ eligibility = "korapy.policies:basic"
 ```
 
 It selects open, unheld, unblocked tickets with no open linked pull
-and no merged linked pull (a merged ticket stays withdrawn, so no new
+and no merged linked pull newer than the claim start (a ticket whose
+work landed during its claim stays withdrawn, so no new
 round starts on landed work), weighted by board priority. The same file carries the project's slot
 `floor` and `ceiling`: with the host total full, a project below its
 floor still starts, and a project at its ceiling does not.
