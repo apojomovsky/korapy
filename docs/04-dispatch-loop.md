@@ -591,28 +591,39 @@ prompt, overridable as `prompts.research` like the other roles.
 The loop treats a research ticket as done when its Findings comment
 exists. Done detection is one pure function over the ticket's
 comments (`research.findings`): the first comment whose first line
-starts with `Findings`. The comments are the only new GitHub reads
-the research finish adds: one `Tracker.comments` read per finished
-research ticket, in the pass that already lists its pulls. After the
-orphan recovery, the pass settles each claimed research row whose
+starts with `Findings`. The first Findings comment on the ticket
+wins across re-runs: comment bodies carry no authorship or timestamp
+to scope the verdict to the current holder's run. The comments are
+the only new GitHub reads the research finish adds: one
+`Tracker.comments` read per finished research ticket, in the pass
+that already lists its pulls. A rate-limited comments read stops the
+pass with exit 3, like any other tracker outage, instead of settling
+blind. Orphan recovery never releases a claimed research row whose
 finished registry entry names the research role behind the current
-holder: with findings, it adds `researched` through the label seam
-and releases the claim (the agent and status clears flow through the
-mirror as usual); without findings, it releases bare, so the ticket
-is startable again instead of waiting on a reviewer that never comes.
-A failed label write keeps the claim for a later pass, never released
-unlabeled; unreadable comments keep it too. A row with a live unit
-keeps its claim whatever the comments say.
+holder, whatever its age: the verdict settles through its comments,
+so the claim survives until the settlement reads them. After the
+orphan recovery, the pass settles each such row: with findings, it
+adds `researched` through the label seam and releases the claim (the
+agent and status clears flow through the mirror as usual); without
+findings, it releases bare, so the ticket is startable again instead
+of waiting on a reviewer that never comes. A failed label write keeps
+the claim for a later pass, never released unlabeled; unreadable
+comments keep it too. A row with a live unit keeps its claim whatever
+the comments say.
 
 A settled research ticket never takes a reviewer: the gate refuses a
 `review` requested on a research row, a finished research holder
 never takes over as one, and the research rows skip both linked-pull
-checks, so the finish never waits for a pull request. A finding
-addressed to the maintainer is reported as an attention item on the
-dashboard (a `research` event in the project's queue, carrying the
-finding's first line) until acknowledged: re-reporting an acked
-finding does not reopen it. A stuck research worker restarts with the
-research prompt, like any other start.
+checks (in the gate and in `basic`, which selects research rows with
+unreadable or open pulls), so the finish never waits for a pull
+request. A finding addressed to the maintainer is reported as an
+attention item on the dashboard (a `research` event in the driving
+project's queue, carrying the finding's first line) until
+acknowledged: re-reporting an acked finding does not reopen it. The
+event goes to the settlement's driving project, resolved where the
+project context still exists; when two projects drive one repository,
+the first sorted project wins. A stuck research worker restarts with
+the research prompt, like any other start.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 

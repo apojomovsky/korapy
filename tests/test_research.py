@@ -89,6 +89,10 @@ class FindingsTest(unittest.TestCase):
         self.assertIsNone(research.findings([None, 42]))
 
 
+def holder_of(agent="drive-host-1-x", role="research"):
+    return {("app", 7): (agent, role)}
+
+
 class SettlementPlanTest(unittest.TestCase):
     def test_finished_research_with_findings_is_due_with_findings(self):
         from korapy import research
@@ -101,9 +105,8 @@ class SettlementPlanTest(unittest.TestCase):
             labels=["research"],
             agent="drive-host-1-x",
         )
-        finished = {("app", 7): finished_entry()}
         comments = {("app", 7): ["note", "Findings: go"]}
-        due = research.settlements([item], finished, comments)
+        due = research.settlements([item], holder_of(), comments)
         self.assertEqual(len(due), 1)
         self.assertTrue(due[0].has_findings)
 
@@ -118,9 +121,8 @@ class SettlementPlanTest(unittest.TestCase):
             labels=["research"],
             agent="drive-host-1-x",
         )
-        finished = {("app", 7): finished_entry()}
         comments = {("app", 7): ["still digging"]}
-        due = research.settlements([item], finished, comments)
+        due = research.settlements([item], holder_of(), comments)
         self.assertEqual(len(due), 1)
         self.assertFalse(due[0].has_findings)
 
@@ -135,8 +137,23 @@ class SettlementPlanTest(unittest.TestCase):
             labels=["research"],
             agent="drive-host-1-x",
         )
-        finished = {("app", 7): finished_entry()}
-        self.assertEqual(research.settlements([item], finished, {("app", 7): None}), [])
+        self.assertEqual(research.settlements([item], holder_of(), {("app", 7): None}), [])
+
+    def test_a_later_findings_comment_never_beats_the_first(self):
+        from korapy import research
+
+        item = board.Item(
+            repo="app",
+            number=7,
+            title="T",
+            state="open",
+            labels=["research"],
+            agent="drive-host-1-x",
+        )
+        comments = {("app", 7): ["Findings: no-go on old facts", "Findings: go on new facts"]}
+        due = research.settlements([item], holder_of(), comments)
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0].findings, "Findings: no-go on old facts")
 
     def test_unfinished_or_unclaimed_or_labeled_rows_settle_nothing(self):
         from korapy import research
@@ -152,14 +169,14 @@ class SettlementPlanTest(unittest.TestCase):
         comments = {("app", 7): ["Findings: go"]}
         self.assertEqual(research.settlements([claimed], {}, comments), [])
         self.assertEqual(
-            research.settlements([claimed], {("app", 7): finished_entry(role="worker")}, comments),
+            research.settlements([claimed], {("app", 7): ("drive-host-1-x", "worker")}, comments),
             [],
         )
         unclaimed = board.Item(repo="app", number=8, title="T", state="open", labels=["research"])
         self.assertEqual(
             research.settlements(
                 [unclaimed],
-                {("app", 8): finished_entry()},
+                {("app", 8): ("drive-host-1-x", "research")},
                 {("app", 8): ["Findings: go"]},
             ),
             [],
@@ -175,11 +192,30 @@ class SettlementPlanTest(unittest.TestCase):
         self.assertEqual(
             research.settlements(
                 [labeled],
-                {("app", 9): finished_entry()},
+                {("app", 9): ("drive-host-1-x", "research")},
                 {("app", 9): ["Findings: go"]},
             ),
             [],
         )
+
+    def test_a_settlement_carries_its_driving_project(self):
+        from korapy import research
+
+        item = board.Item(
+            repo="app",
+            number=7,
+            title="T",
+            state="open",
+            labels=["research"],
+            agent="drive-host-1-x",
+        )
+        due = research.settlements(
+            [item],
+            holder_of(),
+            {("app", 7): ["Findings: go"]},
+            projects={("app", 7): "green"},
+        )
+        self.assertEqual([entry.project for entry in due], ["green"])
 
 
 class PromptsResearchTest(unittest.TestCase):
@@ -233,6 +269,18 @@ class EligibilityResearchTest(unittest.TestCase):
     def test_basic_never_selects_a_researched_row(self):
         rows = [TicketRow(repo="app", number=7, labels=("research", "researched"))]
         self.assertEqual(policies.basic(rows, now=1000.0), [])
+
+    def test_basic_selects_a_research_row_with_unreadable_pulls(self):
+        rows = [research_row(number=7, pulls=None)]
+        found = policies.basic(rows, now=1000.0)
+        self.assertEqual([(request.number, request.kind) for request in found], [(7, "research")])
+
+    def test_basic_selects_a_research_row_with_an_open_pull(self):
+        from tests import test_drive_gates as gates_mod
+
+        rows = [research_row(number=7, pulls=(gates_mod.open_pull(3),))]
+        found = policies.basic(rows, now=1000.0)
+        self.assertEqual([(request.number, request.kind) for request in found], [(7, "research")])
 
 
 class GateResearchTest(unittest.TestCase):
@@ -354,7 +402,6 @@ class SettleResearchTest(unittest.TestCase):
             "record_event": lambda project, repo, number, body: self.events.append(
                 ("research-event", project, repo, number)
             ),
-            "driven": {"blue": frozenset({"app"})},
         }
         values.update(over)
         return drive.settle_research(self.store, lambda repo: fake, settlements, **values)
@@ -365,7 +412,7 @@ class SettleResearchTest(unittest.TestCase):
         fake = FakeTracker()
         released = self._settle(
             fake,
-            [research.Settlement("app", 7, "drive-host-1-x", True)],
+            [research.Settlement("app", 7, "drive-host-1-x", True, project="blue")],
         )
         self.assertEqual(released, {("app", 7): "drive-host-1-x"})
         held = self.store.claim_of("app", 7)
@@ -387,7 +434,9 @@ class SettleResearchTest(unittest.TestCase):
 
         fake = FakeTracker()
         fake.label_errors[("app", 7)] = tracker.TrackerError("down")
-        released = self._settle(fake, [research.Settlement("app", 7, "drive-host-1-x", True)])
+        released = self._settle(
+            fake, [research.Settlement("app", 7, "drive-host-1-x", True, project="blue")]
+        )
         self.assertEqual(released, {})
         self.assertEqual(self.store.claim_of("app", 7).agent, "drive-host-1-x")
 
@@ -397,11 +446,32 @@ class SettleResearchTest(unittest.TestCase):
         fake = FakeTracker()
         released = self._settle(
             fake,
-            [research.Settlement("app", 7, "drive-host-1-x", True)],
+            [research.Settlement("app", 7, "drive-host-1-x", True, project="blue")],
             live_units=frozenset({("app", 7)}),
         )
         self.assertEqual(released, {})
         self.assertEqual(self.store.claim_of("app", 7).agent, "drive-host-1-x")
+
+    def test_the_event_goes_to_the_settlement_project(self):
+        from korapy import research
+
+        fake = FakeTracker()
+        released = self._settle(
+            fake,
+            [
+                research.Settlement(
+                    "app",
+                    7,
+                    "drive-host-1-x",
+                    True,
+                    findings="Findings: go",
+                    project="green",
+                )
+            ],
+        )
+        self.assertEqual(released, {("app", 7): "drive-host-1-x"})
+        self.assertIn(("research-event", "green", "app", 7), self.events)
+        self.assertNotIn(("research-event", "blue", "app", 7), self.events)
 
 
 class DashboardResearchTest(unittest.TestCase):
@@ -554,6 +624,119 @@ class ResearchPassTest(unittest.TestCase):
         self.assertEqual(recorded, [])
         self.assertIn("open for a fresh start", out.getvalue())
 
+    def test_an_aged_finished_research_claim_settles_instead_of_orphaning(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = board.open_store(os.path.join(tmp.name, "board.db"))
+        self.addCleanup(store.close)
+        store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                kind="issue",
+                title="Title 7",
+                body="Body",
+                state="open",
+                author="operator",
+                labels=["research"],
+                priority="",
+                assignees=[],
+                url="https://example.com/app/7",
+                tracker_updated_at=1000.0,
+                extra={},
+            ),
+            operators=["operator"],
+            now=1000.0,
+        )
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        policies_dir = os.path.join(tmp.name, "policies")
+        os.makedirs(policies_dir)
+        with open(os.path.join(policies_dir, "blue.py"), "w", encoding="utf-8") as handle:
+            handle.write(policy_source([]))
+        found = [project_named("blue", os.path.join(policies_dir, "blue.py") + ":eligible")]
+        fake = FakeTracker()
+        fake.comment_bodies[("app", 7)] = ["digging", "Findings: go, the API exists"]
+        recorded = []
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            os.path.join(tmp.name, "drive.lock"),
+            out,
+            err,
+            plan=False,
+            found=found,
+            tracker_factory=lambda repo: fake,
+            stale_after=10**12,
+            launcher=None,
+            agent_states={},
+            gone_s=400.0,
+            finished_for={("app", 7): ("drive-host-1-x", "research", "ok")},
+            comments_for=drive.research_comments_for(lambda repo: fake),
+            record_event=lambda project, repo, number, body: recorded.append(
+                (project, repo, number, body)
+            ),
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(code, 0, err.getvalue())
+        held = store.claim_of("app", 7)
+        self.assertTrue(held is None or not held.agent)
+        self.assertIn(("add_label", "app", 7, tracker.RESEARCHED), fake.calls)
+        self.assertEqual(recorded, [("blue", "app", 7, "Findings: go, the API exists")])
+        self.assertIn("as researched", out.getvalue())
+        self.assertNotIn("released dead claim", out.getvalue())
+
+    def test_a_rate_limited_comments_read_stops_the_pass(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = board.open_store(os.path.join(tmp.name, "board.db"))
+        self.addCleanup(store.close)
+        store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                kind="issue",
+                title="Title 7",
+                body="Body",
+                state="open",
+                author="operator",
+                labels=["research"],
+                priority="",
+                assignees=[],
+                url="https://example.com/app/7",
+                tracker_updated_at=1000.0,
+                extra={},
+            ),
+            operators=["operator"],
+            now=1000.0,
+        )
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        policies_dir = os.path.join(tmp.name, "policies")
+        os.makedirs(policies_dir)
+        with open(os.path.join(policies_dir, "blue.py"), "w", encoding="utf-8") as handle:
+            handle.write(policy_source([]))
+        found = [project_named("blue", os.path.join(policies_dir, "blue.py") + ":eligible")]
+        fake = FakeTracker()
+        fake.comments_errors[("app", 7)] = tracker.TrackerRateLimited("limited", 30.0)
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            os.path.join(tmp.name, "drive.lock"),
+            out,
+            err,
+            plan=False,
+            found=found,
+            tracker_factory=lambda repo: fake,
+            stale_after=10**12,
+            launcher=None,
+            agent_states={},
+            finished_for={("app", 7): ("drive-host-1-x", "research", "ok")},
+            comments_for=drive.research_comments_for(lambda repo: fake),
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(code, 3, err.getvalue())
+        self.assertIn("rate limited", err.getvalue())
+        self.assertEqual(store.claim_of("app", 7).agent, "drive-host-1-x")
+
 
 class CommentsMapTest(unittest.TestCase):
     def test_research_comments_map_reads_one_call_per_ticket(self):
@@ -564,7 +747,7 @@ class CommentsMapTest(unittest.TestCase):
         )
         self.assertEqual(found[("app", 7)], ["Findings: go"])
         self.assertEqual(
-            [call for call in fake.calls if call[0] == "comments"],
+            sorted(call for call in fake.calls if call[0] == "comments"),
             [("comments", "app", 7), ("comments", "app", 8)],
         )
 
@@ -579,6 +762,35 @@ class CommentsMapTest(unittest.TestCase):
         )
         self.assertIsNone(found[("app", 7)])
         self.assertIn("down", errors[("app", 7)])
+
+    def test_a_rate_limited_read_propagates_instead_of_reading_unreadable(self):
+        fake = FakeTracker()
+        fake.comments_errors[("app", 7)] = tracker.TrackerRateLimited("limited", 30.0)
+        with self.assertRaises(tracker.TrackerRateLimited):
+            drive.research_comments_map(
+                {("app", 7)},
+                drive.research_comments_for(lambda repo: fake),
+                errors={},
+            )
+
+
+class GovernanceDocTest(unittest.TestCase):
+    def test_the_governance_sample_prices_the_research_role(self):
+        import re
+        import tomllib
+        from pathlib import Path
+
+        text = (
+            Path(__file__).resolve().parent.parent / "docs" / "09-host-resource-governance.md"
+        ).read_text(encoding="utf-8")
+        blocks = re.findall(r"```toml\n(.*?)```", text, re.DOTALL)
+        samples = [tomllib.loads(block) for block in blocks]
+        hosts = [doc for doc in samples if "resources" in doc and "host" in doc["resources"]]
+        self.assertTrue(hosts, "no host budget sample in the governance doc")
+        roles = hosts[0]["resources"].get("role", {})
+        self.assertIn("research", roles)
+        self.assertTrue(roles["research"].get("cpu_m", 0) > 0)
+        self.assertTrue(roles["research"].get("memory_mb", 0) > 0)
 
 
 if __name__ == "__main__":

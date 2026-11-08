@@ -27,6 +27,8 @@ class Settlement:
     the attention event go with the release. A finished research
     worker with no Findings comment releases bare, so the ticket is
     startable again instead of waiting on a reviewer that never comes.
+    `project` is the driving project the attention event goes to,
+    resolved by the pass where the project context still exists.
     """
 
     repo: str
@@ -34,6 +36,7 @@ class Settlement:
     agent: str
     has_findings: bool
     findings: str = ""
+    project: str = ""
 
 
 def findings(comments: Sequence[Any]) -> str | None:
@@ -42,7 +45,11 @@ def findings(comments: Sequence[Any]) -> str | None:
     A comment counts when its first line starts with `Findings`. The
     match is case sensitive and unindented, so a note merely
     mentioning findings never reads as the verdict. Non-string
-    entries are ignored, never an error.
+    entries are ignored, never an error. The first Findings comment
+    on the ticket wins across re-runs: comment bodies carry no
+    authorship or timestamp to scope the verdict to the current
+    holder's run, so a re-run's corrected verdict never beats an
+    earlier one already posted.
     """
     for comment in comments or ():
         if not isinstance(comment, str):
@@ -60,18 +67,26 @@ def first_line(body: str) -> str:
 
 def settlements(
     items: Sequence[Any],
-    finished: Mapping[tuple[str, int], tuple] | None,
+    holders: Mapping[tuple[str, int], tuple[str | None, str | None] | None] | None,
     comments_by_key: Mapping[tuple[str, int], Sequence[str] | None] | None,
+    projects: Mapping[tuple[str, int], str] | None = None,
 ) -> list[Settlement]:
     """The research rows whose claims the pass can settle now. Pure.
 
     One settlement per open claimed row carrying the research label
-    (and not the researched one) whose finished registry entry names
-    the research role behind the current holder, and whose comments
-    the pass read: `has_findings` is whether they hold a Findings
-    comment. Unreadable comments (None, or a missing key) settle
-    nothing: without the comments there is no proof either way, so
-    the claim stays held for a later pass.
+    (and not the researched one) whose `holders` entry names the
+    research role behind the current holder, and whose comments the
+    pass read. `holders` maps (repo, number) to the pre-resolved
+    (agent, role) pair the pass read off the finished registry entry
+    through its one finished-entry reader, so this function never
+    indexes the entry shape itself. `projects` maps (repo, number)
+    to the driving project, resolved by the pass where the project
+    context still exists; a missing entry settles with no project,
+    and the pass records that finding nowhere. `has_findings` is
+    whether the comments hold a Findings comment. Unreadable
+    comments (None, or a missing key) settle nothing: without the
+    comments there is no proof either way, so the claim stays held
+    for a later pass.
     """
     due: list[Settlement] = []
     for item in items or ():
@@ -83,9 +98,10 @@ def settlements(
         holder = getattr(item, "agent", "") or ""
         if not holder:
             continue
-        newest = (finished or {}).get((item.repo, item.number))
-        role = newest[1] if newest is not None and len(newest) > 1 else None
-        agent = newest[0] if newest is not None and len(newest) > 0 else None
+        seen = (holders or {}).get((item.repo, item.number))
+        if seen is None:
+            continue
+        agent, role = seen
         if role != "research" or agent != holder:
             continue
         if comments_by_key is None or (item.repo, item.number) not in comments_by_key:
@@ -94,6 +110,7 @@ def settlements(
         if comments is None:
             continue
         found = findings(comments)
+        project = (projects or {}).get((item.repo, item.number)) or ""
         due.append(
             Settlement(
                 repo=item.repo,
@@ -101,6 +118,7 @@ def settlements(
                 agent=holder,
                 has_findings=found is not None,
                 findings=found or "",
+                project=project if isinstance(project, str) else "",
             )
         )
     return due

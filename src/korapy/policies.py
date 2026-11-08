@@ -55,6 +55,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     value reads as none, so odd data selects or skips without raising.
     Unreadable pulls (None) are never selected: a ticket whose links
     the pass could not read fails closed here, as in the gate. A
+    research row skips both pulls checks, as in the gate: it finishes
+    as a Findings comment and never waits on a pull request. A
     researched row is never selected: its Findings comment already
     finished it, so selecting it would research it twice.
     """
@@ -75,6 +77,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
         return False
     if "blocked" in labels:
         return False
+    if tracker.RESEARCH in labels:
+        return True
     if row.pulls is None:
         return False
     pulls = row.pulls if isinstance(row.pulls, (tuple, list)) else ()

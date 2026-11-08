@@ -1581,18 +1581,37 @@ def research_comments_map(keys, comments_for, *, errors=None):
     An unreadable ticket maps to None, and readers fail those rows
     closed (the claim stays held for a later pass); when `errors` is
     given, the first error string per unreadable ticket is recorded
-    there, so the log line can name the cause.
+    there, so the log line can name the cause. A rate-limited read
+    propagates: like any other tracker outage it stops the pass
+    instead of settling blind while the same pass keeps launching
+    into further rate limits.
     """
     found: dict = {}
     for key in dict.fromkeys(keys):
         repo, number = key
         try:
             found[key] = list(comments_for(repo, number))
+        except iface.TrackerRateLimited:
+            raise
         except Exception as exc:
             found[key] = None
             if errors is not None:
                 errors.setdefault(key, str(exc) or type(exc).__name__)
     return found
+
+
+def driving_project(driven, repo) -> str:
+    """The project a finding on `repo` is reported to. Pure.
+
+    The one resolver from a driven repo to its project: `driven` is
+    {project name: tracker repos it drives}, and the first sorted
+    project driving the repo wins. A repo no project drives resolves
+    to "", and the settlement records that finding nowhere.
+    """
+    for project in sorted((driven or {})):
+        if repo in (driven or {})[project]:
+            return project
+    return ""
 
 
 def settle_research(
@@ -1606,7 +1625,6 @@ def settle_research(
     err=None,
     events=None,
     record_event=None,
-    driven=None,
 ):
     """Release settled research claims, label the answered ones. Returns freed.
 
@@ -1623,19 +1641,15 @@ def settle_research(
     entry when `events` is a list, and races under the pass (`Claimed`)
     are left held with a logbook line, never retried. `record_event`
     is `(project, repo, number, findings)` for each answered row; the
-    project resolves through `driven` ({project name: tracker repos}),
-    first sorted project winning, and rows for no driven repo record
-    nothing. A failed event record warns and the release still stands:
-    the comment and the label carry the finding, the event only
-    surfaces it.
+    project rides the settlement itself, resolved by the pass through
+    `driving_project` where the project context still exists, and a
+    settlement with no project records nothing. A failed event record
+    warns and the release still stands: the comment and the label
+    carry the finding, the event only surfaces it.
     """
     stream = out if out is not None else io.StringIO()
     trouble = err if err is not None else io.StringIO()
     live = set(live_units or ())
-    by_repo: dict = {}
-    for project in sorted((driven or {})):
-        for repo in (driven or {})[project]:
-            by_repo.setdefault(repo, project)
     released: dict = {}
     for item in due or ():
         key = (item.repo, item.number)
@@ -1666,8 +1680,8 @@ def settle_research(
                 print(f"{ref}: researched label refused ({problem}), claim kept", file=stream)
                 continue
             if record_event is not None:
-                project = by_repo.get(item.repo)
-                if project is None:
+                project = getattr(item, "project", "") or ""
+                if not project:
                     print(
                         f"{ref}: no driving project, finding recorded nowhere",
                         file=stream,
@@ -2480,6 +2494,29 @@ def is_orphan(
     return now - claim.claimed_at > 2 * gone_s
 
 
+def _research_awaiting_settlement(item, claim, finished) -> bool:
+    """Whether this claimed row is a finished research row awaiting settlement.
+
+    Pure: an open claimed row carrying the research label (and not the
+    researched one) whose finished registry entry, read through the
+    one finished-entry reader, names the research role behind the
+    current holder. Such a row settles through its Findings comment,
+    never through orphan recovery: releasing it as an orphan would
+    drop a posted verdict before its comments are read, and the
+    ticket would restart as fresh research with the finding never
+    surfacing.
+    """
+    if claim is None or not claim.agent:
+        return False
+    if getattr(item, "state", "open") != "open":
+        return False
+    labels = getattr(item, "labels", None) or ()
+    if iface.RESEARCH not in labels or iface.RESEARCHED in labels:
+        return False
+    newest = (finished or {}).get((item.repo, item.number))
+    return _finished_role(newest) == "research" and _finished_agent(newest) == claim.agent
+
+
 def _orphan_claims(
     store,
     *,
@@ -2489,19 +2526,26 @@ def _orphan_claims(
     live_units=None,
     agent_states=None,
     agent_tickets=None,
+    finished=None,
 ):
     """The provably-dead claims, in store order. Pure reads.
 
     The scan half of `release_orphans`: each store row whose claim the
-    orphan rule calls dead, resolved through the one resolver. Runs
-    through the shared retry policy; a persistent failure propagates
-    for the caller to skip the step with every claim kept.
+    orphan rule calls dead, resolved through the one resolver. A
+    finished research row awaiting settlement is never an orphan,
+    whatever its age: its verdict is settled through its comments,
+    and only `finished` (the pass's newest finished entry per ticket)
+    exempts it, never the claim's age. Runs through the shared retry
+    policy; a persistent failure propagates for the caller to skip the
+    step with every claim kept.
     """
 
     def scan():
         found = []
         for item in store.items():
             claim = store.claim_of(item.repo, item.number)
+            if _research_awaiting_settlement(item, claim, finished):
+                continue
             if not is_orphan(
                 claim,
                 now=now,
@@ -2529,6 +2573,7 @@ def release_orphans(
     events=None,
     agent_states=None,
     agent_tickets=None,
+    finished=None,
 ) -> int:
     """Release every provably-dead claim, one logbook line each.
 
@@ -2544,8 +2589,11 @@ def release_orphans(
     the holder and leaves the epoch for the next claim to mint, which
     fences a stale holder still acting on the old epoch; the worktree
     and branch stay untouched. Rows with no claim are left alone:
-    adoption happens only in resync, never here. When `events` is a
-    list, each release appends its journal entry.
+    adoption happens only in resync, never here. `finished` is the
+    pass's newest finished entry per ticket: a finished research row
+    awaiting settlement is never released here, whatever its age, so
+    its Findings comment survives until the settlement reads it. When
+    `events` is a list, each release appends its journal entry.
     """
     orphans = _orphan_claims(
         store,
@@ -2555,6 +2603,7 @@ def release_orphans(
         live_units=live_units,
         agent_states=agent_states,
         agent_tickets=agent_tickets,
+        finished=finished,
     )
     released = 0
     for claim in orphans:
@@ -5228,6 +5277,7 @@ def _launching_pass(
                 events=events if journal_path is not None else None,
                 agent_states=agent_states,
                 agent_tickets=agent_tickets,
+                finished=finished,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"korapy drive: orphan recovery skipped ({problem})", file=err)
@@ -5242,6 +5292,10 @@ def _launching_pass(
     if agent_states is not None and comments_for is not None and tracker_factory is not None:
         comment_errors: dict = {}
         units_now = set(live_units or ())
+        holders = {
+            key: (_finished_agent(entry), _finished_role(entry))
+            for key, entry in (finished or {}).items()
+        }
         research_keys = set()
         for item in _items:
             key = (item.repo, item.number)
@@ -5253,13 +5307,17 @@ def _launching_pass(
                 continue
             if not item.agent or not is_managed_agent(item.agent):
                 continue
-            newest = finished.get(key)
-            role = newest[1] if newest is not None and len(newest) > 1 else None
-            agent = newest[0] if newest is not None and len(newest) > 0 else None
+            agent, role = holders.get(key, (None, None))
             if role != "research" or agent != item.agent:
                 continue
             research_keys.add(key)
-        comments_by_key = research_comments_map(research_keys, comments_for, errors=comment_errors)
+        try:
+            comments_by_key = research_comments_map(
+                research_keys, comments_for, errors=comment_errors
+            )
+        except iface.TrackerRateLimited as problem:
+            print(f"korapy drive: research comments rate limited ({problem}), pass stops", file=err)
+            return finish(UNREACHABLE)
         for key in sorted(comment_errors):
             print(
                 f"{key[0]}#{key[1]}: research comments unreadable,"
@@ -5270,13 +5328,17 @@ def _launching_pass(
             settled = settle_research(
                 store,
                 tracker_factory,
-                research.settlements(_items, finished, comments_by_key),
+                research.settlements(
+                    _items,
+                    holders,
+                    comments_by_key,
+                    projects={key: driving_project(driven, key[0]) for key in research_keys},
+                ),
                 live_units=live_units,
                 now=now,
                 out=out,
                 events=events if journal_path is not None else None,
                 record_event=record_event,
-                driven=driven,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"korapy drive: research settlement skipped ({problem})", file=err)
