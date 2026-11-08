@@ -209,7 +209,19 @@
    "cap": 2
   },
   "released": 0,
-  "gave_up": 0
+  "gave_up": 0,
+  "waits": [
+   {
+    "ticket": "repo-a#41",
+    "code": "cap",
+    "reason": "repo-a#41: day cap reached (4 of 50 today), not started"
+   },
+   {
+    "ticket": "repo-a#43",
+    "code": "cap",
+    "reason": "repo-a#43: day cap reached (4 of 50 today), not started"
+   }
+  ]
  },
  "attention": {
   "state": "ready",
@@ -223,19 +235,19 @@
   "next": [
    {
     "what": "start",
-    "waits": "cap"
+    "ticket": "repo-a#41",
+    "waits": "day cap reached (4 of 50 today), not started",
+    "count": 2
    },
    {
     "what": "start",
-    "waits": "slot free"
-   },
-   {
-    "what": "start",
-    "waits": "slot free"
+    "ticket": null,
+    "waits": "slot free",
+    "count": 2
    }
   ],
   "waits": [
-   "cap"
+   "day cap reached (4 of 50 today), not started"
   ],
   "next_pass_in_s": 180,
   "starts_remaining": 46
