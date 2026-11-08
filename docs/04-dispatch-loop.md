@@ -152,9 +152,10 @@ registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
-`blocked_by` and no `blocked` label), and with no open linked pull
-request, claimed or not: in-flight rows stay requested so the loop
-never withdraws them by omission. Weight is the board priority rank,
+`blocked_by` and no `blocked` label), and with no open or merged
+linked pull request, claimed or not: in-flight rows stay requested
+so the loop never withdraws them by omission, while a merged ticket
+stays withdrawn so no new round starts on landed work. Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
@@ -229,10 +230,16 @@ and re-reads live state before every start, never a cached count.
 
 Per-candidate gate order, cheapest first:
 
-1. Non-open, externally owned (the row's stored `external` field,
-   computed at sync time by `board.is_external`; the loop never
-   re-derives it), or withdrawn by this pass's eligibility: skip with
-   reason.
+1. Non-open (a closed issue reads as merged), a merged linked
+   pull for every kind, externally owned (the row's stored
+   `external` field, computed at sync time by `board.is_external`;
+   the loop never re-derives it), or withdrawn by this pass's
+   eligibility: skip with reason `merged` for the first two. No new
+   round of any kind starts on a merged ticket, claimed or not,
+   while a running unit is never stopped by this verdict. A pull
+   closed without merging is not merged: the ticket still needs its
+   round, and a reopened issue reads open with no merged pull, so
+   it stays startable.
 2. Claim routing by request kind against the row's live holder.
    `resume`, `fix`, `review` and stuck restarts are classified here,
    before any claimed check, so the check below never sees them as
@@ -660,7 +667,7 @@ is tested through the seam its production code already injects:
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
-| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked and open-pull rows stay withdrawn | pure policy call over fixture rows |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull and merged-pull rows stay withdrawn | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |

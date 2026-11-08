@@ -317,7 +317,8 @@ def gate(
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
-    Row state first (missing, non-open, external, withdrawn), then claim
+    Row state first (missing, non-open with closed reading as merged,
+    a merged linked pull for every kind, external, withdrawn), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
     role, outcome)} for the newest finished entry per ticket), then the
@@ -331,7 +332,13 @@ def gate(
     unclaimed row whose latest review record (`reviews`, keyed by
     (repo, number)) approves with no finding at or above
     `fix_threshold` is merge-ready too: no fix round opens for lows,
-    and no fresh start launches on approved work. None (the default)
+    and no fresh start launches on approved work. A ticket whose
+    linked pull already merged, or whose issue is closed, is
+    withdrawn with reason `merged`: no new round of any kind starts
+    on it, claimed or not, while a running unit is never stopped by
+    this verdict. A pull closed without merging is not merged: the
+    ticket still needs its round, and a reopened issue reads open
+    with no merged pull, so it stays startable. None (the default)
     reads the shared default threshold, so the gate follows it past
     import time; a falsy value falls back the same way. A finished reviewer
     with outcome `ok` and no review record for the ticket is a protocol
@@ -369,11 +376,26 @@ def gate(
     if row is None:
         return _skip(candidate, request.kind, "row", f"{ref}: no store row, skipped as withdrawn")
     if row.state != "open":
+        if row.state == "closed":
+            return _skip(
+                candidate,
+                request.kind,
+                "row",
+                f"{ref}: merged (state is closed, not open), skipped",
+            )
         return _skip(
             candidate, request.kind, "row", f"{ref}: state is {row.state}, not open, skipped"
         )
     if row.external:
         return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
+    merged = eligibility.merged_pull(row)
+    if merged is not None:
+        return _skip(
+            candidate,
+            request.kind,
+            "row",
+            f"{ref}: pull #{merged.number} is merged, not a fresh round, skipped",
+        )
 
     holder = row.agent or ""
     kind = route_kind(request.kind, holder)

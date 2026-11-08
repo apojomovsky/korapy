@@ -93,6 +93,21 @@ class TicketRow:
             object.__setattr__(self, "extra", {})
 
 
+def merged_pull(row: TicketRow):
+    """The row's first merged linked pull, else None. Pure.
+
+    A merged pull means the ticket's work already landed, so no new
+    round starts on it, whatever else the row says. A pull closed
+    without merging is not merged: the ticket still needs its round.
+    Unreadable pulls (None) read as no merged pull; readers refuse
+    those rows on their own check.
+    """
+    for pull in row.pulls or ():
+        if getattr(pull, "state", "") == "merged":
+            return pull
+    return None
+
+
 @dataclass(frozen=True)
 class StartRequest:
     """One ticket the policy wants worked on, with its dispatch kind.

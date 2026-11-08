@@ -918,11 +918,58 @@ class OpenPullGateTest(unittest.TestCase):
         gated = gate(entry(row_=row(pulls=(LinkedPull(number=9, state="closed"),))))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
+    def test_a_start_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(entry(row_=row(pulls=(LinkedPull(number=9, state="merged"),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_a_review_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=(LinkedPull(number=9, state="merged"),))),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_a_fix_on_a_claimed_row_with_a_merged_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="fix",
+                row_=row(agent="drive-host-1-x", pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_a_closed_row_is_withdrawn_as_merged(self):
+        gated = gate(entry(row_=row(state="closed")))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
     def test_two_open_linked_pulls_name_the_first(self):
         gated = gate(entry(row_=row(pulls=(open_pull(9), open_pull(4)))))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
         self.assertNotIn("#4", gated.reason)
+
+    def test_two_merged_linked_pulls_name_the_first(self):
+        pulls = (
+            LinkedPull(number=9, state="merged"),
+            LinkedPull(number=4, state="merged"),
+        )
+        gated = gate(entry(row_=row(pulls=pulls)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9", gated.reason)
+        self.assertIn("merged", gated.reason)
+        self.assertNotIn("#4", gated.reason)
+
+    def test_a_merged_pull_wins_over_an_open_pull(self):
+        pulls = (open_pull(9), LinkedPull(number=4, state="merged"))
+        gated = gate(entry(row_=row(pulls=pulls)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #4", gated.reason)
+        self.assertIn("merged", gated.reason)
 
     def test_an_unreadable_pull_lookup_refuses_the_start(self):
         gated = gate(entry(row_=row(pulls=None)))
@@ -1116,6 +1163,14 @@ class LinkedPullAgreementTest(unittest.TestCase):
         gated = gate(entry(row_=rows[0]))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
+
+    def test_a_merged_linked_pull_is_withdrawn_by_policy_and_gate(self):
+        _, rows = self.tracked_rows(state="merged")
+        self.assertEqual(policies.basic(rows, now=1000.0), [])
+        gated = gate(entry(row_=rows[0]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
 
     def test_policy_and_gate_share_a_single_repo_listing(self):
         fake, rows = self.tracked_rows()

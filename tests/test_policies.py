@@ -141,6 +141,10 @@ class SelectionTest(unittest.TestCase):
         pull = eligibility.LinkedPull(number=11, state="closed")
         self.assertEqual(selected([row(7, pulls=(pull,))]), [("app", 7)])
 
+    def test_merged_linked_pull_is_withdrawn(self):
+        pull = eligibility.LinkedPull(number=11, state="merged")
+        self.assertEqual(selected([row(7, pulls=(pull,))]), [])
+
     def test_mixed_rows_select_only_the_startable_ones(self):
         rows = [
             row(1),
