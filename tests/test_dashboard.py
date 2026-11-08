@@ -30,6 +30,10 @@ class AgentState(unittest.TestCase):
         self.assertEqual(ok["derived"], "finished")
         self.assertEqual(failed["derived"], "failed")
 
+    def test_finished_timed_out_outcome(self):
+        got = dashboard.agent_state(entry(ended_at=T0 - 5, outcome="timed-out"), "finished", T0)
+        self.assertEqual(got["derived"], "timed-out")
+
     def test_stale_reads_stalled(self):
         self.assertEqual(dashboard.agent_state(entry(), "stale", T0)["derived"], "stalled")
 

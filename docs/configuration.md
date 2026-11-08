@@ -139,6 +139,8 @@ what it means. Do not edit this table by hand.
 | `admission.repo_cap` | `0` | live plus pending agents per repo (0 means none) |
 | `admission.total_cap` | `4` | live plus pending agents the host admits in total |
 | `agents.cap` | `1` | this project's ceiling of live agents on the host |
+| `agents.max_time` | `'3h'` | wall-clock limit for one agent run, like 3h (bare is seconds) |
+| `agents.reviewer_max_time` | `'3h'` | wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time |
 | `agents.unit_prefix` | `'korapy-agent-'` | prefix of transient agent unit names |
 | `board.add_per_pass` | `20` | missing board issues added per repo per pass (default: 20; 0 or less adopts nothing) |
 | `board.drift_max_age_s` | `600` | seconds a card may stay out of step with its issue before the doctor fails the repo |
