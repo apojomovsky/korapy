@@ -28,11 +28,22 @@ OK, UNREACHABLE, USAGE = 0, 3, 4
 #: the host facts on `resources.pressure` (`ncpu`, `load_1min`,
 #: `mem_total_mb`, `mem_available_mb`): the denominators the dashboard
 #: gauges share with the load and memory ratios, null when unreadable.
-SCHEMA_VERSION = 3
+#: Version 4 adds the dashboard data panels: per-agent `derived`,
+#: `idle_s` and `doing` row fields, honest quota `source`/`read_failed`/
+#: `error_trimmed` per provider, the `attention` and `plan` sections,
+#: and the fleet header's `tz_offset_s`/`now_iso` local-time facts.
+SCHEMA_VERSION = 4
 
 #: Sections whose `{"error"}` body marks the server degraded.
 #: The one owner of the section names; `serve` reads through this.
 ERROR_SECTIONS = ("agents", "quota", "capacity", "resources", "disk", "drive")
+
+#: Panel sections that never degrade the server: they read their own
+#: `{"state"}` (`ready`, `unknown` or `error`) instead of the section
+#: `{"error"}` body, so a missing source reads `unknown`, never a
+#: failed section. The one owner of the panel names; the docs gate
+#: reads through this with `ERROR_SECTIONS`.
+PANEL_SECTIONS = ("attention", "plan")
 
 
 def _err(text):
@@ -55,18 +66,31 @@ def _section_error(exc):
     return {"error": error_text(exc)}
 
 
-def _agent_row(entry, state):
+def _agent_row(entry, state, now=None):
     """One agent row from a registry entry and its status (pure).
 
     Fields missing on the entry read as null, never absent, except the
     profile: entries from before profile records display `default`.
+    The panel facts (`derived`, `idle_s`, `doing`) come from the one
+    reader `dashboard.agent_state`, timed against `now`; without `now`
+    the row is timed against its own `last_seen`, so only callers that
+    own no clock pass nothing.
     """
-    from korapy import profiles, registry
+    from korapy import dashboard, profiles, registry
 
     ticket = entry.get("ticket")
     if not isinstance(ticket, dict):
         ticket = {}
     held = registry.ticket_of(entry)
+    moment = now
+    if moment is None:
+        moment = entry.get("last_seen")
+        if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+            moment = entry.get("started_at")
+    try:
+        panel = dashboard.agent_state(entry, state, moment)
+    except Exception:  # noqa: BLE001 - a broken note never breaks the row
+        panel = {"derived": "unknown", "idle_s": "unknown", "doing": "unknown"}
     return {
         "id": entry.get("id"),
         "project": ticket.get("project") or None,
@@ -77,6 +101,9 @@ def _agent_row(entry, state):
         "profile": entry.get("profile") or profiles.DEFAULT_PROFILE_NAME,
         "model": entry.get("model"),
         "state": state,
+        "derived": panel.get("derived"),
+        "idle_s": panel.get("idle_s"),
+        "doing": panel.get("doing"),
         "started_at": entry.get("started_at"),
         "last_seen": entry.get("last_seen"),
         "note": entry.get("note"),
@@ -84,19 +111,19 @@ def _agent_row(entry, state):
 
 
 def _sort_key(row):
-    """Sort rows by `(project, repo, number, id)`; tickets without a number sort last."""
-    return (
-        row["project"] or "",
-        row["repo"] or "",
-        row["number"] is None,
-        row["number"] or 0,
-        row["id"] or "",
-    )
+    """Sort rows by urgency, then `(project, repo, number, id)`.
+
+    One fact, one place: the urgency order lives in `dashboard`, and
+    every reader sorts through it.
+    """
+    from korapy import dashboard
+
+    return dashboard.sort_key(row)
 
 
-def _agents_and_header(registry_view):
+def _agents_and_header(registry_view, now=None):
     """`(fleet_header, agents)`: both error when the registry cannot be read."""
-    rows = [_agent_row(entry, state) for entry, state in registry_view]
+    rows = [_agent_row(entry, state, now) for entry, state in registry_view]
     rows.sort(key=_sort_key)
     header = {
         "host": None,  # filled in by build, which owns `host`
@@ -205,8 +232,12 @@ def resources_section(
     *,
     live_by_owner,
     project_names,
+    now=None,
 ):
     """The `resources` snapshot section from plain data.
+
+    `now` times the per-row panel facts; without it each row times
+    against its own `last_seen` (see `_agent_row`).
 
     Charged usage is `resources.charge_live_units` over the registry
     view and `live_by_owner`, the same sum the launch gate admits
@@ -262,7 +293,7 @@ def resources_section(
     zeros = resources.Usage()
     rows = []
     for entry, state in registry_view:
-        row = _agent_row(entry, state)
+        row = _agent_row(entry, state, now)
         if row["id"] in per_unit:
             owner, cost = per_unit[row["id"]]
             measured = None
@@ -327,6 +358,7 @@ def build(
     usage_fn=None,
     drive_view=None,
     resources_view=None,
+    events_view=None,
 ):
     """The snapshot document from plain data (pure, except disk paths).
 
@@ -341,25 +373,42 @@ def build(
     error, since nothing collected it. `resources_view` is the dict
     `resources_section` returns, or the exception reading it raised;
     None reads as a section error too, and a broken registry errors it
-    like the capacity section. Sections fail independently: a broken
-    one reads `{"error": ...}` while the rest still print.
+    like the capacity section. `events_view` is the `coordevents`
+    unresolved rows (or the exception reading them raised); None reads
+    the attention panel as `unknown`, never an error, since the panel
+    is additive and must not degrade the server. Sections fail
+    independently: a broken one reads `{"error": ...}` while the rest
+    still print.
     """
+    from korapy import dashboard
+
     if usage_fn is None:
         usage_fn = shutil.disk_usage
     if isinstance(registry_view, Exception):
         header = agents = _section_error(registry_view)
     else:
         try:
-            header, agents = _agents_and_header(registry_view)
+            header, agents = _agents_and_header(registry_view, now)
         except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
             header = agents = _section_error(exc)
         else:
             header["host"] = host
             header["now"] = now
+            try:
+                header["tz_offset_s"] = dashboard.local_offset_s(now)
+            except Exception:  # noqa: BLE001 - a broken clock never breaks the header
+                header["tz_offset_s"] = "unknown"
+            try:
+                header["now_iso"] = dashboard.now_iso(now)
+            except Exception:  # noqa: BLE001 - a broken clock never breaks the header
+                header["now_iso"] = "unknown"
     if isinstance(quota_view, Exception):
         quota = _section_error(quota_view)
     else:
-        quota = quota_view
+        try:
+            quota = dashboard.with_honest_quota(quota_view)
+        except Exception:  # noqa: BLE001 - honesty fields never break the section
+            quota = quota_view
     if isinstance(settings, Exception) or isinstance(registry_view, Exception):
         capacity = _section_error(settings if isinstance(settings, Exception) else registry_view)
     else:
@@ -387,6 +436,14 @@ def build(
         drive = drive_view
     else:
         drive = _section_error(ValueError(f"drive section is {type(drive_view).__name__}"))
+    try:
+        attention = dashboard.attention(events_view)
+    except Exception as exc:  # noqa: BLE001 - the panel never breaks the document
+        attention = {"state": "error", "error": error_text(exc)}
+    try:
+        plan = dashboard.plan_projection(drive_view, now)
+    except Exception as exc:  # noqa: BLE001 - the panel never breaks the document
+        plan = {"state": "error", "error": error_text(exc)}
     return {
         "schema_version": SCHEMA_VERSION,
         "fleet_header": header,
@@ -396,6 +453,8 @@ def build(
         "resources": resources,
         "disk": disk,
         "drive": drive,
+        "attention": attention,
+        "plan": plan,
     }
 
 
@@ -434,7 +493,11 @@ def _show(doc):
                 ticket = f"{project}{row['repo']} #{row['number']}"
             note = f"  {row['note']}" if row.get("note") else ""
             role = row.get("role") or "-"
-            print(f"  {row['id']}  {row['runtime']}  {role}  {row['state']}  {ticket}{note}")
+            derived = row.get("derived") or "unknown"
+            doing = f" ({row['doing']})" if row.get("doing") else ""
+            print(
+                f"  {row['id']}  {row['runtime']}  {role}  {row['state']}/{derived}  {ticket}{doing}{note}"
+            )
     else:
         _err(
             f"agents: {agents.get('error', 'unreadable') if isinstance(agents, dict) else 'unreadable'}"
@@ -624,6 +687,7 @@ def collect_kwargs() -> dict:
     from korapy import (
         accounts,
         admission,
+        coordevents,
         drive,
         projects,
         quota_ledger,
@@ -669,6 +733,10 @@ def collect_kwargs() -> dict:
         )
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         drive_view = exc
+    try:
+        events_view = coordevents.unresolved()
+    except Exception as exc:  # noqa: BLE001 - a broken queue reads unknown, never fatal
+        events_view = exc
     pressure, pressure_notes = resources.read_pressure()
     notes = list(pressure_notes)
     try:
@@ -701,6 +769,7 @@ def collect_kwargs() -> dict:
                 default_measured,
                 live_by_owner=listing,
                 project_names=[entry.name for entry in registered],
+                now=now,
             )
         except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
             resources_view = exc
@@ -713,6 +782,7 @@ def collect_kwargs() -> dict:
         "usage_fn": shutil.disk_usage,
         "drive_view": drive_view,
         "resources_view": resources_view,
+        "events_view": events_view,
     }
 
 
@@ -740,7 +810,7 @@ def add_parser(sub) -> None:
     """Register `snapshot` on the top-level subparsers."""
     p = sub.add_parser(
         "snapshot",
-        help="one read-only view of the host: agents, quota, capacity, resources, disks and drive",
+        help="one read-only view of the host: agents, quota, capacity, resources, disks, drive, attention and plan",
     )
     p.add_argument("--json", action="store_true", help="print the stable machine-readable document")
     p.set_defaults(func=cmd_snapshot)

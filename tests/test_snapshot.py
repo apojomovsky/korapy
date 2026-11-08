@@ -195,14 +195,16 @@ def doc_of(**overrides):
 
 class FullDocument(unittest.TestCase):
     def test_full_document_pins_schema(self):
-        from korapy import paths
+        from korapy import dashboard, paths
 
         doc = doc_of()
         state, cache = paths.state_dir(), paths.cache_dir()
+        self.assertEqual(doc["fleet_header"].pop("tz_offset_s"), dashboard.local_offset_s(T0))
+        self.assertEqual(doc["fleet_header"].pop("now_iso"), dashboard.now_iso(T0))
         self.assertEqual(
             doc,
             {
-                "schema_version": 3,
+                "schema_version": 4,
                 "fleet_header": {
                     "host": HOST,
                     "now": T0,
@@ -212,17 +214,20 @@ class FullDocument(unittest.TestCase):
                 },
                 "agents": [
                     {
-                        "id": "a3",
-                        "project": None,
-                        "repo": None,
-                        "number": None,
+                        "id": "a2",
+                        "project": "proj-a",
+                        "repo": "repo-b",
+                        "number": 2,
                         "runtime": "omp",
                         "role": None,
                         "profile": "default",
                         "model": "m1",
-                        "state": "finished",
+                        "state": "stale",
+                        "derived": "stalled",
+                        "idle_s": 700,
+                        "doing": "working",
                         "started_at": T0 - 100,
-                        "last_seen": T0 - 10,
+                        "last_seen": T0 - 700,
                         "note": "working",
                     },
                     {
@@ -235,26 +240,54 @@ class FullDocument(unittest.TestCase):
                         "profile": "default",
                         "model": "m1",
                         "state": "live",
+                        "derived": "working",
+                        "idle_s": 10,
+                        "doing": "working",
                         "started_at": T0 - 100,
                         "last_seen": T0 - 10,
                         "note": "working",
                     },
                     {
-                        "id": "a2",
-                        "project": "proj-a",
-                        "repo": "repo-b",
-                        "number": 2,
+                        "id": "a3",
+                        "project": None,
+                        "repo": None,
+                        "number": None,
                         "runtime": "omp",
                         "role": None,
                         "profile": "default",
                         "model": "m1",
-                        "state": "stale",
+                        "state": "finished",
+                        "derived": "finished",
+                        "idle_s": 10,
+                        "doing": "working",
                         "started_at": T0 - 100,
-                        "last_seen": T0 - 700,
+                        "last_seen": T0 - 10,
                         "note": "working",
                     },
                 ],
-                "quota": quota_view(),
+                "quota": {
+                    "now": T0,
+                    "providers": {
+                        "provider-a": {
+                            "state": "ok",
+                            "windows": {
+                                "weekly": {
+                                    "used_pct": 10.0,
+                                    "resets_at": None,
+                                    "source": "measured",
+                                }
+                            },
+                            "read_at": T0,
+                            "stale": False,
+                            "mark": None,
+                            "reader": "fake:provider-a",
+                            "error": None,
+                            "source": "measured",
+                            "read_failed": False,
+                            "error_trimmed": "none",
+                        }
+                    },
+                },
                 "capacity": {
                     "total_cap": 4,
                     "repo_cap": 1,
@@ -269,6 +302,20 @@ class FullDocument(unittest.TestCase):
                     ]
                 },
                 "drive": {"error": "drive section not collected"},
+                "attention": {
+                    "state": "unknown",
+                    "needs_decision": "unknown",
+                    "ready_to_merge": "unknown",
+                    "coordinator_handled": "unknown",
+                    "items": "unknown",
+                },
+                "plan": {
+                    "state": "unknown",
+                    "next": "unknown",
+                    "waits": "unknown",
+                    "next_pass_in_s": "unknown",
+                    "starts_remaining": "unknown",
+                },
                 "resources": {
                     "schema_version": 1,
                     "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
@@ -329,6 +376,8 @@ class FullDocument(unittest.TestCase):
                 "resources",
                 "disk",
                 "drive",
+                "attention",
+                "plan",
             ],
         )
 
@@ -347,6 +396,9 @@ class FullDocument(unittest.TestCase):
                     "profile": "default",
                     "model": "m1",
                     "state": "live",
+                    "derived": "working",
+                    "idle_s": 10,
+                    "doing": "working",
                     "started_at": T0 - 100,
                     "last_seen": T0 - 10,
                     "note": "working",
@@ -356,7 +408,7 @@ class FullDocument(unittest.TestCase):
         self.assertEqual(doc["capacity"]["live"], 0)
         self.assertEqual(doc["capacity"]["by_project"], {})
 
-    def test_schema_three_carries_the_host_facts(self):
+    def test_schema_four_carries_the_host_facts(self):
         made = snapshot.resources_section(
             view((entry("a1"), "live")),
             HOST,
@@ -380,7 +432,7 @@ class FullDocument(unittest.TestCase):
             resources_view=made,
             drive_view={"last_exit": 0},
         )
-        self.assertEqual(doc["schema_version"], 3)
+        self.assertEqual(doc["schema_version"], 4)
         self.assertEqual(
             doc["resources"]["pressure"],
             {
@@ -435,6 +487,9 @@ class FullDocument(unittest.TestCase):
                 "profile": "default",
                 "model": None,
                 "state": "live",
+                "derived": "idle",
+                "idle_s": "unknown",
+                "doing": "unknown",
                 "started_at": None,
                 "last_seen": None,
                 "note": None,
@@ -668,6 +723,32 @@ class ResourcesSection(unittest.TestCase):
                 "notes",
             ],
         )
+
+    def test_rows_time_against_the_given_clock(self):
+        from korapy import dashboard
+
+        real = dashboard.agent_state
+        moments = []
+
+        def spy(entry, state, now):
+            moments.append(now)
+            return real(entry, state, now)
+
+        rows = default_rows()
+        with mock.patch.object(dashboard, "agent_state", spy):
+            snapshot.resources_section(
+                rows,
+                HOST,
+                doc_limits(),
+                doc_pressure(),
+                [],
+                None,
+                live_by_owner=live_listing(rows),
+                project_names=names_of(rows),
+                now=T0,
+            )
+        self.assertTrue(moments)
+        self.assertTrue(all(moment == T0 for moment in moments))
 
     def test_no_budget_still_reports_charged_and_pressure(self):
         section = snapshot.resources_section(
@@ -1194,9 +1275,11 @@ class CliExits(unittest.TestCase):
                 "resources",
                 "disk",
                 "drive",
+                "attention",
+                "plan",
             ],
         )
-        self.assertEqual(doc["schema_version"], 3)
+        self.assertEqual(doc["schema_version"], 4)
         self.assertEqual(len(doc["agents"]), 1)
         self.assertEqual(doc["drive"], {"last_exit": 0})
         self.assertEqual(doc["resources"]["schema_version"], 1)
