@@ -271,7 +271,9 @@ class DispatchLoopDefaults(unittest.TestCase):
 
 class SnapshotSections(unittest.TestCase):
     def test_document_keys_match_the_error_sections(self):
-        self.assertEqual(document_sections(), set(snapshot.ERROR_SECTIONS))
+        self.assertEqual(
+            document_sections(), set(snapshot.ERROR_SECTIONS) | set(snapshot.PANEL_SECTIONS)
+        )
 
     def test_help_and_reference_list_the_document_sections(self):
         sections = document_sections()
