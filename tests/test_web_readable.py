@@ -30,6 +30,19 @@ def web_text(name):
     return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
 
 
+def function_body(source, name):
+    """The text of `function name(...)` through its closing brace line."""
+    import re
+
+    match = re.search(
+        r"(?:export )?function " + re.escape(name) + r"\(.*?^\}",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, "no function " + name
+    return match.group(0)
+
+
 def build_doc():
     rows = view((entry("a1"), "live"))
     made = snapshot.resources_section(
@@ -73,11 +86,15 @@ class SnapshotSchemaUnchanged(ServeCase):
 
 
 class AgentCount(unittest.TestCase):
-    """Point 1: live and stale are the headline; finished is collapsed history."""
+    """Point 1: the strip headlines live, stale and finished counts."""
 
-    def test_headline_and_collapsed_finished(self):
+    def test_strip_headlines_live_stale_and_finished(self):
+        body = function_body(web_text("views.js"), "stripSegments")
+        for bit in ("agents_live", "agents_stale", "agents_finished"):
+            self.assertIn(bit, body)
+
+    def test_collapsed_finished_history(self):
         views = web_text("views.js")
-        self.assertIn("headline", views)
         self.assertIn("finished (history)", views)
         self.assertIn("isFinishedRow", views)
         self.assertIn('"details"', views)
@@ -137,12 +154,14 @@ class CapacityLabels(unittest.TestCase):
 
     def test_capacity_fields_are_labelled(self):
         views = web_text("views.js")
-        for label in ("Total capacity", "Per-repo cap", "Live now", "Pending", "By project"):
+        for label in ("Agents running", "Per-repo limit", "Pending", "By project"):
             self.assertIn(label, views)
+        self.assertNotIn("Total capacity", views)
+        self.assertNotIn("Per-repo cap", views)
 
     def test_capacity_explains_each_field(self):
         views = web_text("views.js")
-        self.assertIn("How many agents the host admits in total.", views)
+        self.assertIn("of the host's total allowance", views)
         self.assertIn("no per-repo limit", views)
         self.assertIn("The host does not track a queue yet.", views)
 
@@ -157,10 +176,10 @@ class ResourceBars(unittest.TestCase):
         self.assertIn("millicores", fmt)
         self.assertIn("cores", fmt)
 
-    def test_resources_card_explains_charged_vs_measured(self):
+    def test_gauge_cards_explain_the_reservation_tick(self):
         views = web_text("views.js")
-        self.assertIn("Charged is what admission reserved", views)
-        self.assertIn("measured is what", views)
+        self.assertIn("tick inside is the share the loop reserved", views)
+        self.assertIn("of the host", views)
 
     def test_bare_field_names_are_replaced_by_labels(self):
         views = web_text("views.js")
@@ -173,7 +192,7 @@ class DriveSection(unittest.TestCase):
 
     def test_drive_is_named_the_dispatch_loop(self):
         views = web_text("views.js")
-        self.assertIn("dispatch loop", views)
+        self.assertIn("Dispatch loop", views)
 
     def test_drive_fields_are_labelled_with_help(self):
         views = web_text("views.js")
@@ -205,7 +224,9 @@ class SectionHelp(unittest.TestCase):
             "Agents on this host right now.",
             "What the providers last reported.",
             "How many agents this host may run.",
-            "Charged is what admission reserved for live agents",
+            "Host load from the kernel, per core.",
+            "Host memory used from MemTotal and MemAvailable.",
+            "Only items that need a human.",
             "Free space on the state and cache disks.",
             "The drive pass: sync boards, claim tickets, start agents.",
         ):
@@ -214,7 +235,8 @@ class SectionHelp(unittest.TestCase):
     def test_abbreviations_carry_tooltips(self):
         views = web_text("views.js")
         self.assertIn('"abbr"', views)
-        self.assertIn("title:", views)
+        self.assertIn("central processing unit", views)
+        self.assertIn('setAttribute("title"', views)
 
     def test_error_cards_say_what_to_do(self):
         views = web_text("views.js")
@@ -228,10 +250,10 @@ class SectionHelp(unittest.TestCase):
 class VisualPass(unittest.TestCase):
     """The visual pass: grid, meters, table, themes, small screens."""
 
-    def test_cards_lay_out_as_a_grid_with_a_full_width_strip(self):
+    def test_cards_lay_out_as_a_grid_with_a_full_width_banner(self):
         css = web_text("app.css")
         self.assertIn("grid-template-columns", css)
-        self.assertIn("grid-column: 1 / -1", css)
+        self.assertIn("#attention", css)
 
     def test_meters_have_ok_low_stale_states(self):
         css = web_text("app.css")
@@ -241,13 +263,17 @@ class VisualPass(unittest.TestCase):
         for state in ('"meter ok"', '"meter low"', '"meter stale"'):
             self.assertIn(state, views)
 
-    def test_agents_render_as_a_table_with_stacking_labels(self):
+    def test_agents_render_as_a_table_with_phone_cards(self):
         views = web_text("views.js")
         for tag in ('"table"', '"thead"', '"tbody"', '"details"'):
             self.assertIn(tag, views)
-        self.assertIn("data-th", views)
         css = web_text("app.css")
-        self.assertIn("attr(data-th)", css)
+        # Narrow screens show one card per row: the ticket and state
+        # lead on the first line, the note sits below, the rest reads
+        # as compact inline meta, never a label-per-field list.
+        for cls in (".c-ticket", ".c-state", ".c-note"):
+            self.assertIn(cls, css)
+        self.assertNotIn("attr(data-th)", css)
 
     def test_themes_and_figures_stay(self):
         css = web_text("app.css")
@@ -259,10 +285,10 @@ class VisualPass(unittest.TestCase):
         self.assertIn("@media (max-width: 700px)", css)
 
     def test_full_disk_reads_high_like_full_budget(self):
-        # A disk past 90% full and a budget past 90% charged share one
-        # threshold and one word, so full never reads as low usage.
+        # Disk bars band through the same cuts as every other bar, so
+        # full never reads as low usage and NaN never reads as healthy.
         views = web_text("views.js")
-        self.assertIn('>= 0.9 ? "high"', views)
+        self.assertIn("meter(used, bandFor(used),", views)
 
     def test_no_second_poll_loop_appears(self):
         app = web_text("app.js")

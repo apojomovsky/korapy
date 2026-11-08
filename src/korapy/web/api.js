@@ -1,5 +1,7 @@
 // Data access for the shell: fetch, auth, backend identity. No DOM here.
 
+import { parseEpoch } from "./fmt.js";
+
 export const TOKEN_KEY = "korapy.token";
 
 // Poll cadence and failure backoff, in milliseconds. One pure table:
@@ -264,6 +266,61 @@ export function resolveAgent(doc, key) {
 // The API major is compared at each unlock, then on this cadence
 // and whenever the page becomes visible again.
 export const VERSION_CHECK_MS = 60000;
+
+// Finished runs stay visible, dimmed, behind a toggle for this long
+// after their last sighting, then drop out of the list. Named here
+// (not in the view) so the suite can pin the window without a runner.
+export const FINISHED_RETENTION_MS = 6 * 3600 * 1000;
+
+// Whether a finished row is still inside the retention window. Rows
+// without a last-seen stamp never age out: dropping a run the host
+// cannot date would hide history, not retire it.
+export function retainedFinished(row, nowMs) {
+  if (!row || typeof row !== "object") {
+    return false;
+  }
+  if (row.state !== "finished") {
+    return true;
+  }
+  const seen = parseEpoch(row.last_seen);
+  if (seen === null || seen === undefined || typeof seen !== "number") {
+    return true;
+  }
+  return nowMs - seen <= FINISHED_RETENTION_MS;
+}
+
+// The last good snapshot, kept across reloads. The page renders it
+// at once on load under a "saved copy" header; the first good poll
+// replaces it. False when this browser refuses the write.
+export const SNAPSHOT_CACHE_KEY = "korapy.snapshot";
+
+export function loadCachedSnapshot() {
+  try {
+    const raw = window.localStorage.getItem(SNAPSHOT_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || !parsed.data) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function saveCachedSnapshot(doc) {
+  try {
+    window.localStorage.setItem(
+      SNAPSHOT_CACHE_KEY,
+      JSON.stringify({ at: Date.now(), data: doc }),
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // Whether a snapshot section is the server's bare failure body,
 // mirrored from the server's own rule so degraded state renders as

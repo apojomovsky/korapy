@@ -24,8 +24,11 @@ OK, UNREACHABLE, USAGE = 0, 3, 4
 #: The document schema version, printed as `schema_version`. Version 2 adds
 #: the agent `profile` row field: the profile name recorded at launch.
 #: Rows from before profile records display `default`: the cutover
-#: resolves them as the default profile for display only.
-SCHEMA_VERSION = 2
+#: resolves them as the default profile for display only. Version 3 adds
+#: the host facts on `resources.pressure` (`ncpu`, `load_1min`,
+#: `mem_total_mb`, `mem_available_mb`): the denominators the dashboard
+#: gauges share with the load and memory ratios, null when unreadable.
+SCHEMA_VERSION = 3
 
 #: Sections whose `{"error"}` body marks the server degraded.
 #: The one owner of the section names; `serve` reads through this.

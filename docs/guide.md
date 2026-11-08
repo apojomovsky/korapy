@@ -535,6 +535,33 @@ Startup prints that URL; `--port N` overrides `serve.port` for one
 run, and `--port 0` picks a free port for a second or throwaway
 instance. A wider bind needs `--allow-remote` and a token file, and
 a held port exits 2 with the `--port` fix in the message.
+`--snapshot-file PATH` serves a saved snapshot document instead of
+the live host, so the page can be developed and screenshotted
+without a running fleet; `docs/assets/dashboard-fixture.json` is a
+committed example. Board, tail, events and journal still read the
+live host in fixture mode.
+
+The page is vanilla JS and CSS, no framework. A sticky strip names
+fleet counts, the loop state, quota freshness, host load per core and
+disk free. Under it a full-width banner lists only items that need a
+human, or "nothing needs you". The Overview, Board and Log tabs sit
+in the top bar beside the brand. The agents table leads: what runs
+now with a project picker and a filter box (live rows carry a state
+chip and a thin accent on the left edge, finished runs sit behind a
+toggle for six hours); the ticket links to the row detail and an
+empty table names the loop state instead of showing blank. CPU,
+memory and disk sit in one row of equal gauge cards showing the
+actual host values, with the share the loop reserved drawn as a tick
+inside the CPU and memory bars (the loop reserves no disk, so its
+bar carries no tick); quota and capacity sit in the next row, quota
+as bars per window with a reset countdown and a dated stale badge.
+Backend mode, API and schema versions and the server time read as a
+small footer line. The page polls on an interval with an "updated Ns
+ago" stamp, keeps the last data with its age when a poll fails, and
+renders the last good snapshot from local storage at once on load.
+Keys: `j`/`k` move between agent rows, Enter opens the row, `/`
+focuses the filter, `?` lists the keys; every key action also works
+by click.
 
 `coord events` lists what is open (`--all` includes resolved rows);
 `coord wait` blocks until an unresolved event exists (or the timeout,

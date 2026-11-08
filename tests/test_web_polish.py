@@ -28,43 +28,44 @@ def function_body(source, name):
 
 
 class StripTitle(unittest.TestCase):
-    """Point 1: the overview strip is `fleet`; the list stays `agents`."""
+    """Point 1: the strip carries the fleet counts; the list stays `agents`."""
 
-    def test_strip_card_is_titled_fleet(self):
-        self.assertIn('card("fleet"', web_text("views.js"))
+    def test_no_separate_fleet_card(self):
+        self.assertNotIn('card("fleet"', web_text("views.js"))
 
     def test_agents_list_keeps_its_title(self):
-        self.assertIn('card("agents"', web_text("views.js"))
+        self.assertIn('card("Agents"', web_text("views.js"))
 
-    def test_header_builder_names_fleet(self):
-        self.assertIn('"fleet"', function_body(web_text("views.js"), "headerLine"))
+    def test_strip_names_live_stale_and_finished(self):
+        body = function_body(web_text("views.js"), "stripSegments")
+        for bit in ("agents_live", "agents_stale", "agents_finished"):
+            self.assertIn(bit, body)
 
 
 class UnknownCounts(unittest.TestCase):
     """Point 2: a missing fleet count reads as not reported, never 0."""
 
     def test_missing_live_does_not_default_to_zero(self):
-        self.assertNotIn("info.agents_live : 0", web_text("views.js"))
+        self.assertNotIn("agents_live : 0", web_text("views.js"))
 
     def test_missing_stale_does_not_default_to_zero(self):
-        self.assertNotIn("info.agents_stale : 0", web_text("views.js"))
+        self.assertNotIn("agents_stale : 0", web_text("views.js"))
 
     def test_missing_counts_render_not_reported(self):
-        self.assertIn("not reported", function_body(web_text("views.js"), "headerLine"))
+        # The strip delegates the wording to countWord, so the
+        # not-reported fallback lives one helper down.
+        self.assertIn("not reported", function_body(web_text("views.js"), "countWord"))
 
 
 class FinishedGuard(unittest.TestCase):
-    """Ticket 569: a non-finite finished count hides the toggle, never renders."""
+    """Ticket 569: a non-finite finished count never renders as a number."""
 
     def test_finished_count_is_finite_guarded(self):
-        body = function_body(web_text("views.js"), "headerLine")
-        self.assertIn("Number.isFinite(info.agents_finished)", body)
+        body = function_body(web_text("views.js"), "countWord")
+        self.assertIn("Number.isFinite", body)
 
-    def test_finished_has_no_bare_typeof_default(self):
-        self.assertNotIn(
-            'typeof info.agents_finished === "number" ? info.agents_finished : 0',
-            web_text("views.js"),
-        )
+    def test_finished_has_no_bare_zero_default(self):
+        self.assertNotIn("agents_finished : 0", web_text("views.js"))
 
 
 class CapacityGuards(unittest.TestCase):
@@ -72,11 +73,10 @@ class CapacityGuards(unittest.TestCase):
 
     def test_total_capacity_is_guarded(self):
         views = web_text("views.js")
-        self.assertNotIn('String(info.live) + " of " + String(info.total_cap)', views)
         self.assertIn("typeof info.live", function_body(views, "capacityCard"))
         self.assertIn("typeof info.total_cap", function_body(views, "capacityCard"))
 
-    def test_live_now_is_guarded(self):
+    def test_agents_running_is_guarded(self):
         body = function_body(web_text("views.js"), "capacityCard")
         self.assertIn("typeof info.live", body)
         self.assertIn("not reported", body)
@@ -119,18 +119,18 @@ class PauseFile(unittest.TestCase):
 
 
 class WideLayout(unittest.TestCase):
-    """Point 5: the page uses a wide window, up to three cards across."""
+    """Point 5: the page centres at 1200px, up to three cards across."""
 
     def test_content_column_is_not_capped_at_seventy_rem(self):
         self.assertNotIn("max-width: 70rem", web_text("app.css"))
 
-    def test_content_is_centered_with_a_wide_cap(self):
+    def test_content_is_centered_with_a_twelve_hundred_px_cap(self):
         css = web_text("app.css")
         self.assertIn("margin: 0 auto", css)
-        self.assertIn("max-width: 96rem", css)
+        self.assertIn("max-width: 75rem", css)
 
     def test_cards_fit_three_across(self):
-        self.assertIn("min(22rem, 100%)", web_text("app.css"))
+        self.assertIn("min(20rem, 100%)", web_text("app.css"))
 
 
 class FieldHelp(unittest.TestCase):
@@ -148,11 +148,11 @@ class FieldHelp(unittest.TestCase):
         )
         self.assertNotIn(
             'el("dd", help, { class: "help" })',
-            function_body(views, "resourceDim"),
+            function_body(views, "hostGauge"),
         )
 
-    def test_resource_help_is_a_title_attribute(self):
-        self.assertIn('setAttribute("title"', function_body(web_text("views.js"), "resourceDim"))
+    def test_gauge_help_is_a_title_attribute(self):
+        self.assertIn('setAttribute("title"', function_body(web_text("views.js"), "hostGauge"))
 
 
 class Meters(unittest.TestCase):
