@@ -283,6 +283,8 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
@@ -310,7 +312,7 @@ TAIL = """# Defaults: uncomment to override.
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
-# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
 #
 # [freeze]
 # freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
@@ -428,6 +430,8 @@ commits.conventional = false
 # admission.total_cap = 4  # live plus pending agents the host admits in total
 #
 # [agents]
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
@@ -454,7 +458,7 @@ commits.conventional = false
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
-# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
 #
 # [freeze]
 # freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts

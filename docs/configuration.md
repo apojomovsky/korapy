@@ -139,6 +139,8 @@ what it means. Do not edit this table by hand.
 | `admission.repo_cap` | `0` | live plus pending agents per repo (0 means none) |
 | `admission.total_cap` | `4` | live plus pending agents the host admits in total |
 | `agents.cap` | `1` | this project's ceiling of live agents on the host |
+| `agents.max_time` | `'3h'` | wall-clock limit for one agent run, like 3h (bare is seconds) |
+| `agents.reviewer_max_time` | `'3h'` | wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time |
 | `agents.unit_prefix` | `'korapy-agent-'` | prefix of transient agent unit names |
 | `board.add_per_pass` | `20` | missing board issues added per repo per pass (default: 20; 0 or less adopts nothing) |
 | `board.drift_max_age_s` | `600` | seconds a card may stay out of step with its issue before the doctor fails the repo |
@@ -161,7 +163,7 @@ what it means. Do not edit this table by hand.
 | `drive.fix_round_threshold` | `'normal'` | lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready |
 | `drive.max_starts_per_day` | `50` | real starts one dispatch pass may launch per calendar day (plans never count) |
 | `drive.period` | `'*:0/5'` | systemd OnCalendar cadence at which the installed timer wakes a pass |
-| `drive.pulls_max_calls` | `20` | max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed) |
+| `drive.pulls_max_calls` | `20` | max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed) |
 | `freeze.max_age_s` | `86400` | age in seconds after which a standing freeze warns in doctor instead of silently blocking starts |
 | `git.branch` | `'{type}/{issue}-{slug}'` | branch name template |
 | `git.commits.conventional` | `True` | enforce Conventional Commits |

@@ -180,7 +180,7 @@ class FakeStatusReader:
     """A board-reader double for the status step: a scripted pulls index, recorded writes.
 
     Implements only the production seams the step reads: ``pulls_index``
-    for the once-per-repo open-pull listing, ``write_option`` for the
+    for the once-per-repo linked-pull listing, ``write_option`` for the
     writes, and the ``board_status_limit``/``board_status_ids``
     attributes. There is deliberately no per-card pulls method: the
     step resolves pulls once per repo, and the fake cannot drift from
@@ -206,7 +206,7 @@ class FakeStatusReader:
         self.writes = []
         self.index_calls = []
 
-    def pulls_index(self, repo, max_calls):
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
         self.index_calls.append((repo, max_calls))
         if self.index_error is not None:
             raise self.index_error
@@ -540,7 +540,7 @@ class BoardStepStatusTest(unittest.TestCase):
     def test_board_step_resolves_pulls_once_per_repo(self):
         reader = BoardStepReader(
             [card(7, status="Available"), card(8, status="Claimed")],
-            pulls={(REPO, 7): [object()]},
+            pulls={(REPO, 7): [reading(repo=REPO, number=9, kind="pr")]},
         )
         result = self.repo_sync(reader)
         self.assertEqual(reader.writes, [(REPO, 7, "opt-r"), (REPO, 8, "opt-a")])
@@ -628,6 +628,32 @@ class BoardStepStatusTest(unittest.TestCase):
         result = self.repo_sync(reader)
         self.assertEqual(reader.writes, [(REPO, 7, "opt-a")])
         self.assertEqual(result.status_errors, ())
+
+    def test_board_step_merged_pull_is_not_in_review(self):
+        reader = BoardStepReader(
+            [card(7, status="Available")],
+            pulls={(REPO, 7): [reading(repo=REPO, number=9, kind="pr", state="merged")]},
+        )
+        result = self.repo_sync(reader)
+        self.assertEqual(reader.writes, [])
+        self.assertEqual(result.status_errors, ())
+        self.assertEqual(
+            self.store.status_set_of(REPO, 7),
+            boardstatus.StatusRecord(option_id="opt-a", derived=boardstatus.AVAILABLE),
+        )
+
+    def test_board_step_closed_unmerged_pull_is_not_in_review(self):
+        reader = BoardStepReader(
+            [card(7, status="Available")],
+            pulls={(REPO, 7): [reading(repo=REPO, number=9, kind="pr", state="closed")]},
+        )
+        result = self.repo_sync(reader)
+        self.assertEqual(reader.writes, [])
+        self.assertEqual(result.status_errors, ())
+        self.assertEqual(
+            self.store.status_set_of(REPO, 7),
+            boardstatus.StatusRecord(option_id="opt-a", derived=boardstatus.AVAILABLE),
+        )
 
     def test_board_step_syncs_status_from_the_poll(self):
         reader = BoardStepReader([card(7, state="closed", status="Available")])
