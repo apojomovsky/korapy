@@ -13,7 +13,7 @@ the tree as it stands.
 
 ## 0. Scope and non-goals
 
-The design adds: what an area is, two PROPOSED settings, one
+The design adds: what an area is, three PROPOSED settings, one
 PROPOSED pure helper, one PROPOSED gate check with its `--plan`
 and journal wording, the release rule, the cost statement, the
 test plan and the migration. Non-goals: changing the eligibility
@@ -96,11 +96,15 @@ candidate over the same pre-pass rows snapshot, and
 unclaimed same-area tickets in one pass would both gate
 "proceed" and both launch. PROPOSED: the claiming loop re-runs
 `area_hold` for each proceeding `start` immediately before
-`store.claim`, with the areas of tickets this pass already
-claimed added to the holder set (synthetic same-project holder
-rows), mirroring the existing "claim changed under the pass,
-left held" re-read pattern. The second same-area start refuses
-with code `area` and its claim is never minted. The reason shown in
+`_fresh_claim` (before `_mint_claim`, hence before any
+`hub.propose` grant), with the areas of tickets this pass
+already claimed added to the holder set (synthetic
+same-project holder rows), mirroring the existing "claim
+changed under the pass, left held" re-read pattern. Placing
+the re-check before the hub grant means a refused second
+start never burns a grant and needs no grant-release. The
+second same-area start refuses with code `area` and its claim
+is never minted. The reason shown in
 `drive --plan` names the ticket, the area and the holder:
 
 ```text
@@ -125,11 +129,23 @@ listing per repository the pass already reads; repos with no
 area-labeled row cost no new call. `None` then means truly
 unreadable only: other rows with `None` pulls contribute their
 claim-held areas, while the candidate's own `None` already
-refuses it earlier. When `drive.pulls_max_calls` caps the pass,
-capped holders read None and lose PR-held areas but keep
-claim-held ones; the existing "starts refused" notice counts
-them, so the default handoff stays fail-open only under a cap
-or a listing outage.
+refuses it earlier with code `row`. A pulls-`None` holder
+fails closed: its label areas count as PR-held, so an
+overlapping candidate refuses with code `area` and wording
+naming the outage, for example "owner/repo#12: area ci
+possibly held by owner/repo#34 (pulls unreadable), start
+refused". This mirrors the existing
+cap precedent (capped tickets read `None` and their starts
+are refused) and keeps the default handoff closed under a cap
+or a listing outage. The bound against a long outage stalling
+the project is twofold: PROPOSED `drive.area_fail_open`,
+default false, which an operator sets true to fall back to
+claim-held areas only during a known outage; and the doctor,
+which warns when a project with a non-empty prefix shows
+repeated `(pulls unreadable)` area refusals in the journal.
+The `area` skip count still measures the cost in section 4,
+and the `(pulls unreadable)` wording tells outage-driven
+serialization apart from live-holder contention.
 
 ## 3. Release, no-area tickets, ceiling and hold
 
@@ -194,13 +210,18 @@ use hand-built rows through the existing `gate` seams (fake
 `read_labels`, admission, quota, ledger): claim-held refused,
 PR-held refused, own row excluded, `resume`/`fix`/`review` on
 the claimed row bypass, no-area passes, `hold_until_merged`
-false ignores pulls, and `None` pulls on other rows contribute
-claims only. A held PR-holder plus a conflicting candidate
+false ignores pulls, `drive.area_fail_open` true ignores
+unreadable pulls, and `None` pulls on other rows otherwise
+fail closed per section 2. A held PR-holder plus a conflicting candidate
 proves PR-held refusal through the extended fetch set, with a
-fake listing seam asserting the holder row was fetched. An
-in-pass test starts two same-area tickets in
+fake listing seam asserting the holder row was fetched. A
+fail-closed test gives the holder pulls `None` and proves the
+conflicting candidate refuses with code `area`, while
+`drive.area_fail_open = True` lets it proceed on claims only.
+An in-pass test starts two same-area tickets in
 one pass through the claiming loop with a fake store and
-proves the second refuses with code `area` and mints no claim.
+proves the second refuses with code `area` and mints no claim
+(and no hub grant when hub mode is faked in).
 A `--plan` test proves claim-held refusals print
 with the section 2 wording while PR-held ones never fire on
 empty pulls. The journal test proves one refusal lands one
@@ -220,14 +241,16 @@ reason wording; this doc stays the record.
 
 ## 6. Implementation tickets, in order
 
-1. The pure helper plus the two settings (registry entries,
-   per-project resolution, empty-prefix off, overlap table
-   tests, label-over-board precedence test).
+1. The pure helper plus the three settings (registry entries,
+   per-project resolution, empty-prefix off, fail-open default
+   false, overlap table tests, label-over-board precedence
+   test).
 2. The gate check with `--plan` wording, journal code and
    snapshot counts (gate tests, extended holder fetch test,
    in-pass double-start test, plan test, journal test; the
    doctor warns when a project maps `area_column` and uses
-   `area:` labels at once).
+   `area:` labels at once, and on repeated `(pulls
+   unreadable)` area refusals).
 3. The reference-doc updates above plus a worked example with
    nested areas in the guide.
 
