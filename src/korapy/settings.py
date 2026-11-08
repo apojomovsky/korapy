@@ -194,6 +194,12 @@ class Resolved:
     #: one place. Repo entries cannot set it: the table is project-wide,
     #: and it reads as unknown settings there.
     heavy: dict = field(default_factory=dict)
+    #: The raw ``[hygiene.<name>]`` tables from the project file, or {}
+    #: when the project sets none. Hygiene validates them through
+    #: ``hygiene.check_table``; this stays unchecked here so the shape
+    #: errors name the rule in one place. Repo entries cannot set them:
+    #: rules are project-wide, and they read as unknown settings there.
+    hygiene: dict = field(default_factory=dict)
     #: Raw ``[profiles.<name>]`` tables, the host config shadowing the
     #: project file per name. The launch path validates them through
     #: ``profiles.validate``; this stays unchecked here so the shape and
@@ -715,6 +721,9 @@ def resolve(
     heavy_raw = project.pop("heavy", {})
     if not isinstance(heavy_raw, dict):
         raise SettingsError(f"{project_name}: [heavy] must be a table")
+    hygiene_raw = project.pop("hygiene", {})
+    if not isinstance(hygiene_raw, dict):
+        raise SettingsError(f"{project_name}: [hygiene] must be a table of rules")
     if "models" in project:
         _reject_models(project_name)
     private = _check_private(project.pop("private", {}), project_name)
@@ -776,6 +785,7 @@ def resolve(
         board,
         resources.check_tables(resource_tables, host_name),
         heavy=dict(heavy_raw),
+        hygiene=dict(hygiene_raw),
         profiles={**project_profiles, **host_profiles},
         profile_committed={
             "default": profile_default,
