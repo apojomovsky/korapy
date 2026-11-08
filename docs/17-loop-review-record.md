@@ -85,9 +85,11 @@ Prompt (`prompts.py`, `prompts/reviewer.md`): the record
 command becomes checklist item one, with the same exact
 command template, before the findings and summary steps. One
 template, one place: the resume message in `drive.py` reuses
-the prompt builder's command string, never a second copy
-(AGENTS.md "One fact, one place"; a test pins the two
-identical). The same builder also serves the fix hint in
+the PROPOSED new `prompts.review_record_command` builder's
+string, never a second copy (`prompts.py` today exposes only
+`render()`, so the builder is new code under the PROPOSED
+convention; AGENTS.md "One fact, one place", and a test pins
+the two identical). The same builder also serves the fix hint in
 `takeoff.py` `_check_review`, whose hand-written
 `--verdict <approve|block>` has drifted from `VERDICTS`
 (`reviewrecord.py`) and `prompts/reviewer.md`; the agreement
@@ -101,16 +103,18 @@ PROPOSED planning step that turns a `review-missing` skip
 with no mark into one resume request carrying the exact
 command (commit pinned to the ticket branch tip read fresh
 from the remote at plan time, the same tip `merge --plan`
-compares against `pr.head_sha`; author pinned per the
-review launch rule below; verdict left to the reviewer).
-Freshness comes first: the plan reads the tip with
-`git ls-remote origin refs/heads/<branch>` through the
-existing injectable git seam (the
-`takeoff.production_ls_remote` shape, in the main clone),
-still zero tracker or forge calls, and passes it as a full
-SHA so `reviewcli._commit` takes it verbatim. All three tip
-reads, the plan-time pin, the pre-resume revalidation and
-the post-resume revalidation, go through that same seam;
+compares against `pr.head_sha`; author pinned to the worker
+id parsed from the stored reviewer prompt below; verdict left
+to the reviewer).
+Freshness comes first: the plan reads the tip through the
+existing `push.remote_head(cwd, "origin", branch)`, the one
+resolver for the remote-tip fact (its injectable `run` seam
+keeps tests offline), with `cwd` the launch target's clone
+(`tgt.clone` for the ticket's repo entry, the same checkout
+the loop launches from), and passes it as a full SHA so
+`reviewcli._commit` takes it verbatim. All three tip reads,
+the plan-time pin, the pre-resume revalidation and the
+post-resume revalidation, go through that same helper;
 `drive.py` reads no remote tip today, so the resume path
 adds no second resolver for the tip fact. When the tip
 cannot be read, or the tip moved between reads, no resume
@@ -121,26 +125,29 @@ The resume goes through the existing `launch.resume` seam
 with role reviewer (read-only preserved), so runtimes need no
 new interface (`resume_handle` already exists per runtime).
 
-Author: the exact source is the review launch rule
-(`drive.py` claim path): `(released or {}).get(key)` first,
-else `_finished_agent` of the `resolve_finished` newest
-entry for the ticket, read through `_finished_agent`,
-`_finished_role` and `_finished_outcome` only, no second
-resolver. The resume-pass capture (`_capture_finished_holders`)
-is usually empty, since no takeover precedes the resume, so
-the fallback carries the case. Empty or mismatch means no
-resume and the skip stands: no id at all, an unknown role or
-outcome, or a fallback that still names the finished
-reviewer itself (the two id flavors in `resolve_finished`:
-cross-pass unit name versus capture drive id) would record a
-self-review, which `write_record` refuses.
+Author: the exact source is the finished reviewer leaf's
+stored prompt (`prompt.md`, written by `launch._write_session`
+next to the role file; it embeds `reviewer_author_block`
+with the pre-takeover worker id from the original review
+launch). That leaf survives into the resume pass, while the
+same-pass capture (`_capture_finished_holders`) is usually
+empty and the `resolve_finished` newest entry is the
+reviewer itself, so neither can name the worker; the
+`(released or {}).get(key)` rule feeds the original review
+launch only, never the resume. Empty or mismatch means no
+resume and the skip stands: an unreadable prompt, no worker
+id in it, or a parsed id that still names the finished
+reviewer itself would record a self-review, which
+`write_record` refuses.
 
 Mark: PROPOSED one empty marker file per reprompted reviewer
 session inside that session's own leaf,
 `os.path.join(paths.role_session_dir(repo, number,
 "reviewer", gen), ".reprompted")` with `gen` from
-`units.parse_unit` of the finished unit name, the one
-resolver for the unit-name fact. A unit name that does not
+`units.parse_unit(projects.unit_prefix(root, resolved),
+<finished unit name>)`, the one resolver for the unit-name
+fact (`units._gen_of` is prefix-free and would parse another
+fleet's unit, so it is not used). A unit name that does not
 parse (the capture drive-id flavor, which `parse_unit`
 refuses) is an explicit no-resume branch with the skip
 standing, so no caller ever defaults to `gen=0` and marks
@@ -196,7 +203,9 @@ proofs still cover it.
 
 None added. The record check reads local session dirs, the
 resume spawns a local unit through the existing launch seam,
-and the prompt reorder is text. No tracker or forge calls:
+and the prompt reorder is text. Zero tracker or forge API
+calls; up to three git-protocol remote reads (`ls-remote`
+via `push.remote_head`) per missing-record pass.
 `review-missing` detection, the reprompt decision and the
 resume all stay behind the current seams.
 
@@ -219,11 +228,15 @@ resume requests none and keeps the skip for a fresh review;
 resume success plus a record written by the fake reviewer
 clears the skip; resume refusal keeps the skip and the log
 line; an unwritable mark keeps the skip with no resume and
-no failed pass. A fake git seam where the remote tip (B)
-differs from the plan-time pin (A), or cannot be read at
-all, requests no resume and keeps the skip. Author cases
-request no resume and keep the skip: no finished id at all,
-an unknown role or outcome, a fallback that still names the
+no failed pass. A fake `run` behind `push.remote_head`
+where the remote tip (B) differs from the plan-time pin (A),
+or cannot be read at all, requests no resume and keeps the
+skip. A production-shaped case proves the resume fires: the
+newest finished entry is reviewer-ok with an empty capture,
+and the reviewer leaf's stored prompt names worker W, so the
+plan requests one resume with `--author W`. Author cases
+request no resume and keep the skip: an unreadable leaf
+prompt, no worker id in it, a parsed id that still names the
 finished reviewer itself, and an unparseable generation
 (`units.parse_unit` returns None for the drive-id flavor).
 The mid-resume race lands the original session's record
