@@ -449,6 +449,300 @@ class DeclaredRootsCase(unittest.TestCase):
             hygiene.declared_roots(rules, root=self.ops, env=env)
 
 
+DAY = 24 * 60 * 60
+NOW = 1_700_000_000.0
+
+
+def plan_rules(raw, roots=None, entries=(), now=NOW):
+    """`hygiene.plan` over `raw` tables with a fake `scan` (no filesystem)."""
+    rules = hygiene.check_table(raw, "korapy.toml")
+    if roots is None:
+        roots = {name: f"/cache/{name}" for name in raw}
+    by_root = dict(entries)
+
+    def scan(root):
+        return list(by_root.get(root, []))
+
+    return hygiene.plan(rules, roots, now=now, scan=scan)
+
+
+def entry(path, *, mtime, size=100, symlink=False, realpath=None):
+    return hygiene.DirEntry(
+        path=path, mtime=mtime, size=size, is_symlink=symlink, realpath=realpath
+    )
+
+
+class DirPlanAgeCase(unittest.TestCase):
+    def test_old_entry_is_safe_with_proof_naming_rule_and_days(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/run-4", mtime=NOW - 9 * DAY, size=100)
+                ]
+            },
+        )
+        (found,) = candidates
+        self.assertEqual(
+            (found.kind, found.path, found.bytes, found.safe),
+            ("hygiene-dir", "/cache/acme/scratch/run-4", 100, True),
+        )
+        self.assertIn("acme-scratch", found.proof)
+        self.assertIn("9d", found.proof)
+        self.assertIn("7d", found.proof)
+
+    def test_young_entry_is_kept_with_reason(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/run-9", mtime=NOW - 2 * DAY, size=5000)
+                ]
+            },
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertEqual(found.proof, "kept: touched 2d ago, rule keeps 7d")
+
+    def test_boundary_age_is_kept(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/run-7", mtime=NOW - 7 * DAY, size=100)
+                ]
+            },
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+
+    def test_unreadable_mtime_is_kept(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [entry("/cache/acme/scratch/run-x", mtime=None, size=100)]
+            },
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertIn("modification time is unreadable", found.proof)
+
+    def test_symlink_is_dropped_with_a_note_and_no_candidate(self):
+        candidates, notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/link", mtime=NOW - 9 * DAY, symlink=True)
+                ]
+            },
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("/cache/acme/scratch/link", notes[0])
+        self.assertIn("is a symlink", notes[0])
+
+    def test_entry_resolving_outside_the_roots_is_dropped_with_a_note(self):
+        candidates, notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry(
+                        "/cache/acme/scratch/evil",
+                        mtime=NOW - 9 * DAY,
+                        realpath="/tmp/evil",
+                    )
+                ]
+            },
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("resolves outside a declared root", notes[0])
+
+
+class DirPlanCountCase(unittest.TestCase):
+    def test_all_but_newest_keep_are_safe(self):
+        candidates, _notes = plan_rules(
+            {"acme-build": dir_rule(selector="count", keep=2, days=None)},
+            roots={"acme-build": "/cache/acme/build"},
+            entries={
+                "/cache/acme/build": [
+                    entry("/cache/acme/build/run-1", mtime=NOW - 3 * DAY),
+                    entry("/cache/acme/build/run-2", mtime=NOW - 2 * DAY),
+                    entry("/cache/acme/build/run-3", mtime=NOW - 1 * DAY),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/cache/acme/build/run-1"].safe)
+        self.assertFalse(by_path["/cache/acme/build/run-2"].safe)
+        self.assertFalse(by_path["/cache/acme/build/run-3"].safe)
+
+    def test_mtime_tie_breaks_by_ascending_name(self):
+        candidates, _notes = plan_rules(
+            {"acme-build": dir_rule(selector="count", keep=1, days=None)},
+            roots={"acme-build": "/cache/acme/build"},
+            entries={
+                "/cache/acme/build": [
+                    entry("/cache/acme/build/run-a", mtime=NOW - 1 * DAY),
+                    entry("/cache/acme/build/run-b", mtime=NOW - 1 * DAY),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/cache/acme/build/run-a"].safe)
+        self.assertFalse(by_path["/cache/acme/build/run-b"].safe)
+
+    def test_survivors_are_named_in_a_note(self):
+        _candidates, notes = plan_rules(
+            {"acme-build": dir_rule(selector="count", keep=1, days=None)},
+            roots={"acme-build": "/cache/acme/build"},
+            entries={
+                "/cache/acme/build": [
+                    entry("/cache/acme/build/run-1", mtime=NOW - 3 * DAY),
+                    entry("/cache/acme/build/run-2", mtime=NOW - 1 * DAY),
+                ]
+            },
+        )
+        self.assertTrue(
+            any("acme-build" in note and "/cache/acme/build/run-2" in note for note in notes),
+            f"survivor not named in notes: {notes}",
+        )
+
+    def test_unreadable_mtime_is_kept_without_taking_a_survivor_slot(self):
+        candidates, _notes = plan_rules(
+            {"acme-build": dir_rule(selector="count", keep=1, days=None)},
+            roots={"acme-build": "/cache/acme/build"},
+            entries={
+                "/cache/acme/build": [
+                    entry("/cache/acme/build/run-old", mtime=NOW - 3 * DAY),
+                    entry("/cache/acme/build/run-new", mtime=NOW - 1 * DAY),
+                    entry("/cache/acme/build/run-x", mtime=None),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/cache/acme/build/run-old"].safe)
+        self.assertFalse(by_path["/cache/acme/build/run-new"].safe)
+        self.assertFalse(by_path["/cache/acme/build/run-x"].safe)
+        self.assertIn("modification time is unreadable", by_path["/cache/acme/build/run-x"].proof)
+
+
+class DirPlanSizeCase(unittest.TestCase):
+    def test_oldest_first_until_under_budget(self):
+        candidates, _notes = plan_rules(
+            {
+                "acme-cache": dir_rule(
+                    selector="size",
+                    max_bytes=100,
+                    days=None,
+                    path="acme/build-cache",
+                )
+            },
+            roots={"acme-cache": "/cache/acme/build-cache"},
+            entries={
+                "/cache/acme/build-cache": [
+                    entry("/cache/acme/build-cache/e1", mtime=NOW - 3 * DAY, size=60),
+                    entry("/cache/acme/build-cache/e2", mtime=NOW - 2 * DAY, size=50),
+                    entry("/cache/acme/build-cache/e3", mtime=NOW - 1 * DAY, size=40),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/cache/acme/build-cache/e1"].safe)
+        self.assertFalse(by_path["/cache/acme/build-cache/e2"].safe)
+        self.assertFalse(by_path["/cache/acme/build-cache/e3"].safe)
+        self.assertIn("under budget now", by_path["/cache/acme/build-cache/e2"].proof)
+
+    def test_already_under_budget_keeps_everything(self):
+        candidates, _notes = plan_rules(
+            {"acme-cache": dir_rule(selector="size", max_bytes=1000, days=None)},
+            roots={"acme-cache": "/cache/acme/cache"},
+            entries={
+                "/cache/acme/cache": [
+                    entry("/cache/acme/cache/e1", mtime=NOW - 3 * DAY, size=60),
+                    entry("/cache/acme/cache/e2", mtime=NOW - 1 * DAY, size=40),
+                ]
+            },
+        )
+        self.assertTrue(candidates)
+        self.assertTrue(all(not found.safe for found in candidates))
+
+    def test_size_tie_breaks_by_ascending_name(self):
+        candidates, _notes = plan_rules(
+            {"acme-cache": dir_rule(selector="size", max_bytes=50, days=None)},
+            roots={"acme-cache": "/cache/acme/cache"},
+            entries={
+                "/cache/acme/cache": [
+                    entry("/cache/acme/cache/b", mtime=NOW - 1 * DAY, size=40),
+                    entry("/cache/acme/cache/a", mtime=NOW - 1 * DAY, size=40),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/cache/acme/cache/a"].safe)
+        self.assertFalse(by_path["/cache/acme/cache/b"].safe)
+
+    def test_unreadable_mtime_counts_but_is_never_safe(self):
+        candidates, _notes = plan_rules(
+            {"acme-cache": dir_rule(selector="size", max_bytes=100, days=None)},
+            roots={"acme-cache": "/cache/acme/cache"},
+            entries={
+                "/cache/acme/cache": [
+                    entry("/cache/acme/cache/u", mtime=None, size=80),
+                    entry("/cache/acme/cache/o", mtime=NOW - 9 * DAY, size=60),
+                ]
+            },
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertFalse(by_path["/cache/acme/cache/u"].safe)
+        self.assertTrue(by_path["/cache/acme/cache/o"].safe)
+
+
+class DirPlanScopeCase(unittest.TestCase):
+    def test_image_and_session_rules_are_skipped(self):
+        candidates, notes = plan_rules(
+            {
+                "acme-images": image_rule(),
+                "acme-old": session_rule(),
+            }
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(notes, ())
+
+    def test_empty_scan_plans_nothing(self):
+        candidates, notes = plan_rules({"acme-scratch": dir_rule()})
+        self.assertEqual(candidates, ())
+        self.assertEqual(notes, ())
+
+    def test_symlink_and_escape_never_become_candidates(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/link", mtime=NOW - 9 * DAY, symlink=True),
+                    entry(
+                        "/cache/acme/scratch/evil",
+                        mtime=NOW - 9 * DAY,
+                        realpath="/elsewhere/evil",
+                    ),
+                ]
+            },
+        )
+        self.assertEqual(candidates, ())
+
+    def test_missing_root_is_refused_naming_the_rule(self):
+        rules = hygiene.check_table({"acme-scratch": dir_rule()}, "korapy.toml")
+        with self.assertRaisesRegex(settings.SettingsError, "acme-scratch"):
+            hygiene.plan(rules, {}, now=NOW, scan=lambda root: [])
+
+
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 
 #: The one join of a rule's base and path, as (module stem, function).
