@@ -301,9 +301,10 @@ def rules(root):
 def _abs_clone(root, clone):
     """A clone path as an absolute path, resolved against the ops root.
 
-    The one place a relative `clone.path` joins the ops root: both the
-    base resolver and the protected-grounds listing read through here,
-    so the worktree base and the recorded clone ground never disagree.
+    The one place in `hygiene.py` a relative `clone.path` joins the ops
+    root: both the base resolver and the protected-grounds listing read
+    through here, so the worktree base and the recorded clone ground
+    never disagree.
     """
     if os.path.isabs(clone):
         return clone
