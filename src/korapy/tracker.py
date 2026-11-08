@@ -212,6 +212,16 @@ class Tracker(Protocol):
         """
         ...
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, oldest first, for the decision protocol only.
+
+        The decision verb lists before posting, so a retry posts only
+        when its decision line is absent. Read-only: a failed call
+        raises ``TrackerError``; a rate-limit answer raises
+        ``TrackerRateLimited`` with the seconds to wait.
+        """
+        ...
+
     def add_label(self, repo: str, number: int, label: str) -> None:
         """Add one decision label to an item, for the decision protocol only.
 

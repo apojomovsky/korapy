@@ -175,6 +175,15 @@ class BoardBackedTracker(BoardTracker):
         """One decision-protocol comment, through the REST adapter."""
         self._issues.comment(repo, number, body)
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, through the REST adapter.
+
+        Comments live on the repository whatever the tracker variant,
+        so a board repo lists through the same adapter call as a
+        labels one.
+        """
+        return self._issues.comments(repo, number)
+
     def add_label(self, repo: str, number: int, label: str) -> None:
         """The one decision label, through the REST adapter."""
         self._issues.add_label(repo, number, label)

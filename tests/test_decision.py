@@ -12,6 +12,7 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from korapy import coord, decision, decisioncli, tracker
 from tests.test_tracker import FakeTracker, reading
@@ -133,11 +134,11 @@ class RecordTest(unittest.TestCase):
             body = handle.read()
         self.assertIn(f"Decision: {DECISION}", body)
         kinds = [call[0] for call in self.fake.calls]
-        self.assertEqual(kinds, ["item", "remove_label", "comment"])
+        self.assertEqual(kinds, ["item", "remove_label", "comments", "comment"])
         self.assertEqual(
             self.fake.calls[1], ("remove_label", TRACKER_REPO, NUMBER, "needs-decision")
         )
-        comment = self.fake.calls[2][3]
+        comment = [call[3] for call in self.fake.calls if call[0] == "comment"][0]
         self.assertIn(f"Decision on {REPO}#{NUMBER}: {DECISION}", comment)
         self.assertIn("decisions/2026-11-08-adopt-the-hub-claim-service.md", comment)
         self.assertNotIn(self.ops, comment)
@@ -147,13 +148,16 @@ class RecordTest(unittest.TestCase):
         self.assertIn(f"{REPO}#{NUMBER}", entries[0]["refs"])
         self.assertIn(DECISION, entries[0]["text"])
 
-    def test_retry_after_success_writes_nothing(self):
+    def test_retry_after_success_replays_reads_but_writes_nothing(self):
         first = self.record()
         calls = list(self.fake.calls)
         second = self.record()
         self.assertTrue(second.already)
         self.assertEqual(second.path, first.path)
-        self.assertEqual(self.fake.calls, calls)
+        replayed = [call[0] for call in self.fake.calls[len(calls) :]]
+        self.assertEqual(replayed, ["item", "remove_label", "comments"])
+        posted = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(posted), 1)
         self.assertEqual(len(coord.read_entries(root=self.coords)), 1)
 
     def test_conflicting_slug_is_a_usage_error(self):
@@ -161,16 +165,20 @@ class RecordTest(unittest.TestCase):
         with self.assertRaises(decision.UsageError):
             self.record(number=9)
 
-    def test_halfway_tracker_failure_writes_no_file_or_log(self):
+    def test_tracker_failure_keeps_file_but_writes_no_comment_or_log(self):
         self.fake.comment_errors[(TRACKER_REPO, NUMBER)] = tracker.TrackerError("down")
         with self.assertRaises(tracker.TrackerError):
             self.record()
-        self.assertEqual(
+        names = (
             os.listdir(os.path.join(self.ops, "decisions"))
             if os.path.isdir(os.path.join(self.ops, "decisions"))
-            else [],
-            [],
+            else []
         )
+        self.assertEqual(names, ["2026-11-08-adopt-the-hub-claim-service.md"])
+        with open(os.path.join(self.ops, "decisions", names[0]), encoding="utf-8") as handle:
+            self.assertIn(f"Decision: {DECISION}", handle.read())
+        posted = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(posted, [])
         self.assertEqual(coord.read_entries(root=self.coords), [])
 
     def test_retry_after_halfway_failure_comments_once(self):
@@ -178,10 +186,18 @@ class RecordTest(unittest.TestCase):
         with self.assertRaises(tracker.TrackerError):
             self.record()
         del self.fake.comment_errors[(TRACKER_REPO, NUMBER)]
-        self.fake.calls.clear()
         result = self.record()
-        self.assertFalse(result.already)
-        self.assertEqual([call[0] for call in self.fake.calls], ["item", "remove_label", "comment"])
+        self.assertTrue(result.already)
+        self.assertEqual(
+            result.path,
+            os.path.join(self.ops, "decisions", "2026-11-08-adopt-the-hub-claim-service.md"),
+        )
+        attempts = [call for call in self.fake.calls if call[0] == "comment"]
+        self.assertEqual(len(attempts), 2)
+        posted = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(posted), 1)
+        self.assertIn(f"Decision on {REPO}#{NUMBER}: {DECISION}", posted[0])
+        self.assertEqual(len(coord.read_entries(root=self.coords)), 1)
 
     def test_missing_decision_is_a_usage_error(self):
         with self.assertRaises(decision.UsageError):
@@ -295,6 +311,291 @@ class CliTest(unittest.TestCase):
         code, _, err = self.run_record(self.args(repo="nope"))
         self.assertEqual(code, 4)
         self.assertIn("nope", err)
+
+
+class ExactSlugTest(unittest.TestCase):
+    """`find_recorded` matches the slug exactly, not by suffix."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        os.makedirs(os.path.join(self.ops, "decisions"))
+        with open(
+            os.path.join(self.ops, "decisions", "2026-11-08-hub-claim-service.md"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("recorded\n")
+
+    def test_longer_slug_with_same_suffix_does_not_match(self):
+        self.assertIsNone(decision.find_recorded(self.ops, "claim-service"))
+
+    def test_exact_slug_still_matches(self):
+        self.assertEqual(
+            decision.find_recorded(self.ops, "hub-claim-service"),
+            os.path.join(self.ops, "decisions", "2026-11-08-hub-claim-service.md"),
+        )
+
+    def test_retry_past_midnight_finds_the_first_write(self):
+        with open(
+            os.path.join(self.ops, "decisions", "2026-11-07-hub-claim-service.md"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("older\n")
+        self.assertEqual(
+            decision.find_recorded(self.ops, "hub-claim-service"),
+            os.path.join(self.ops, "decisions", "2026-11-07-hub-claim-service.md"),
+        )
+
+
+class ExactTicketLineTest(unittest.TestCase):
+    """The idempotency check compares full lines, not substrings."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def test_prefix_ticket_number_is_a_conflict_not_already(self):
+        slug = decision.slugify(DECISION)
+        os.makedirs(os.path.join(self.ops, "decisions"))
+        with open(
+            os.path.join(self.ops, "decisions", f"2026-11-08-{slug}.md"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write(
+                decision.render_markdown(
+                    repo=REPO,
+                    number=70,
+                    date="2026-11-08",
+                    decision=DECISION,
+                    why=WHY,
+                )
+            )
+        with self.assertRaises(decision.UsageError):
+            decision.record(
+                repo=REPO,
+                tracker_repo=TRACKER_REPO,
+                number=NUMBER,
+                decision=DECISION,
+                why=WHY,
+                tracker=self.fake,
+                ops_root=self.ops,
+                coord_root=self.coords,
+                now=T0,
+            )
+
+
+class FileFirstOrderingTest(unittest.TestCase):
+    """The file lands before any tracker call, so a local failure posts nothing."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def test_write_failure_posts_no_comment(self):
+        with mock.patch.object(decision, "_write_file", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                decision.record(
+                    repo=REPO,
+                    tracker_repo=TRACKER_REPO,
+                    number=NUMBER,
+                    decision=DECISION,
+                    why=WHY,
+                    tracker=self.fake,
+                    ops_root=self.ops,
+                    coord_root=self.coords,
+                    now=T0,
+                )
+        self.assertEqual(self.fake.calls, [])
+
+    def test_retry_after_write_failure_comments_once(self):
+        real_write = decision._write_file
+        state = {"fail": True}
+
+        def flaky(path, text):
+            if state["fail"]:
+                state["fail"] = False
+                raise OSError("disk full")
+            return real_write(path, text)
+
+        with mock.patch.object(decision, "_write_file", side_effect=flaky):
+            with self.assertRaises(OSError):
+                decision.record(
+                    repo=REPO,
+                    tracker_repo=TRACKER_REPO,
+                    number=NUMBER,
+                    decision=DECISION,
+                    why=WHY,
+                    tracker=self.fake,
+                    ops_root=self.ops,
+                    coord_root=self.coords,
+                    now=T0,
+                )
+            result = decision.record(
+                repo=REPO,
+                tracker_repo=TRACKER_REPO,
+                number=NUMBER,
+                decision=DECISION,
+                why=WHY,
+                tracker=self.fake,
+                ops_root=self.ops,
+                coord_root=self.coords,
+                now=T0,
+            )
+        bodies = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn(f"Decision on {REPO}#{NUMBER}: {DECISION}", bodies[0])
+        self.assertFalse(result.already)
+        self.assertEqual(len(coord.read_entries(root=self.coords)), 1)
+
+
+class RetryConvergenceTest(unittest.TestCase):
+    """A retry replays only what is missing: never a second comment or file."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def record(self, fake=None, coords=None, now=T0, **over):
+        params = {
+            "repo": REPO,
+            "tracker_repo": TRACKER_REPO,
+            "number": NUMBER,
+            "decision": DECISION,
+            "why": WHY,
+            "tracker": fake if fake is not None else self.fake,
+            "ops_root": self.ops,
+            "coord_root": coords if coords is not None else self.coords,
+            "now": now,
+        }
+        params.update(over)
+        return decision.record(**params)
+
+    def test_retry_past_midnight_reuses_first_file_and_comments_once(self):
+        first = self.record()
+        fresh = fake_tracker()
+        coords2 = os.path.join(os.path.dirname(self.coords), "coords2")
+        second = self.record(
+            fake=fresh,
+            coords=coords2,
+            now=T0 + datetime.timedelta(days=1),
+        )
+        self.assertTrue(second.already)
+        self.assertEqual(second.path, first.path)
+        bodies = [body for bodies in fresh.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn(os.path.basename(first.path), bodies[0])
+        self.assertNotIn("2026-11-09", bodies[0])
+
+    def test_retry_repairs_missing_comment_without_second_file(self):
+        first = self.record()
+        fresh = fake_tracker()
+        second = self.record(fake=fresh)
+        self.assertTrue(second.already)
+        self.assertEqual(second.path, first.path)
+        bodies = [body for bodies in fresh.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 1)
+        kinds = [call[0] for call in fresh.calls]
+        self.assertIn("remove_label", kinds)
+        self.assertEqual(len(coord.read_entries(root=self.coords)), 1)
+
+    def test_retry_repairs_missing_logbook_entry_without_second_comment(self):
+        first = self.record()
+        self.assertFalse(first.already)
+        os.remove(coord.journal_path(self.coords))
+        second = self.record()
+        self.assertTrue(second.already)
+        self.assertEqual(second.path, first.path)
+        bodies = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 1)
+        entries = coord.read_entries(root=self.coords)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["kind"], "decision")
+
+
+class DirnameConstantTest(unittest.TestCase):
+    """The relative display path comes from `DECISIONS_DIRNAME`, not a literal."""
+
+    def test_comment_and_logbook_use_dirname_constant(self):
+        with mock.patch.object(decision, "DECISIONS_DIRNAME", "verdicts"):
+            body = decision.comment_body(
+                repo=REPO,
+                number=NUMBER,
+                decision=DECISION,
+                why=WHY,
+                filename="2026-11-08-adopt-the-hub-claim-service.md",
+            )
+        self.assertIn("verdicts/2026-11-08-adopt-the-hub-claim-service.md", body)
+        self.assertNotIn("decisions/", body)
+
+    def test_record_logbook_text_uses_dirname_constant(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ops = os.path.join(tmp.name, "ops")
+        coords = os.path.join(tmp.name, "coords")
+        os.makedirs(ops)
+        fake = fake_tracker()
+        with mock.patch.object(decision, "DECISIONS_DIRNAME", "verdicts"):
+            result = decision.record(
+                repo=REPO,
+                tracker_repo=TRACKER_REPO,
+                number=NUMBER,
+                decision=DECISION,
+                why=WHY,
+                tracker=fake,
+                ops_root=ops,
+                coord_root=coords,
+                now=T0,
+            )
+        self.assertTrue(os.path.dirname(result.path).endswith("verdicts"))
+        entries = coord.read_entries(root=coords)
+        self.assertEqual(len(entries), 1)
+        self.assertIn("verdicts/", entries[0]["text"])
+        self.assertNotIn("decisions/", entries[0]["text"])
+
+
+class HolderFallbackTest(unittest.TestCase):
+    """Only a missing lease falls back to manual; real errors surface."""
+
+    def test_os_error_falls_back_to_manual(self):
+        class Bad:
+            @staticmethod
+            def describe(root=None):
+                raise OSError("no lease")
+
+        self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
+
+    def test_value_error_falls_back_to_manual(self):
+        class Bad:
+            @staticmethod
+            def describe(root=None):
+                raise ValueError("bad lease")
+
+        self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
+
+    def test_unexpected_error_propagates(self):
+        class Boom:
+            @staticmethod
+            def describe(root=None):
+                raise RuntimeError("lease lock poisoned")
+
+        with self.assertRaises(RuntimeError):
+            decisioncli._holder_and_generation(Boom(), "/tmp/x")
 
 
 if __name__ == "__main__":

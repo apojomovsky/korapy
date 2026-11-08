@@ -410,6 +410,38 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, oldest first, through the API.
+
+        Pages until a short page ends the list, like the feed. Anything
+        short of a list of ``body`` strings is a ``TrackerError``, never
+        a partial list: a truncated list would read a posted decision
+        line as absent and post it twice.
+        """
+        found: list[str] = []
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._get(
+                        f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}"
+                    )
+                )
+            except iface.TrackerError:
+                raise
+            except Exception as err:
+                raise _fail(f"comments of {repo}#{number} are not JSON: {err}") from err
+            if not isinstance(payload, list):
+                raise _fail(f"comments of {repo}#{number} are not a list")
+            for entry in payload:
+                body = entry.get("body") if isinstance(entry, dict) else None
+                if not isinstance(body, str):
+                    raise _fail(f"bad comment entry {entry!r} on {repo}#{number}")
+                found.append(body)
+            if len(payload) < PER_PAGE:
+                return tuple(found)
+            page += 1
+
     def add_label(self, repo: str, number: int, label: str) -> None:
         """Add the one decision label through the issues-labels endpoint.
 

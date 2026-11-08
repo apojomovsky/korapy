@@ -32,7 +32,7 @@ def _holder_and_generation(coord, coord_root):
     """
     try:
         info = coord.describe(root=coord_root)
-    except Exception:
+    except (OSError, ValueError):
         return os.environ.get(AGENT_ID_ENV, "") or "manual", 0
     holder = info.get("holder") or os.environ.get(AGENT_ID_ENV, "") or "manual"
     generation = info.get("generation")
