@@ -46,19 +46,15 @@ class Strip(unittest.TestCase):
 
     def test_strip_names_loop_quota_load_and_disk(self):
         body = function_body(web_text("views.js"), "stripSegments")
-        for bit in ("loop running, last pass", "starts ", "quota fresh", "load ", "/cpu", "free"):
+        for bit in ("running, last pass ", "starts ", "fresh", "per core", "free"):
             self.assertIn(bit, body)
 
     def test_strip_never_reports_a_missing_source_as_zero(self):
         body = function_body(web_text("views.js"), "stripSegments")
-        for bit in (
-            "fleet unknown",
-            "loop unknown",
-            "quota unknown",
-            "load unknown",
-            "disk unknown",
-        ):
-            self.assertIn(bit, body)
+        # Every pill reads as a bare unknown: the pill label names
+        # the fact, so the value never repeats it.
+        self.assertGreaterEqual(body.count('text: "unknown"'), 5)
+        self.assertNotIn("fleet unknown", body)
 
     def test_overview_renders_the_strip(self):
         body = function_body(web_text("views.js"), "renderOverview")
@@ -123,7 +119,16 @@ class RealGauges(unittest.TestCase):
 
     def test_gauge_helpers_exist_in_fmt(self):
         fmt = web_text("fmt.js")
-        for name in ("bandFor", "clamp01", "formatLoad", "formatMemUsed", "formatRetentionWindow"):
+        for name in (
+            "bandFor",
+            "clamp01",
+            "formatLoadFigure",
+            "formatLoadDetail",
+            "formatMemFigure",
+            "formatMemDetail",
+            "formatDuration",
+            "formatRetentionWindow",
+        ):
             self.assertIn("export function " + name + "(", fmt)
 
     def test_gauge_bands_match_the_charged_bar_cuts(self):
@@ -134,8 +139,8 @@ class RealGauges(unittest.TestCase):
 
     def test_missing_gauge_source_reads_unknown(self):
         fmt = web_text("fmt.js")
-        self.assertIn('"not reported"', function_body(fmt, "formatLoad"))
-        self.assertIn('"not reported"', function_body(fmt, "formatMemUsed"))
+        self.assertIn('"not reported"', function_body(fmt, "formatLoadFigure"))
+        self.assertIn('"not reported"', function_body(fmt, "formatMemFigure"))
         self.assertIn('"unknown"', function_body(fmt, "bandFor"))
 
     def test_cpu_and_memory_gauges_carry_a_reserved_tick(self):
@@ -533,9 +538,12 @@ class ImpossibleMemoryReadsUnknown(unittest.TestCase):
     """Round 3: available above total is unknown, never a healthy gauge."""
 
     def test_format_mem_used_rejects_available_above_total(self):
-        body = function_body(web_text("fmt.js"), "formatMemUsed")
-        self.assertIn("not reported", body)
-        self.assertIn("availMb > totalMb", body)
+        figure = function_body(web_text("fmt.js"), "formatMemFigure")
+        self.assertIn("not reported", figure)
+        self.assertIn("availMb > totalMb", figure)
+        detail = function_body(web_text("fmt.js"), "formatMemDetail")
+        self.assertIn('""', detail)
+        self.assertIn("availMb > totalMb", detail)
 
     def test_memory_gauge_treats_impossible_reading_as_unknown(self):
         body = function_body(web_text("views.js"), "memoryGauge")
