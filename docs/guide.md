@@ -706,7 +706,8 @@ replays only what is missing (it lists the ticket comments and posts
 only when the decision line is absent as a whole line, removing an
 already-removed label succeeds, and a missing logbook entry is
 appended), reusing the first filename whatever date the retry runs on.
-The file is written once and the comment posts once. Record one
+The file is written once and the comment posts once. Each TEXT flag
+stays one line: an embedded newline is a usage error. Record one
 decision at a time: the verb takes no lock. Exit 0 recorded, 4 usage,
 3 tracker unreachable.
 

@@ -691,5 +691,156 @@ class UnknownTicketTest(unittest.TestCase):
         self.assertEqual(names, [])
 
 
+class NewlineRejectionTest(unittest.TestCase):
+    """Free-text flags stay one line so a retry can match whole lines."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ops = os.path.join(tmp.name, "ops")
+        self.coords = os.path.join(tmp.name, "coords")
+        os.makedirs(self.ops)
+        self.fake = fake_tracker()
+
+    def record(self, **over):
+        params = {
+            "repo": REPO,
+            "tracker_repo": TRACKER_REPO,
+            "number": NUMBER,
+            "decision": DECISION,
+            "why": WHY,
+            "tracker": self.fake,
+            "ops_root": self.ops,
+            "coord_root": self.coords,
+            "now": T0,
+        }
+        params.update(over)
+        return decision.record(**params)
+
+    def test_newline_decision_is_a_usage_error_naming_the_flag(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(decision="Ship\nit")
+        self.assertIn("--decision", str(ctx.exception))
+
+    def test_carriage_return_decision_is_a_usage_error(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(decision="Ship\rit")
+        self.assertIn("--decision", str(ctx.exception))
+
+    def test_newline_why_is_a_usage_error_naming_the_flag(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(why="Because\nreasons")
+        self.assertIn("--why", str(ctx.exception))
+
+    def test_newline_settles_is_a_usage_error(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(settles="The path\nfor now")
+        self.assertIn("--settles", str(ctx.exception))
+
+    def test_newline_still_open_is_a_usage_error(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(still_open="The budget\nremains")
+        self.assertIn("--open", str(ctx.exception))
+
+    def test_newline_reopen_when_is_a_usage_error(self):
+        with self.assertRaises(decision.UsageError) as ctx:
+            self.record(reopen_when="A claim\nis lost")
+        self.assertIn("--reopen-when", str(ctx.exception))
+
+    def test_newline_decision_writes_no_file_and_posts_nothing(self):
+        with self.assertRaises(decision.UsageError):
+            self.record(decision="Ship\nit")
+        base = os.path.join(self.ops, "decisions")
+        names = os.listdir(base) if os.path.isdir(base) else []
+        self.assertEqual(names, [])
+        posted = [body for bodies in self.fake.posted_comments.values() for body in bodies]
+        self.assertEqual(posted, [])
+
+    def test_cli_maps_newline_decision_to_exit_4(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "demo"\ntracker.repo = "acme/demo"\n')
+        coords = os.path.join(root, "coords")
+        here = os.getcwd()
+        os.chdir(root)
+        self.addCleanup(os.chdir, here)
+        from korapy import trackers
+
+        entry = trackers.RepoTracker(
+            name=REPO,
+            tracker_repo=TRACKER_REPO,
+            operators=[],
+            variant="labels",
+            tracker=self.fake,
+        )
+        args = argparse.Namespace(
+            repo=REPO,
+            number=NUMBER,
+            decision="Ship\nit",
+            why=WHY,
+            reversible=None,
+            confidence=None,
+            settles=None,
+            still_open=None,
+            reopen_when=None,
+            follow_up=[],
+            project=None,
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = decisioncli.cmd_record(
+                args,
+                tracker_factory=lambda root, names, git: ({REPO: entry}, None),
+                coord_root=coords,
+                now=T0,
+            )
+        self.assertEqual(code, 4)
+        self.assertIn("--decision", err.getvalue())
+
+
+class RetryNoopTest(unittest.TestCase):
+    """A retry of a valid record changes nothing: same path, once each."""
+
+    def test_retry_of_valid_record_is_a_noop(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ops = os.path.join(tmp.name, "ops")
+        coords = os.path.join(tmp.name, "coords")
+        os.makedirs(ops)
+        fake = fake_tracker()
+        first = decision.record(
+            repo=REPO,
+            tracker_repo=TRACKER_REPO,
+            number=NUMBER,
+            decision=DECISION,
+            why=WHY,
+            tracker=fake,
+            ops_root=ops,
+            coord_root=coords,
+            now=T0,
+        )
+        self.assertFalse(first.already)
+        second = decision.record(
+            repo=REPO,
+            tracker_repo=TRACKER_REPO,
+            number=NUMBER,
+            decision=DECISION,
+            why=WHY,
+            tracker=fake,
+            ops_root=ops,
+            coord_root=coords,
+            now=T0,
+        )
+        self.assertTrue(second.already)
+        self.assertEqual(second.path, first.path)
+        bodies = [body for bodies in fake.posted_comments.values() for body in bodies]
+        self.assertEqual(len(bodies), 1)
+        self.assertIn(f"Decision on {REPO}#{NUMBER}: {DECISION}", bodies[0].splitlines())
+        entries = coord.read_entries(root=coords)
+        self.assertEqual(len(entries), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

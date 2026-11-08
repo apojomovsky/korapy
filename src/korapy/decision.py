@@ -213,13 +213,22 @@ def _write_file(path, text):
         raise
 
 
+def _require_single_line(flag, value):
+    """Refuse an embedded newline in one free-text flag (retry matches whole lines)."""
+    if value is not None and ("\n" in value or "\r" in value):
+        raise UsageError(f"korapy decision record {flag} must be one line")
+    return value
+
+
 def _check_args(number, decision, why, reversible, confidence):
     text = str(decision or "").strip()
     if not text:
         raise UsageError("korapy decision record needs --decision TEXT")
+    _require_single_line("--decision", text)
     reason = str(why or "").strip()
     if not reason:
         raise UsageError("korapy decision record needs --why TEXT")
+    _require_single_line("--why", reason)
     if not isinstance(number, int) or isinstance(number, bool) or number < 1:
         raise UsageError(f"korapy decision record needs a ticket number, got {number!r}")
     if reversible is not None and reversible not in REVERSIBLE_CHOICES:
@@ -359,6 +368,9 @@ def record(
                 f"korapy decision record --follow-up wants ticket numbers, got {follow!r}"
             )
     opt_settles, opt_open, opt_reopen = _opt(settles), _opt(still_open), _opt(reopen_when)
+    _require_single_line("--settles", opt_settles)
+    _require_single_line("--open", opt_open)
+    _require_single_line("--reopen-when", opt_reopen)
     tracker.item(tracker_repo, number)
     existing = find_recorded(ops_root, slug)
     if existing is not None:
