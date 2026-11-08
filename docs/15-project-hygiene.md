@@ -1,10 +1,11 @@
 # 15: project-declared hygiene rules for gc and disk
 
-Status: design, awaiting maintainer approval. No code ships with
-this doc. It decides how a project declares its own host hygiene
-rules for things korapy does not know about, so `korapy gc` and
-`korapy disk` can clean them safely. Implementation waits for
-approval and follows the tickets in section 9.
+Status: approved option 1 (`[hygiene.<name>]` tables). Ticket 1
+(config and validation: `hygiene.rules` plus the resolver guard)
+has merged. This doc decides how a project declares its own host
+hygiene rules for things korapy does not know about, so `korapy
+gc` and `korapy disk` can clean them safely. The remaining work
+follows the tickets in section 9.
 
 Conventions: module, function and file names quoted below were
 read from the tree at design time (`gc.py`, `disk.py`,

@@ -298,6 +298,18 @@ def rules(root):
     return check_table(table.get("hygiene", {}), os.path.join(root, settings.PROJECT_FILE))
 
 
+def _abs_clone(root, clone):
+    """A clone path as an absolute path, resolved against the ops root.
+
+    The one place a relative `clone.path` joins the ops root: both the
+    base resolver and the protected-grounds listing read through here,
+    so the worktree base and the recorded clone ground never disagree.
+    """
+    if os.path.isabs(clone):
+        return clone
+    return os.path.normpath(os.path.join(root, clone))
+
+
 def _base_dir(rule, root, env, worktrees_setting):
     """The base directory a directory rule's `path` sits under.
 
@@ -318,9 +330,7 @@ def _base_dir(rule, root, env, worktrees_setting):
         resolved = settings.load(root=root, repo=rule.repo, env=env)
     except settings.SettingsError as err:
         raise settings.SettingsError(f"[hygiene.{rule.name}] {err}") from None
-    clone = resolved["clone.path"]
-    if not os.path.isabs(clone):
-        clone = os.path.normpath(os.path.join(root, clone))
+    clone = _abs_clone(root, resolved["clone.path"])
     setting = worktrees_setting
     if setting is None:
         setting = settings.REGISTRY["git.worktrees"].default
@@ -335,8 +345,9 @@ def _protected_dirs(rule, root, env, home, worktrees_setting):
 
     Bases resolve through `env`, so tests redirect them at temp dirs
     and never touch the real state, sessions or cache dirs. `root` is
-    the ops root: without it the clone and worktree-root entries are
-    skipped, so production callers always pass it.
+    the ops root: `declared_roots` refuses before reaching here
+    without it, so the clone and worktree-root entries below are
+    only skipped by direct callers passing none.
     """
     state = paths.state_dir(env)
     found = [
@@ -357,9 +368,7 @@ def _protected_dirs(rule, root, env, home, worktrees_setting):
             resolved = settings.load(root=root, repo=repo, env=env)
         except settings.SettingsError as err:
             raise settings.SettingsError(f"[hygiene.{rule.name}] {err}") from None
-        clone = resolved["clone.path"]
-        if not os.path.isabs(clone):
-            clone = os.path.normpath(os.path.join(root, clone))
+        clone = _abs_clone(root, resolved["clone.path"])
         found.append((f"the clone of repo {repo!r}", clone))
         try:
             grounds = worktrees.root(os.path.realpath(clone), setting)
@@ -369,17 +378,25 @@ def _protected_dirs(rule, root, env, home, worktrees_setting):
     return found
 
 
-def declared_roots(rules, *, root=None, env=None, worktrees_setting=None, home=None):
+def declared_roots(rules, *, root, env=None, worktrees_setting=None, home=None):
     """`{name: realpath}` for every rule with a directory root.
 
-    The one function that joins a rule's `base` and `path`. The root
-    must sit strictly below its base (never equal to it, never
-    escaping it, symlinks resolved), must not name a `reviews`
-    record dir, and must neither be nor contain protected ground
-    (home, clones, worktree roots, state, sessions, cache, ledger).
-    Any refusal is exit 4, naming the rule. Image rules carry no
-    directory root and are skipped.
+    The one function that joins a rule's `base` and `path`. `root` is
+    the ops root and is required: without it the clone and
+    worktree-root entries of protected ground would be silently
+    skipped, so any rule with a directory root refuses naming the
+    rule instead. The root must sit strictly below its base (never
+    equal to it, never escaping it, symlinks resolved), must not name
+    a `reviews` record dir, and must neither be nor contain protected
+    ground (home, clones, worktree roots, state, sessions, cache,
+    ledger). Any refusal is exit 4, naming the rule. Image rules
+    carry no directory root and are skipped.
     """
+    if root is None:
+        offenders = sorted(name for name, rule in rules.items() if rule.kind != "image")
+        if offenders:
+            raise settings.SettingsError(f"[hygiene.{offenders[0]}] needs the ops root")
+        return {}
     found = {}
     for name, rule in rules.items():
         if rule.kind == "image":

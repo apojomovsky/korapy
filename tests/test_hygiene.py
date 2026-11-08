@@ -287,6 +287,13 @@ class SettingsCarryCase(unittest.TestCase):
         resolved = settings.resolve(project={"hygiene": {"acme-scratch": dir_rule()}}, env={})
         self.assertEqual(set(resolved.hygiene), {"acme-scratch"})
 
+    def test_repo_level_hygiene_is_refused(self):
+        with self.assertRaises(settings.SettingsError):
+            settings.resolve(
+                project={"repo": [{"name": "acme", "hygiene": {"x": dir_rule()}}]},
+                env={},
+            )
+
 
 class RulesCase(unittest.TestCase):
     def setUp(self):
@@ -438,6 +445,22 @@ class DeclaredRootsCase(unittest.TestCase):
         )
         with self.assertRaises(settings.SettingsError):
             hygiene.declared_roots(rules, root=None, env=self.env)
+
+    def test_root_none_with_dir_rule_is_refused(self):
+        rules = hygiene.check_table({"x": dir_rule()}, "korapy.toml")
+        with self.assertRaisesRegex(settings.SettingsError, "x"):
+            hygiene.declared_roots(rules, root=None, env=self.env)
+
+    def test_root_none_with_image_only_reads_as_no_roots(self):
+        rules = hygiene.check_table({"x": image_rule()}, "korapy.toml")
+        self.assertEqual(hygiene.declared_roots(rules, root=None, env=self.env), {})
+
+    def test_abs_clone_resolves_relative_against_the_root(self):
+        self.assertEqual(hygiene._abs_clone("/ops", "main"), "/ops/main")
+        self.assertEqual(hygiene._abs_clone("/ops", "sub/../main"), os.path.normpath("/ops/main"))
+
+    def test_abs_clone_leaves_absolute_clones_alone(self):
+        self.assertEqual(hygiene._abs_clone("/ops", "/abs/main"), "/abs/main")
 
     def test_root_equal_to_a_clone_is_refused(self):
         with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
@@ -1076,15 +1099,15 @@ def _rule_path_joins(path):
 class ResolverGuardTest(unittest.TestCase):
     def test_no_second_base_plus_path_join_exists(self):
         problems = []
-        for path in sorted(ROOT.glob("*.py")):
+        for path in sorted(ROOT.rglob("*.py")):
             for func, lineno in _rule_path_joins(path):
                 if (path.stem, func) not in HYGIENE_JOIN_ALLOW:
-                    problems.append(f"{path.name}:{lineno} {func}")
+                    problems.append(f"{path.relative_to(ROOT)}:{lineno} {func}")
         self.assertEqual(problems, [], f"second base plus path join: {problems}")
 
     def test_the_allow_list_names_real_uses(self):
         seen = set()
-        for path in sorted(ROOT.glob("*.py")):
+        for path in sorted(ROOT.rglob("*.py")):
             for func, _ in _rule_path_joins(path):
                 seen.add((path.stem, func))
         for entry in HYGIENE_JOIN_ALLOW:
