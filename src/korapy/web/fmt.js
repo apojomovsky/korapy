@@ -119,6 +119,23 @@ export function canonicalJson(value) {
   return text === undefined ? "null" : text;
 }
 
+// A retention window in words for the finished toggle caption:
+// "6 hours". Anything unparseable reads as "a while", never zero.
+export function formatRetentionWindow(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+    return "a while";
+  }
+  const hours = Math.round(ms / 3600000);
+  if (hours >= 2) {
+    return String(hours) + " hours";
+  }
+  if (hours === 1) {
+    return "1 hour";
+  }
+  const mins = Math.max(1, Math.round(ms / 60000));
+  return mins === 1 ? "1 minute" : String(mins) + " minutes";
+}
+
 // A reset epoch as wall-clock hours and minutes for the quota bars.
 // Null reads as not reported; anything unparseable is shown verbatim,
 // the same degradation rule as the timestamp parsers above.
@@ -186,6 +203,76 @@ export function formatCountdown(targetMs, nowMs) {
     return "in" + gap + mins + gap + "m";
   }
   return "in" + gap + secs + gap + "s";
+}
+
+// Presentation bands for host gauges: the same 0.7/0.9 cuts the
+// charged bars already use, so every bar on the page bands alike.
+// Anything unparseable reads as unknown, never as a healthy zero.
+export function bandFor(frac) {
+  if (typeof frac !== "number" || !Number.isFinite(frac)) {
+    return "unknown";
+  }
+  if (frac < 0.7) {
+    return "ok";
+  }
+  if (frac < 0.9) {
+    return "low";
+  }
+  return "high";
+}
+
+// A fraction clamped to the bar domain. Null stays null so the bar
+// renders unknown instead of empty.
+export function clamp01(frac) {
+  if (typeof frac !== "number" || !Number.isFinite(frac)) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, frac));
+}
+
+// Host load as "1.60 on 4 cores (0.40 per core)". A missing reading
+// is not reported, never an idle zero.
+export function formatLoad(load1min, ncpu) {
+  if (load1min === null || load1min === undefined || ncpu === null || ncpu === undefined) {
+    return "not reported";
+  }
+  if (
+    typeof load1min !== "number" ||
+    !Number.isFinite(load1min) ||
+    typeof ncpu !== "number" ||
+    !Number.isFinite(ncpu) ||
+    ncpu <= 0
+  ) {
+    return String(load1min) + " on " + String(ncpu) + " cores";
+  }
+  const per = load1min / ncpu;
+  const shown = load1min.toFixed(2) + " on " + String(ncpu) + " cores";
+  return shown + " (" + per.toFixed(2) + " per core)";
+}
+
+// Host memory used from the totals: "used 3.5 of 7.8 GB (45%)". A
+// missing half reads as not reported, never as empty or full. An
+// impossible reading (available above total, or below zero) is a
+// broken meter, not an idle host, so it reads as not reported too.
+export function formatMemUsed(totalMb, availMb) {
+  if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
+    return "not reported";
+  }
+  if (
+    typeof totalMb !== "number" ||
+    !Number.isFinite(totalMb) ||
+    typeof availMb !== "number" ||
+    !Number.isFinite(availMb) ||
+    totalMb <= 0
+  ) {
+    return String(totalMb) + " of " + String(availMb);
+  }
+  if (availMb > totalMb || availMb < 0) {
+    return "not reported";
+  }
+  const usedMb = Math.max(0, totalMb - availMb);
+  const pct = Math.round((usedMb / totalMb) * 100);
+  return "used " + (usedMb / 1024).toFixed(1) + " of " + (totalMb / 1024).toFixed(1) + " GB (" + String(pct) + "%)";
 }
 
 // A quota window reset as local wall-clock time plus the wait in

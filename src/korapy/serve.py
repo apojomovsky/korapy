@@ -1489,6 +1489,28 @@ def collect() -> dict:
     return snapshot.build(**snapshot.collect_kwargs())
 
 
+def fixture_build(path: str) -> Callable[[], dict]:
+    """A snapshot builder reading a saved document from `path`.
+
+    Fixture mode: the snapshot-derived routes answer the file instead
+    of the live host, so the page can be developed, tested and
+    screenshotted without a running fleet. Board, tail, events and
+    journal still read the live host. A missing, corrupt or non-object
+    file raises `ServeError`, so a bad fixture fails closed at startup
+    (exit 4) instead of serving half a page.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except OSError as exc:
+        raise ServeError(f"cannot read snapshot fixture {path}: {exc}") from exc
+    except ValueError as exc:
+        raise ServeError(f"snapshot fixture {path} is not JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ServeError(f"snapshot fixture {path} is not a JSON object")
+    return lambda: doc
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the `serve` verb."""
     from korapy import paths
@@ -1539,8 +1561,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except OSError as err:
         _err(f"cannot read state dir {state_dir}: {err}")
         return UNREACHABLE
+    if args.snapshot_file is not None:
+        try:
+            build = fixture_build(args.snapshot_file)
+        except ServeError as err:
+            _err(str(err))
+            return USAGE
+    else:
+        build = collect
     try:
         server = make_server(
+            build=build,
             bind=bind,
             port=port,
             allowed_origins=tuple(origins),
@@ -1607,5 +1638,11 @@ def add_parser(sub) -> None:
         "--new-token",
         action="store_true",
         help="mint the API token file, then serve",
+    )
+    p.add_argument(
+        "--snapshot-file",
+        default=None,
+        metavar="PATH",
+        help="serve a saved snapshot document instead of the live host (screenshot and dev use)",
     )
     p.set_defaults(func=cmd_serve)

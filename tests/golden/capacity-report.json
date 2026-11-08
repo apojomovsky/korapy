@@ -7,9 +7,13 @@
   "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
   "pressure": {
     "cpu_some_avg10": null,
+    "load_1min": null,
     "load_per_cpu": 0.4,
+    "mem_available_mb": null,
     "mem_available_pct": 55.0,
+    "mem_total_mb": null,
     "memory_some_avg10": null,
+    "ncpu": null,
     "saturated": false
   },
   "schema_version": 1

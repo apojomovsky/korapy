@@ -616,6 +616,10 @@ class RunHeavyCase(HeavyCase):
                     "saturated": False,
                     "cpu_some_avg10": 2.5,
                     "memory_some_avg10": 0.8,
+                    "ncpu": None,
+                    "load_1min": None,
+                    "mem_total_mb": None,
+                    "mem_available_mb": None,
                 },
             },
         )
