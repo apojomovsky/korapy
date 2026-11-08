@@ -544,7 +544,6 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
     cutoff = now - rule.retention_days * DAY_S
     done = disk.done_tickets(entries, now)
     rows = []
-    saw_ticket = False
     for found in idle:
         assert found.mtime is not None
         name = os.path.basename(found.path)
@@ -570,7 +569,6 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
                 )
             )
             continue
-        saw_ticket = True
         state = "done" if ticket in done else "open"
         is_live = live is not None and ticket in live
         aged = _aged_days(now, found.mtime)
@@ -607,7 +605,7 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
         )
     if (
         live is None
-        and saw_ticket
+        and rows
         and not any(
             note.startswith(f"rule {rule.name}:") and "live units unreadable" in note
             for note in notes
