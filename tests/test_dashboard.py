@@ -121,6 +121,31 @@ class HonestQuota(unittest.TestCase):
         )
         self.assertEqual(view["providers"]["p"]["windows"]["w"]["source"], "measured")
 
+    def test_two_providers_keep_their_own_source(self):
+        view = dashboard.with_honest_quota(
+            {
+                "now": T0,
+                "providers": {
+                    "fresh": {
+                        "state": "ok",
+                        "stale": False,
+                        "windows": {"w": {"used_pct": 10.0, "resets_at": None}},
+                        "read_at": T0,
+                        "error": None,
+                    },
+                    "old": {
+                        "state": "ok",
+                        "stale": True,
+                        "windows": {"w": {"used_pct": 10.0, "resets_at": None}},
+                        "read_at": T0 - 9999,
+                        "error": None,
+                    },
+                },
+            }
+        )
+        self.assertEqual(view["providers"]["fresh"]["source"], "measured")
+        self.assertEqual(view["providers"]["old"]["source"], "estimate")
+
     def test_estimate_when_no_windows(self):
         got = dashboard.quota_honesty(
             {"state": "unknown", "windows": None, "error": None, "read_at": T0 - 10}
@@ -150,6 +175,15 @@ class Attention(unittest.TestCase):
         self.assertEqual(len(got["needs_decision"]), 1)
         self.assertEqual(len(got["ready_to_merge"]), 1)
         self.assertEqual(got["coordinator_handled"], 1)
+
+    def test_two_questions_both_list_in_order(self):
+        events = [
+            {"kind": "question", "ref": "r#1", "question": "first?"},
+            {"kind": "question", "ref": "r#2", "question": "second?"},
+        ]
+        got = dashboard.attention(events)
+        self.assertEqual([item["ref"] for item in got["needs_decision"]], ["r#1", "r#2"])
+        self.assertEqual(len(got["items"]), 2)
 
     def test_missing_source_reads_unknown(self):
         got = dashboard.attention(None)
@@ -183,6 +217,17 @@ class PlanBand(unittest.TestCase):
         got = dashboard.plan_projection(drive, {"live": 1}, T0)
         self.assertIn("quota", got["waits"])
 
+    def test_several_skips_sort_and_cap_the_next_list(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 5,
+            "skipped_by_reason": {"quota": 3, "cap": 1, "hold": 2, "lock": 1},
+        }
+        got = dashboard.plan_projection(drive, {"live": 1}, T0)
+        self.assertEqual(got["waits"], ["cap", "hold", "lock", "quota"])
+        self.assertEqual(len(got["next"]), 3)
+        self.assertEqual([item["waits"] for item in got["next"]], ["cap", "hold", "lock"])
+
 
 class LocalTime(unittest.TestCase):
     def test_offset_is_an_int_and_iso_carries_it(self):
@@ -190,6 +235,20 @@ class LocalTime(unittest.TestCase):
         iso = dashboard.now_iso(T0)
         self.assertIsInstance(iso, str)
         self.assertRegex(iso, r"[+-]\d{2}:?\d{2}")
+
+
+class CadenceAgreement(unittest.TestCase):
+    """The plan countdown repeats the drive timer's cadence: one fact, one place.
+
+    `drive.TIMER_ON_CALENDAR` owns the installed cadence; `PLAN_PASS_S`
+    restates it in seconds, so this test pins the copies to agree.
+    """
+
+    def test_plan_pass_matches_the_drive_timer(self):
+        from korapy import drive
+
+        self.assertEqual(drive.TIMER_ON_CALENDAR, "*:0/5")
+        self.assertEqual(dashboard.PLAN_PASS_S, 300)
 
 
 class BuildPanels(unittest.TestCase):
