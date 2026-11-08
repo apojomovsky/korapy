@@ -283,6 +283,8 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
@@ -425,6 +427,8 @@ commits.conventional = false
 # admission.total_cap = 4  # live plus pending agents the host admits in total
 #
 # [agents]
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
