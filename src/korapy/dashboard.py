@@ -282,8 +282,10 @@ def plan_projection(drive_view, now):
     waited ticket while the daily budget holds, each carrying the
     ticket and the reason it waits (the named waits from the last
     pass, else the skip codes, else `slot free`). Identical waits
-    collapse into one row with a count; free slots collapse into one
-    `slot free` row with a count. With no starts left the list is
+    collapse into one row with a count and the ticket list (every
+    waited ticket, in journal order); free slots collapse into one
+    `slot free` row with a count. The remaining count is an int;
+    anything else reads `error`, never a coerced ready list. With no starts left the list is
     empty, so the panel reads the empty state instead of naming starts
     that can never start. `next_pass_in_s` counts down from the last
     pass on the 5-minute timer cadence. A missing drive section reads
@@ -326,21 +328,9 @@ def plan_projection(drive_view, now):
     if not isinstance(drive_view, dict):
         return _shape_error(f"is {type(drive_view).__name__}")
     raw_remaining = drive_view.get("starts_remaining", 0)
-    if raw_remaining is None:
-        remaining = 0
-    elif isinstance(raw_remaining, bool):
+    if isinstance(raw_remaining, bool) or not isinstance(raw_remaining, int):
         return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
-    elif not isinstance(raw_remaining, (int, float)):
-        try:
-            remaining = int(raw_remaining)
-        except (TypeError, ValueError):
-            return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
-    else:
-        try:
-            remaining = int(raw_remaining)
-        except (TypeError, ValueError, OverflowError):
-            return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
-    remaining = max(0, remaining)
+    remaining = max(0, raw_remaining)
     skipped = drive_view.get("skipped_by_reason")
     if skipped is None:
         skipped = {}
@@ -364,7 +354,8 @@ def plan_projection(drive_view, now):
         return _shape_error(f"waits is {type(raw_waits).__name__}")
     else:
         # One row per waited ticket, in journal order; identical waits
-        # collapse into the first row with a count.
+        # collapse into the first row with a count and the ticket list,
+        # so no capped ticket stays invisible.
         groups = []
         seen: dict[str, dict] = {}
         for entry in raw_waits:
@@ -374,8 +365,9 @@ def plan_projection(drive_view, now):
             words = _wait_words(ticket, entry.get("reason"))
             if words in seen:
                 seen[words]["count"] += 1
+                seen[words]["tickets"].append(ticket)
             else:
-                row = {"ticket": ticket, "waits": words, "count": 1}
+                row = {"ticket": ticket, "tickets": [ticket], "waits": words, "count": 1}
                 seen[words] = row
                 groups.append(row)
     waits = sorted({str(row["waits"]) for row in groups})

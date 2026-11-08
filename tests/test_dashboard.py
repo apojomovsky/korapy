@@ -289,6 +289,7 @@ class PlanBand(unittest.TestCase):
             {
                 "what": "start",
                 "ticket": "app#7",
+                "tickets": ["app#7"],
                 "waits": "day cap reached (1 of 1 today), not started",
                 "count": 1,
             },
@@ -317,6 +318,7 @@ class PlanBand(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["ticket"], "app#7")
         self.assertEqual(rows[0]["count"], 2)
+        self.assertEqual(rows[0]["tickets"], ["app#7", "app#9"])
 
     def test_distinct_waits_stay_separate_rows(self):
         drive = {
@@ -367,6 +369,16 @@ class PlanBand(unittest.TestCase):
                 "starts_remaining": 2,
                 "skipped_by_reason": {},
                 "waits": bad,
+            }
+            got = dashboard.plan_projection(drive, T0)
+            self.assertEqual(got["state"], "error", repr(bad))
+
+    def test_bool_or_non_int_starts_remaining_reads_error(self):
+        for bad in (True, False, "3", 2.5, None):
+            drive = {
+                "last_pass_at": T0 - 100,
+                "starts_remaining": bad,
+                "skipped_by_reason": {},
             }
             got = dashboard.plan_projection(drive, T0)
             self.assertEqual(got["state"], "error", repr(bad))
