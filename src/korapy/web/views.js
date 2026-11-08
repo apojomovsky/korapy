@@ -53,6 +53,8 @@ export function el(tag, text, attrs) {
   return node;
 }
 
+// The footer line: backend mode, API version, document schema and
+// server time. Server facts, kept out of the visual centre.
 export function renderShell({ mode, api, version, seenMs, serverNowMs }) {
   const modeNode = document.getElementById("mode");
   modeNode.textContent = mode + " mode";
@@ -358,40 +360,6 @@ function quotaCard(quota, nowMs) {
   return section;
 }
 
-// One project's charged share in spelled-out units, with measured
-// use where the kernel reports it. A null share on a new server
-// shape reads as unknown instead of throwing inside the poll loop.
-function projectShareLine(share, measured) {
-  const info = share !== null && typeof share === "object" ? share : {};
-  const charged = [
-    info.cpu_m === null || info.cpu_m === undefined ? "CPU unknown" : formatCpu(info.cpu_m),
-    info.memory_mb === null || info.memory_mb === undefined
-      ? "memory unknown"
-      : formatMem(info.memory_mb),
-    info.pids === null || info.pids === undefined
-      ? "processes unknown"
-      : String(info.pids) + " processes",
-  ];
-  let text = "reserved " + charged.join(", ");
-  const got = measured !== null && typeof measured === "object" ? measured : null;
-  if (got !== null) {
-    const bits = [];
-    if (got.cpu_usage_usec !== null && got.cpu_usage_usec !== undefined) {
-      bits.push("cpu " + (got.cpu_usage_usec / 1000000).toFixed(1) + " seconds");
-    }
-    if (got.memory_mb !== null && got.memory_mb !== undefined) {
-      bits.push(formatMem(got.memory_mb));
-    }
-    if (got.pids !== null && got.pids !== undefined) {
-      bits.push(String(got.pids) + " processes");
-    }
-    if (bits.length > 0) {
-      text += "; measured " + bits.join(", ");
-    }
-  }
-  return text;
-}
-
 // A pressure reading outside the contract degrades to its raw value
 // as text, the timestamp formatters' rule, instead of NaN.
 function pressureValue(value, digits) {
@@ -413,35 +381,6 @@ function pressureText(pressure) {
   }
   bits.push(info.saturated ? "saturated" : "ok");
   return bits.join(", ");
-}
-
-// One resource dimension: a labelled bar of charged against the host
-// budget, with both units spelled out. Without a budget there is no
-// bar, only the charged number and the reason. The help rides as a
-// tooltip so the numbers lead.
-function resourceDim(labelText, abbrTitle, valueText, frac, help) {
-  const wrap = document.createElement("div");
-  wrap.setAttribute("class", "field");
-  wrap.setAttribute("title", String(help));
-  const term = document.createElement("dt");
-  if (abbrTitle) {
-    term.appendChild(el("abbr", labelText, { title: abbrTitle }));
-  } else {
-    term.appendChild(document.createTextNode(cleanText(labelText)));
-  }
-  wrap.appendChild(term);
-  const shown = document.createElement("dd");
-  shown.appendChild(document.createTextNode(cleanText(valueText)));
-  if (frac !== null) {
-    const barRow = document.createElement("div");
-    barRow.appendChild(meter(frac, bandFor(frac), labelText));
-    shown.appendChild(barRow);
-  }
-  wrap.appendChild(shown);
-  const list = document.createElement("dl");
-  list.setAttribute("class", "fields");
-  list.appendChild(wrap);
-  return list;
 }
 
 // One host gauge: the actual host value as a bar with the reserved
@@ -535,75 +474,53 @@ function memoryGauge(pressure, charged) {
   );
 }
 
-// The host gauges: the actual host values as bars, each with the
-// share the loop reserved for its agents drawn as a tick inside and
-// labelled as such. A missing reading renders unknown, never zero.
-function resourcesCard(resources) {
+// One host gauge card: the actual host value as a large number with
+// a thin bar, the share the loop reserved for its agents drawn as a
+// tick inside and labelled as such. A missing reading renders as
+// not reported, never zero.
+function cpuCard(resources) {
   const desc =
-    "The host as the kernel reports it. Each bar is the actual host value; " +
-    "the tick inside is the share the loop reserved for its agents.";
+    "Host load from the kernel, per core. The tick inside is the share the loop reserved for its agents.";
   if (isErrorSection(resources)) {
     return errorCard(
-      "host",
+      "CPU",
       desc,
       resources,
       "Resource use could not be measured. Check the host with korapy doctor.",
     );
   }
-  const section = card("host", desc);
+  const section = card("CPU", desc);
+  section.setAttribute("class", "card gauge");
   const info = resources && typeof resources === "object" ? resources : {};
   const charged = info.charged && typeof info.charged === "object" ? info.charged : null;
-  const budget = info.host_budget && typeof info.host_budget === "object" ? info.host_budget : null;
-  if (charged === null && (info.pressure === null || info.pressure === undefined)) {
-    section.appendChild(el("p", "no host readings in this snapshot"));
+  if (info.pressure === null || info.pressure === undefined) {
+    section.appendChild(el("p", "not reported: no host readings in this snapshot"));
     return section;
   }
   section.appendChild(cpuGauge(info.pressure, charged));
-  section.appendChild(memoryGauge(info.pressure, charged));
-  const pidsText =
-    charged === null || charged.pids === null || charged.pids === undefined
-      ? "not reported"
-      : String(charged.pids);
-  const pidsBudget =
-    budget === null || budget.pids === null || budget.pids === undefined
-      ? null
-      : String(budget.pids);
-  section.appendChild(
-    resourceDim(
-      "PIDs",
-      "process identifiers",
-      pidsBudget === null
-        ? pidsText + " processes reserved for agents (no host budget)"
-        : pidsText + " of " + pidsBudget + " process slots reserved for agents",
-      null,
-      "Process slots reserved for live agents, against the host budget. The kernel reports no host total for processes.",
-    ),
-  );
-  const shares = info.by_project && typeof info.by_project === "object" ? info.by_project : {};
-  const measured =
-    info.measured_by_project && typeof info.measured_by_project === "object"
-      ? info.measured_by_project
-      : {};
-  const names = Object.keys(shares).sort();
-  if (names.length > 0) {
-    section.appendChild(
-      el("p", "Reserved shares by project, with measured use where the kernel reports it:"),
+  return section;
+}
+
+function memoryCard(resources) {
+  const desc =
+    "Host memory used from MemTotal and MemAvailable. The tick inside is the share the loop reserved for its agents.";
+  if (isErrorSection(resources)) {
+    return errorCard(
+      "memory",
+      desc,
+      resources,
+      "Resource use could not be measured. Check the host with korapy doctor.",
     );
   }
-  const lines = document.createElement("ul");
-  for (const name of names) {
-    const item = document.createElement("li");
-    item.appendChild(el("span", (name === "" ? "-" : name) + ": " + projectShareLine(shares[name], measured[name])));
-    lines.appendChild(item);
+  const section = card("memory", desc);
+  section.setAttribute("class", "card gauge");
+  const info = resources && typeof resources === "object" ? resources : {};
+  const charged = info.charged && typeof info.charged === "object" ? info.charged : null;
+  if (info.pressure === null || info.pressure === undefined) {
+    section.appendChild(el("p", "not reported: no host readings in this snapshot"));
+    return section;
   }
-  if (lines.childNodes.length > 0) {
-    section.appendChild(lines);
-  }
-  section.appendChild(el("p", pressureText(info.pressure)));
-  const notes = Array.isArray(info.notes) ? info.notes : [];
-  for (const note of notes) {
-    section.appendChild(el("p", "note: " + String(note)));
-  }
+  section.appendChild(memoryGauge(info.pressure, charged));
   return section;
 }
 
@@ -633,25 +550,22 @@ function capacityCard(capacity) {
       : info.repo_cap === 0
         ? "none"
         : String(info.repo_cap) + " agents";
+  const running =
+    live === "not reported" || totalCap === "not reported"
+      ? "not reported"
+      : "Agents running " + live + " of " + totalCap + " allowed";
   section.appendChild(
     field(
-      "Total capacity",
-      live + " of " + totalCap + " tickets live",
-      "How many agents the host admits in total.",
+      "Agents running",
+      running,
+      "How many agents run now, of the host's total allowance.",
     ),
   );
   section.appendChild(
     field(
-      "Per-repo cap",
+      "Per-repo limit",
       repoCap,
       "How many agents one repo may hold. None means no per-repo limit.",
-    ),
-  );
-  section.appendChild(
-    field(
-      "Live now",
-      live === "not reported" ? "not reported" : live + " tickets",
-      "Tickets with a live agent right now: one ticket holds one slot.",
     ),
   );
   const pending = Array.isArray(info.pending) ? info.pending : null;
@@ -682,8 +596,7 @@ function capacityCard(capacity) {
 
 function diskCard(disk) {
   const desc =
-    "Free space on the state and cache disks. Each bar is the actual filesystem use; " +
-    "no reservation is tracked for disk, so these bars carry no tick.";
+    "Free space on the state and cache disks. No reservation is tracked for disk, so these bars carry no tick.";
   if (isErrorSection(disk)) {
     return errorCard(
       "disk",
@@ -693,11 +606,47 @@ function diskCard(disk) {
     );
   }
   const section = card("disk", desc);
+  section.setAttribute("class", "card gauge");
   const info = disk && typeof disk === "object" ? disk : {};
   const paths = Array.isArray(info.paths) ? info.paths : [];
   if (paths.length === 0) {
     section.appendChild(el("p", "no disk paths reported"));
     return section;
+  }
+  // The headline names the tightest disk; the list below names every
+  // path. The bar is the actual filesystem use, with no tick: the
+  // loop reserves no disk.
+  let tightest = null;
+  for (const item of paths) {
+    if (
+      item !== null &&
+      typeof item === "object" &&
+      typeof item.free === "number" &&
+      (tightest === null || item.free < tightest.free)
+    ) {
+      tightest = item;
+    }
+  }
+  if (tightest !== null) {
+    if (typeof tightest.total === "number" && tightest.total > 0) {
+      const used = typeof tightest.used === "number" ? tightest.used / tightest.total : null;
+      section.appendChild(
+        el(
+          "p",
+          formatBytes(tightest.free) + " free of " + formatBytes(tightest.total),
+          { class: "giant" },
+        ),
+      );
+      if (used !== null) {
+        section.appendChild(meter(used, bandFor(used), "disk use " + String(tightest.path)));
+      }
+    } else {
+      section.appendChild(
+        el("p", formatBytes(tightest.free) + " free (" + String(tightest.path) + ")", {
+          class: "giant",
+        }),
+      );
+    }
   }
   const list = document.createElement("ul");
   for (const item of paths) {
@@ -849,54 +798,67 @@ function agentText(row, nowMs) {
 }
 
 // One agent row as table cells: id, ticket, role, runtime, state,
-// started, last seen, note. The id links to the detail when the row
-// has a key; every cell carries its header name for narrow screens.
+// running for, last seen, note. The ticket links to the detail when
+// the row has a key; the state is a coloured dot plus a text chip so
+// it reads without colour too; the runtime is a small badge. Cell
+// classes drive the narrow-screen card layout (ticket and state on
+// the first line, the note below).
 function agentRow(row, nowMs) {
-  const cells = [];
-  const key = agentKey(row);
-  if (key === null) {
-    cells.push([String(row.id), el("span", String(row.id))]);
-  } else {
-    const link = document.createElement("a");
-    link.setAttribute("href", detailHash(key));
-    link.textContent = cleanText(String(row.id));
-    cells.push([String(row.id), link]);
-  }
+  const tr = document.createElement("tr");
+  tr.setAttribute("data-state", String(row.state));
+  const cell = (cls, node) => {
+    const td = document.createElement("td");
+    td.setAttribute("class", cls);
+    td.appendChild(node);
+    tr.appendChild(td);
+    return td;
+  };
+  cell("c-id", el("span", row.id === null || row.id === undefined ? "-" : String(row.id)));
   const ticket =
     row.repo === null || row.repo === undefined || row.number === null || row.number === undefined
       ? "no ticket"
       : String(row.repo) + "#" + String(row.number);
-  cells.push([ticket, el("span", ticket)]);
+  const key = agentKey(row);
+  if (key === null || ticket === "no ticket") {
+    cell("c-ticket", el("span", ticket));
+  } else {
+    const link = document.createElement("a");
+    link.setAttribute("href", detailHash(key));
+    link.textContent = cleanText(ticket);
+    cell("c-ticket", link);
+  }
   const role = row.role === null || row.role === undefined ? "-" : String(row.role);
-  cells.push([role, el("span", role)]);
-  const runtime = row.runtime === null || row.runtime === undefined ? "-" : String(row.runtime);
-  cells.push([runtime, el("span", runtime)]);
-  cells.push([String(row.state), el("span", String(row.state))]);
-  const started =
+  cell("c-role", el("span", role));
+  const runtimeNode = document.createElement("span");
+  runtimeNode.setAttribute(
+    "class",
+    "badge runtime" + (row.runtime === null || row.runtime === undefined ? " missing" : ""),
+  );
+  runtimeNode.textContent = cleanText(
+    row.runtime === null || row.runtime === undefined ? "no runtime" : String(row.runtime),
+  );
+  cell("c-runtime", runtimeNode);
+  const stateNode = document.createElement("span");
+  stateNode.setAttribute("class", "state state-" + String(row.state));
+  const dot = document.createElement("span");
+  dot.setAttribute("class", "dot");
+  dot.setAttribute("aria-hidden", "true");
+  stateNode.appendChild(dot);
+  stateNode.appendChild(document.createTextNode(cleanText(String(row.state))));
+  cell("c-state", stateNode);
+  const running =
     row.started_at === null || row.started_at === undefined
       ? "not reported"
       : age(row.started_at, nowMs);
-  cells.push([started, el("span", started)]);
+  cell("c-running", el("span", running));
   const seen =
     row.last_seen === null || row.last_seen === undefined ? "not reported" : age(row.last_seen, nowMs);
-  cells.push([seen, el("span", seen)]);
+  cell("c-seen", el("span", seen));
   const note =
     row.note === null || row.note === undefined || String(row.note) === ""
       ? "-"
       : String(row.note);
-  cells.push([note, el("span", note)]);
-  const tr = document.createElement("tr");
-  tr.setAttribute("data-state", String(row.state));
-  const heads = ["id", "ticket", "role", "runtime", "state", "started", "last seen", "note"];
-  cells.forEach(([_, node], index) => {
-    const cell = document.createElement("td");
-    cell.setAttribute("data-th", heads[index]);
-    if (index === 0) {
-      cell.setAttribute("class", "id");
-    }
-    cell.appendChild(node);
-    tr.appendChild(cell);
-  });
+  cell("c-note", el("span", note));
   return tr;
 }
 
@@ -907,7 +869,7 @@ function agentTable(rows, nowMs) {
   table.setAttribute("class", "agents");
   const head = document.createElement("thead");
   const headerRow = document.createElement("tr");
-  for (const name of ["id", "ticket", "role", "runtime", "state", "started", "last seen", "note"]) {
+  for (const name of ["id", "ticket", "role", "runtime", "state", "running for", "last seen", "note"]) {
     headerRow.appendChild(el("th", name));
   }
   head.appendChild(headerRow);
@@ -1010,6 +972,38 @@ function agentFilterInput() {
   return wrap;
 }
 
+// A compact project picker inside the agents card: the overview's
+// project filter as one select, not a row of pills. Changing it
+// navigates by hash, so every choice also works without clicks.
+function projectSelect(current, projects) {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "project-select");
+  const caption = document.createElement("label");
+  caption.setAttribute("for", "project-select");
+  caption.textContent = "project";
+  const box = document.createElement("select");
+  box.setAttribute("id", "project-select");
+  const all = document.createElement("option");
+  all.setAttribute("value", "#/");
+  all.textContent = "All projects";
+  if (current === null) {
+    all.setAttribute("selected", "selected");
+  }
+  box.appendChild(all);
+  for (const name of projects) {
+    const opt = document.createElement("option");
+    opt.setAttribute("value", "#/?project=" + encodeURIComponent(name));
+    opt.textContent = cleanText(name);
+    if (name === current) {
+      opt.setAttribute("selected", "selected");
+    }
+    box.appendChild(opt);
+  }
+  wrap.appendChild(caption);
+  wrap.appendChild(box);
+  return wrap;
+}
+
 // Whether a row matches the filter text: id, ticket, role, runtime,
 // state and note, case-insensitive. An empty filter matches all.
 function matchesAgentFilter(row, needle) {
@@ -1063,7 +1057,8 @@ function emptyAgentsText(doc, project, nowMs) {
 
 function agentsSection(doc, project, nowMs) {
   const agents = doc ? doc.agents : null;
-  const desc = "Live and stale agents first; finished entries sit behind a toggle.";
+  const desc =
+    "Agents on this host right now. Live and stale agents first; finished entries sit behind a toggle.";
   if (isErrorSection(agents)) {
     return errorCard(
       "agents",
@@ -1073,6 +1068,7 @@ function agentsSection(doc, project, nowMs) {
     );
   }
   const section = card("agents", desc);
+  section.appendChild(projectSelect(project, snapshotProjects(doc)));
   section.appendChild(agentFilterInput());
   const rows = Array.isArray(agents) ? agents : [];
   const needle = agentFilter.trim().toLowerCase();
@@ -1167,60 +1163,7 @@ export function renderTabs(current) {
   }
 }
 
-// The fleet strip: live agents as the headline number, stale beside
-// it, finished as a collapsed secondary count. Finished entries are
-// history, not agents, so they never share the headline.
-function headerLine(header) {
-  const desc = "Agents on this host right now. Finished entries are history, not agents.";
-  if (isErrorSection(header)) {
-    return errorCard(
-      "fleet",
-      desc,
-      header,
-      "The agent registry could not be read, so no counts can be shown. Check the host with korapy doctor.",
-    );
-  }
-  const info = header && typeof header === "object" ? header : {};
-  const live =
-    typeof info.agents_live === "number" && Number.isFinite(info.agents_live)
-      ? String(info.agents_live) + " live"
-      : "live not reported";
-  const stale =
-    typeof info.agents_stale === "number" && Number.isFinite(info.agents_stale)
-      ? String(info.agents_stale) + " stale"
-      : "stale not reported";
-  const finished =
-    typeof info.agents_finished === "number" && Number.isFinite(info.agents_finished)
-      ? info.agents_finished
-      : null;
-  const section = card("fleet", desc);
-  section.setAttribute("class", "card strip");
-  const line = document.createElement("p");
-  line.setAttribute("class", "headline");
-  const count = document.createElement("strong");
-  count.textContent = cleanText(live);
-  line.appendChild(count);
-  line.appendChild(document.createTextNode(cleanText(", " + stale)));
-  section.appendChild(line);
-  if (finished === null) {
-    section.appendChild(el("p", "finished not reported"));
-  } else if (finished > 0) {
-    const box = document.createElement("details");
-    box.setAttribute("class", "finished");
-    const head = document.createElement("summary");
-    head.textContent = cleanText(String(finished) + " finished (history)");
-    box.appendChild(head);
-    box.appendChild(
-      el("p", "Finished entries are history, not agents. They sit behind a toggle in the agents list below.", {
-        class: "desc",
-      }),
-    );
-    section.appendChild(box);
-  }
-  return section;
-}
-
-// The overview: header counts, one card per snapshot section
+// The overview: gauges first, then quota, capacity and the loop,
 // (failed sections as error cards, never hidden), then agents
 // grouped by project under the selected filter. Every node builds
 // off-DOM and the live sections swap once, so a throw below leaves
@@ -1387,6 +1330,10 @@ function attentionCard(doc, nowMs) {
     "Only items that need a human. The coordinator owns the rest.",
   );
   const items = attentionItems(doc, nowMs);
+  // The banner carries its own tone: amber when something needs a
+  // human, quiet when nothing does. The words carry the state, never
+  // colour alone.
+  section.setAttribute("class", items.length === 0 ? "card quiet" : "card alert");
   if (items.length === 0) {
     section.appendChild(el("p", "nothing needs you"));
     return section;
@@ -1403,22 +1350,24 @@ function attentionCard(doc, nowMs) {
 export function renderOverview(doc, { project, nowMs, notice }) {
   renderTabs("overview");
   renderStrip(doc, { nowMs });
-  const chips = chipsNodes(snapshotProjects(doc), project);
+  const banner = document.getElementById("attention");
+  banner.replaceChildren(attentionCard(doc, nowMs));
   const cards = [
-    attentionCard(doc, nowMs),
-    headerLine(doc.fleet_header),
-    resourcesCard(doc.resources),
+    cpuCard(doc.resources),
+    memoryCard(doc.resources),
+    diskCard(doc.disk),
     quotaCard(doc.quota, nowMs),
     capacityCard(doc.capacity),
-    diskCard(doc.disk),
     driveCard(doc.drive, nowMs),
   ];
   const agents = agentsSection(doc, project, nowMs);
   document.getElementById("detail").hidden = true;
   document.getElementById("board").hidden = true;
+  // The project picker lives inside the agents card on the overview;
+  // the pills row stays for the log view, which has no agents card.
   const nav = document.getElementById("chips");
-  nav.hidden = false;
-  nav.replaceChildren(...chips);
+  nav.hidden = true;
+  nav.textContent = "";
   const note = document.getElementById("notice");
   note.textContent = notice ? cleanText(notice) : "";
   note.hidden = !notice;
@@ -1745,6 +1694,10 @@ export function renderStopped(message) {
   }
   const nav = document.getElementById("chips");
   nav.textContent = "";
+  const banner = document.getElementById("attention");
+  if (banner !== null) {
+    banner.textContent = "";
+  }
   const note = document.getElementById("notice");
   note.textContent = "";
   note.hidden = false;

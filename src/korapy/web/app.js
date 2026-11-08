@@ -243,6 +243,7 @@ function renderCurrent(config, token) {
   }
   try {
     renderOverview(lastDoc, { project: route.project, nowMs: Date.now(), notice: route.notice });
+    restoreSelection();
   } catch {
     return false;
   }
@@ -694,6 +695,7 @@ async function tick(config, token) {
                 nowMs: seenMs,
                 notice: route.notice,
               });
+              restoreSelection();
             }
             lastDoc = reply.data;
             lastFingerprint = fingerprint;
@@ -779,6 +781,23 @@ function selectRow(index) {
   rows[selectedRow].scrollIntoView({ block: "nearest" });
 }
 
+// The poll loop rebuilds the agents table on every overview render,
+// so the keyboard selection is re-applied to the row at the kept
+// index afterwards. No scrolling: a poll must never move the page.
+function restoreSelection() {
+  const rows = agentRowNodes();
+  for (const row of rows) {
+    row.classList.remove("selected");
+  }
+  if (selectedRow < 0 || selectedRow >= rows.length) {
+    selectedRow = rows.length === 0 ? -1 : Math.max(0, Math.min(selectedRow, rows.length - 1));
+    if (selectedRow < 0) {
+      return;
+    }
+  }
+  rows[selectedRow].classList.add("selected");
+}
+
 function openSelectedRow() {
   const rows = agentRowNodes();
   const row = rows[selectedRow];
@@ -815,6 +834,18 @@ function bindViewActions(config, getToken) {
         box.focus();
         box.setSelectionRange(box.value.length, box.value.length);
       }
+    }
+  });
+  // The in-card project picker navigates by hash, so a change lands
+  // on the same overview route the pills used to link to.
+  document.getElementById("view").addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || target.id !== "project-select") {
+      return;
+    }
+    const value = target.value;
+    if (typeof value === "string" && value.startsWith("#")) {
+      window.location.hash = value;
     }
   });
   document.getElementById("view").addEventListener("click", (event) => {
@@ -1205,6 +1236,7 @@ async function boot() {
           formatAge(cachedAt, Date.now()) +
           " old; live data replaces it on the first good poll.",
       });
+      restoreSelection();
       lastProject = route.project;
     }
   } catch {

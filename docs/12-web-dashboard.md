@@ -175,25 +175,26 @@ reads in words with its `read_at` age beside it ("read 40s ago",
 plus the wait ("resets 14:00 local, in 3 d 4 h"), and a stale
 reading wears a stale meter with an on-screen note naming the
 freshness bound and the refresh verb, never color alone),
-capacity (labelled fields: total capacity of `total_cap`, the
-per-repo cap with 0 reading as "none (no per-repo limit)", live
-tickets, pending, and `by_project`, each with a one-line
-explanation), resources (labelled bars of charged against the
-host budget per dimension with both units spelled out, millicores
-as cores and MB as GB, per-project charged shares from the
-`resources` section's `host_budget`, `charged`, `by_project`
-and `measured_by_project`, plus `pressure` as text; the per-agent
-`agents` rows stay out of version one, section 11; "charged" and
-"measured" are defined on screen: what admission reserved versus
-what the kernel reports), disks (a meter plus free of total per
-path in `disk.paths`), and the dispatch loop card (`paused` with
-`pause_reason`, `last_pass_at` age, `last_exit` in words,
-`starts_today` of `max_starts_per_day` as a labelled daily
-budget, every field with a one-line help text). Below, agents
-grouped by project as tables (id, ticket as `repo#number`, role,
-runtime, state, started age from `started_at`, last-seen age, and
-`note`; the id links to the detail): live and stale rows list
-first, finished rows sit behind a collapsed per-group toggle.
+capacity (labelled fields: "Agents running X of Y allowed" from
+`live` of `total_cap`, the per-repo limit with 0 reading as
+"none (no per-repo limit)", pending, and `by_project`, each with
+a one-line explanation), CPU and memory gauge cards (the actual
+host value as a large number with a thin bar, from the
+`resources` section's `pressure`, with the share the loop
+reserved for its agents from `charged` drawn as a tick inside the
+bar and labelled as such; millicores as cores and MB as GB),
+disks (a headline with the tightest path's free of total plus a
+meter per path in `disk.paths`; no reservation is tracked for
+disk, so its bars carry no tick; the per-agent `agents` rows
+stay out of version one, section 11), and the dispatch loop card
+(`paused` with `pause_reason`, `last_pass_at` age, `last_exit`
+in words, `starts_today` of `max_starts_per_day` as a labelled
+daily budget, every field with a one-line help text). Below,
+agents grouped by project as tables (id, ticket as
+`repo#number`, role, runtime, state, running-for age from
+`started_at`, last-seen age, and `note`; the ticket links to the
+detail): live and stale rows list first, finished rows sit behind
+a collapsed per-group toggle.
 Every section carries a one-line description under its title and
 every abbreviation an inline tooltip; a section whose value is
 the `{"error": ...}` body (`snapshot.is_error_section`) renders

@@ -68,9 +68,17 @@ class Strip(unittest.TestCase):
         body = function_body(web_text("views.js"), "renderStopped")
         self.assertIn("renderStrip(null", body)
 
-    def test_fleet_card_reports_a_missing_finished_count(self):
-        body = function_body(web_text("views.js"), "headerLine")
-        self.assertIn("finished not reported", body)
+    def test_overview_has_no_separate_fleet_card(self):
+        # The strip already says "2 live, 1 stale, 1 finished", so the
+        # overview renders no second fleet card beside it.
+        body = function_body(web_text("views.js"), "renderOverview")
+        self.assertNotIn("headerLine(", body)
+        self.assertNotIn("fleet_header", body)
+
+    def test_strip_names_the_finished_count(self):
+        body = function_body(web_text("views.js"), "stripText")
+        self.assertIn("agents_finished", body)
+        self.assertIn("finished", body)
 
 
 class AgentsFirst(unittest.TestCase):
@@ -130,14 +138,23 @@ class RealGauges(unittest.TestCase):
             self.assertIn("hostGauge(", function_body(views, name))
         self.assertIn("of the host", views)
 
-    def test_host_card_labels_the_reservation(self):
-        body = function_body(web_text("views.js"), "resourcesCard")
-        self.assertIn("reserved for agents", body)
-        self.assertIn("the tick inside is the share the loop reserved", body)
+    def test_gauge_cards_label_the_reservation(self):
+        views = web_text("views.js")
+        for name, gauge in (("cpuCard", "cpuGauge("), ("memoryCard", "memoryGauge(")):
+            body = function_body(views, name)
+            self.assertIn(gauge, body)
+            self.assertIn("tick inside is the share the loop reserved", body)
+        self.assertIn("reserved for agents", views)
+
+    def test_overview_renders_cpu_memory_and_disk_gauges(self):
+        body = function_body(web_text("views.js"), "renderOverview")
+        for name in ("cpuCard(", "memoryCard(", "diskCard("):
+            self.assertIn(name, body)
+        self.assertNotIn("resourcesCard(", body)
 
     def test_disk_card_says_no_reservation_is_tracked(self):
         body = function_body(web_text("views.js"), "diskCard")
-        self.assertIn("no reservation is tracked for disk", body)
+        self.assertIn("reservation is tracked for disk, so these bars carry no tick", body)
 
 
 class HonestQuota(unittest.TestCase):
@@ -172,8 +189,11 @@ class HonestQuota(unittest.TestCase):
 class PlainLabels(unittest.TestCase):
     """Point 5: plain labels with one-line captions, tooltips for help."""
 
-    def test_host_card_replaces_resources(self):
-        self.assertIn('card("host"', web_text("views.js"))
+    def test_cpu_and_memory_cards_replace_the_host_card(self):
+        views = web_text("views.js")
+        self.assertIn('card("CPU"', views)
+        self.assertIn('card("memory"', views)
+        self.assertNotIn('card("host"', views)
 
     def test_abbreviations_keep_tooltips(self):
         views = web_text("views.js")
@@ -379,6 +399,142 @@ class FixtureFlag(unittest.TestCase):
         serve.add_parser(sub)
         args = parser.parse_args(["serve"])
         self.assertIsNone(args.snapshot_file)
+
+
+class SelectedRowSurvivesPolls(unittest.TestCase):
+    """The keyboard selection is re-applied after every overview render."""
+
+    def test_overview_renders_restore_the_selection(self):
+        app = web_text("app.js")
+        self.assertIn("function restoreSelection(", app)
+        # One restore per renderOverview site: the compare-and-skip
+        # path in renderCurrent, the snapshot poll, and the boot cache.
+        self.assertEqual(app.count("restoreSelection();"), 3)
+
+    def test_restore_does_not_scroll_the_page(self):
+        body = function_body(web_text("app.js"), "restoreSelection")
+        self.assertIn('add("selected")', body)
+        self.assertNotIn("scrollIntoView", body)
+
+
+class TopBarAndFooter(unittest.TestCase):
+    """One navigation row in the top bar; server details in a footer."""
+
+    def test_tabs_live_inside_the_top_bar(self):
+        shell = web_text("index.html")
+        self.assertLess(shell.index("<header"), shell.index('id="tabs"'))
+        self.assertLess(shell.index('id="tabs"'), shell.index("</header>"))
+
+    def test_no_dashboard_heading_card(self):
+        self.assertNotIn('id="status-card"', web_text("index.html"))
+
+    def test_server_details_live_in_a_small_footer(self):
+        shell = web_text("index.html")
+        self.assertIn('id="meta"', shell)
+        self.assertLess(shell.index('id="meta"'), shell.index('id="toasts"'))
+        footer = shell[shell.index('id="meta"') :]
+        for anchor in ('id="mode"', 'id="api"', 'id="status-line"'):
+            self.assertIn(anchor, footer)
+
+
+class AgentsVisualCentre(unittest.TestCase):
+    """The agents table leads: project select, state chips, ticket links."""
+
+    def test_agents_section_carries_a_project_select(self):
+        views = web_text("views.js")
+        self.assertIn("projectSelect(", function_body(views, "agentsSection"))
+        select = function_body(views, "projectSelect")
+        self.assertIn("project-select", select)
+        self.assertIn('"select"', select)
+
+    def test_select_navigates_by_hash(self):
+        self.assertIn("project-select", web_text("app.js"))
+
+    def test_overview_hides_the_pills_when_the_select_is_shown(self):
+        body = function_body(web_text("views.js"), "renderOverview")
+        self.assertIn("hidden = true", body)
+
+    def test_ticket_is_the_row_link(self):
+        body = function_body(web_text("views.js"), "agentRow")
+        self.assertIn("detailHash(", body)
+
+    def test_state_renders_as_a_dot_plus_text_chip(self):
+        body = function_body(web_text("views.js"), "agentRow")
+        self.assertIn("dot", body)
+        self.assertIn("state-", body)
+
+    def test_runtime_renders_as_a_badge(self):
+        body = function_body(web_text("views.js"), "agentRow")
+        self.assertIn("badge", body)
+
+    def test_running_for_replaces_started(self):
+        body = function_body(web_text("views.js"), "agentTable")
+        self.assertIn("running for", body)
+        self.assertNotIn('"started"', body)
+
+    def test_live_rows_carry_an_accent_not_a_fill(self):
+        css = web_text("app.css")
+        self.assertIn('tr[data-state="live"]', css)
+        self.assertIn("inset", css)
+
+
+class AttentionBanner(unittest.TestCase):
+    """Needs-you is a full-width banner under the strip, not a card."""
+
+    def test_banner_node_sits_under_the_strip(self):
+        shell = web_text("index.html")
+        self.assertIn('id="attention"', shell)
+        self.assertLess(shell.index('id="strip"'), shell.index('id="attention"'))
+        self.assertLess(shell.index('id="attention"'), shell.index('id="agents"'))
+
+    def test_overview_fills_the_banner(self):
+        body = function_body(web_text("views.js"), "renderOverview")
+        self.assertIn('getElementById("attention")', body)
+        self.assertIn("attentionCard(doc", body)
+
+
+class ShellProvidesEveryPollNode(unittest.TestCase):
+    """Every id the scripts look up must exist in the shell or be
+    created by the scripts. A missing node throws inside the poll
+    loop: once this dropped the connection banner and the strip
+    read failure forever with a stale page behind it."""
+
+    def test_every_lookup_resolves_to_shell_or_created_node(self):
+        import re
+
+        shell = web_text("index.html")
+        views = web_text("views.js")
+        app = web_text("app.js")
+        wanted = set(re.findall(r'getElementById\("([^"]+)"', views + app))
+        self.assertIn("banner", wanted)
+        static = set(re.findall(r'id="([^"]+)"', shell))
+        created = set(re.findall(r'setAttribute\("id", "([^"]+)"', views + app))
+        self.assertEqual(set(), wanted - static - created)
+
+    def test_shell_has_the_connection_banner(self):
+        self.assertIn('id="banner"', web_text("index.html"))
+
+
+class StripWrapsAndScale(unittest.TestCase):
+    """The strip wraps on narrow screens; one spacing scale and type scale."""
+
+    def test_strip_never_clips(self):
+        import re
+
+        css = web_text("app.css")
+        strip = re.search(r"#strip \{[^}]*\}", css)
+        self.assertIsNotNone(strip, "no #strip rule")
+        assert strip is not None
+        self.assertNotIn("nowrap", strip.group(0))
+        self.assertIn("white-space: normal", strip.group(0))
+
+    def test_base_type_is_14px_with_ten_px_radius(self):
+        css = web_text("app.css")
+        self.assertIn("font-size: 0.875rem", css)
+        self.assertIn("10px", css)
+
+    def test_content_centres_at_twelve_hundred_px(self):
+        self.assertIn("75rem", web_text("app.css"))
 
 
 if __name__ == "__main__":

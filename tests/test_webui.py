@@ -395,15 +395,15 @@ class SourceDiscipline(unittest.TestCase):
         self.assertIn("lastFingerprint = null", block)
         self.assertIn("lastDoc = null", block)
 
-    def test_project_share_tolerates_a_null_share(self):
-        # A null by_project share on a new server shape must read as
+    def test_gauge_cards_tolerate_missing_readings(self):
+        # A missing host reading on a new server shape must read as
         # unknown, not throw inside the poll loop.
         text = web_bytes("views.js").decode("utf-8")
-        start = text.find("function projectShareLine(")
-        self.assertGreater(start, -1)
-        body = text[start : text.find("\n}\n", start)]
-        self.assertIn("typeof share", body)
-        self.assertIn("unknown", body)
+        for name in ("function cpuCard(", "function memoryCard("):
+            start = text.find(name)
+            self.assertGreater(start, -1, name)
+            body = text[start : text.find("\n}\n", start)]
+            self.assertIn("not reported", body)
 
     def test_pressure_degrades_to_verbatim(self):
         # A non-numeric pressure reading must read as its raw value,
