@@ -933,6 +933,22 @@ class SessionPlanProofCase(unittest.TestCase):
                 f"no unreadable note for {name}: {notes}",
             )
 
+    def test_unreadable_live_listing_notes_unproven_only_rule(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {
+                "/sessions/acme-old": [
+                    leaf("/sessions/acme-old", "scratch-notes", mtime=NOW - 40 * DAY)
+                ]
+            },
+            entries=[finished_entry("acme", 7)],
+            live=None,
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "unproven")
+        self.assertFalse(found.safe)
+        self.assertTrue(any("unreadable" in note for note in notes), f"no unreadable note: {notes}")
+
     def test_ticket_with_a_live_entry_among_finished_ones_is_kept(self):
         candidates, _notes = session_plan(
             {"acme-old": session_rule()},
