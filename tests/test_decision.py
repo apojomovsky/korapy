@@ -580,7 +580,9 @@ class HolderFallbackTest(unittest.TestCase):
             def describe(root=None):
                 raise OSError("no lease")
 
-        self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
+        with mock.patch.dict(os.environ):
+            os.environ.pop(decisioncli.AGENT_ID_ENV, None)
+            self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
 
     def test_value_error_falls_back_to_manual(self):
         class Bad:
@@ -588,7 +590,9 @@ class HolderFallbackTest(unittest.TestCase):
             def describe(root=None):
                 raise ValueError("bad lease")
 
-        self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
+        with mock.patch.dict(os.environ):
+            os.environ.pop(decisioncli.AGENT_ID_ENV, None)
+            self.assertEqual(decisioncli._holder_and_generation(Bad(), "/tmp/x"), ("manual", 0))
 
     def test_unexpected_error_propagates(self):
         class Boom:
