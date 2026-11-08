@@ -591,7 +591,7 @@ prompt, overridable as `prompts.research` like the other roles.
 The loop treats a research ticket as done when its Findings comment
 exists. Done detection is one pure function over the ticket's
 comments (`research.findings`): the first comment whose first line
-starts with `Findings`. The comments are the only new GitHub calls
+starts with `Findings`. The comments are the only new GitHub reads
 the research finish adds: one `Tracker.comments` read per finished
 research ticket, in the pass that already lists its pulls. After the
 orphan recovery, the pass settles each claimed research row whose

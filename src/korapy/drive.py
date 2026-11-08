@@ -1560,7 +1560,7 @@ def research_comments_for(tracker_factory):
     """A per-ticket comments reader over the pass's trackers.
 
     Each call reads one ticket's comment bodies through its tracker's
-    one `comments` seam: the only new GitHub calls the research finish
+    one `comments` seam: the only new GitHub reads the research finish
     adds, spent in the pass that already lists the ticket's pulls. A
     repo with no tracker, or a failed read, raises, and the map below
     marks that ticket unreadable instead of settling blind.
