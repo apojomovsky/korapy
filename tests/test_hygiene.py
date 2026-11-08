@@ -888,6 +888,28 @@ class SessionPlanProofCase(unittest.TestCase):
         self.assertIn("live listing failed", found.proof)
         self.assertTrue(any("unreadable" in note for note in notes), f"no unreadable note: {notes}")
 
+    def test_unreadable_live_listing_notes_each_session_rule(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule(), "acme-older": session_rule()},
+            {
+                "/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)],
+                "/sessions/acme-older": [
+                    leaf("/sessions/acme-older", "acme-8", mtime=NOW - 40 * DAY)
+                ],
+            },
+            entries=[finished_entry("acme", 7), finished_entry("acme", 8)],
+            live=None,
+        )
+        self.assertEqual(len(candidates), 2)
+        for found in candidates:
+            self.assertFalse(found.safe)
+            self.assertIn("live listing failed", found.proof)
+        for name in ("acme-old", "acme-older"):
+            self.assertTrue(
+                any(f"rule {name}:" in note and "unreadable" in note for note in notes),
+                f"no unreadable note for {name}: {notes}",
+            )
+
     def test_ticket_with_a_live_entry_among_finished_ones_is_kept(self):
         candidates, _notes = session_plan(
             {"acme-old": session_rule()},
@@ -910,8 +932,8 @@ class SessionPlanProofCase(unittest.TestCase):
             finished_entry("acme", 8, ended_ago=200),
             finished_entry("acme", 9, ended_ago=2 * DAY),
         ]
-        self.assertEqual(hygiene._done_tickets(entries, NOW), disk_mod._done_tickets(entries, NOW))
-        self.assertEqual(hygiene._done_tickets(entries, NOW), {("acme", 8), ("acme", 9)})
+        self.assertFalse(hasattr(hygiene, "_done_tickets"))
+        self.assertEqual(disk_mod.done_tickets(entries, NOW), {("acme", 8), ("acme", 9)})
 
 
 class SessionPlanScopeCase(unittest.TestCase):

@@ -507,26 +507,6 @@ def _session_eligible(rule, entries, roots, notes):
     return kept, live
 
 
-def _done_tickets(entries, now):
-    """`{(repo, number)}` whose every registry entry is finished or gone.
-
-    Mirrors `disk._done_tickets`: the session proof is the `disk.py`
-    proof unchanged, and the finished-or-gone meaning itself stays in
-    `registry.status` alone.
-    """
-    states: dict[tuple, list[str]] = {}
-    for record in entries:
-        ticket = registry.ticket_of(record)
-        if ticket is None:
-            continue
-        states.setdefault(ticket, []).append(registry.status(record, now))
-    return {
-        ticket
-        for ticket, found in states.items()
-        if found and all(state in (registry.FINISHED, registry.GONE) for state in found)
-    }
-
-
 def _plan_session(rule, idle, *, now, entries, live, notes):
     """Safe rows for done, idle leaves past `retention_days`, keeps else.
 
@@ -539,7 +519,7 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
     """
     assert rule.retention_days is not None
     cutoff = now - rule.retention_days * DAY_S
-    done = _done_tickets(entries, now)
+    done = disk.done_tickets(entries, now)
     rows = []
     saw_ticket = False
     for found in idle:
@@ -602,7 +582,14 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
                 False,
             )
         )
-    if live is None and saw_ticket and not any("live units unreadable" in note for note in notes):
+    if (
+        live is None
+        and saw_ticket
+        and not any(
+            note.startswith(f"rule {rule.name}:") and "live units unreadable" in note
+            for note in notes
+        )
+    ):
         notes.append(f"rule {rule.name}: live units unreadable: session candidates are kept")
     return rows
 
