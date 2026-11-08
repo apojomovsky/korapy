@@ -50,15 +50,20 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unheld, unblocked, with no open linked pull, claimed or not:
-    a missing or non-string title reads as empty and a non-tuple labels
-    value reads as none, so odd data selects or skips without raising.
-    Unreadable pulls (None) are never selected: a ticket whose links
-    the pass could not read fails closed here, as in the gate. A
-    research row skips both pulls checks, as in the gate: it finishes
-    as a Findings comment and never waits on a pull request. A
-    researched row is never selected: its Findings comment already
-    finished it, so selecting it would research it twice.
+    Open, unheld, unblocked, with no open or in-scope merged linked
+    pull, claimed or not: a missing or non-string title reads as empty
+    and a non-tuple labels value reads as none, so odd data selects or
+    skips without raising. Unreadable pulls (None) are never selected:
+    a ticket whose links the pass could not read fails closed here, as
+    in the gate. An in-scope merged linked pull means the work landed
+    since the current claim start (or with no claim behind it), so the
+    ticket stays withdrawn; a pull merged before the claim start
+    reads as landed-before-this-round and still selects, as does a
+    pull closed without merging. A research row skips both pulls
+    checks, as in the gate: it finishes as a Findings comment and
+    never waits on a pull request. A researched row is never selected:
+    its Findings comment already finished it, so selecting it would
+    research it twice.
     """
     if row.state != "open":
         return False
@@ -80,6 +85,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     if tracker.RESEARCH in labels:
         return True
     if row.pulls is None:
+        return False
+    if eligibility.merged_pull(row) is not None:
         return False
     pulls = row.pulls if isinstance(row.pulls, (tuple, list)) else ()
     return all(getattr(pull, "state", "") != "open" for pull in pulls)

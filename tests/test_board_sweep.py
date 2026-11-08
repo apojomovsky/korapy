@@ -103,7 +103,7 @@ class FakeBoardTracker:
             raise AssertionError(f"unexpected poll cursor {after!r}")
         return list(self._items), None
 
-    def pulls_index(self, repo, max_calls):
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
         self.pulls_calls.append((repo, max_calls))
         if self.pulls_error is not None:
             raise self.pulls_error
@@ -535,7 +535,10 @@ class SharedPullsAccessorTest(SweepCase):
 
     def test_plan_with_an_open_card_lists_pulls_once(self):
         self.seed(7)
-        tracker = FakeBoardTracker([card(7, status="Available")], pulls={(REPO, 7): [object()]})
+        tracker = FakeBoardTracker(
+            [card(7, status="Available")],
+            pulls={(REPO, 7): [reading(repo=REPO, number=9, kind="pr")]},
+        )
         code = self.sweep([entry()], [tracker], plan=True)
         self.assertEqual(code, 1)
         self.assertIn(f"{REPO}#7: state open, set Status to 'In review'", self.out.getvalue())

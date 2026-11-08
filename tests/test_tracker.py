@@ -140,8 +140,12 @@ class FakeTracker:
                 raise tracker.TrackerError(f"page error at index {index}")
             yield item
 
-    def pulls_index(self, repo, max_calls):
-        """Programmed per-repo open-pulls index: {issue: [TrackerItem]}."""
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
+        """Programmed per-repo open- and merged-pulls index: {issue: [TrackerItem]}.
+
+        The cutoff is accepted and ignored: the program states the
+        index outright, so every test sees exactly what it filed.
+        """
         self.calls.append(("pulls_index", repo, max_calls))
         if repo in self.index_errors:
             raise tracker.TrackerError(self.index_errors[repo])
@@ -299,6 +303,14 @@ class ItemTest(unittest.TestCase):
         found = self.adapter.item("acme/app", 9)
         self.assertTrue(found.from_fork)
         self.assertTrue(board.is_external(found.author, ["alice"], found.from_fork))
+
+    def test_a_closed_pull_request_in_the_feed_reads_closed(self):
+        payload = item_payload(9, state="closed")
+        payload["pull_request"] = {"url": "https://example.com/pulls/9"}
+        self.gh.add("repos/acme/app/issues/9", payload)
+        self.gh.add("repos/acme/app/pulls/9", pull_payload(9, fork=False))
+        found = self.adapter.item("acme/app", 9)
+        self.assertEqual((found.kind, found.state), ("pr", "closed"))
 
     def test_pull_payload_is_cached_per_tracker(self):
         payload = item_payload(9)
@@ -923,16 +935,24 @@ def pr_payload(number, body, fork=False, **over):
 
 
 class PullsIndexTest(unittest.TestCase):
-    """One open-pulls listing per repo, indexed by linked ticket. Fakes only."""
+    """One open- plus recent-closed-pulls listing per repo, by ticket.
 
-    LISTING = "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    Fakes only. The open pull requests always list fully; the closed
+    pull requests list newest first only when `merged_since` is given,
+    stopping at the first page older than the cutoff, so a long pull
+    history costs a bounded number of calls.
+    """
+
+    OPEN = "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    CLOSED = "repos/acme/app/pulls?state=closed&sort=updated&direction=desc&per_page=100"
 
     def setUp(self):
         self.gh = FakeRun()
         self.adapter = ghtracker.GithubTracker(self.gh)
 
-    def listing(self, pulls):
-        self.gh.add(self.LISTING, pulls)
+    def listing(self, pulls, state="open", page=1):
+        base = self.OPEN if state == "open" else self.CLOSED
+        self.gh.add(base if page == 1 else base + f"&page={page}", pulls)
 
     def numbers(self, found, number):
         return sorted(item.number for item in found.by_issue.get(number, ()))
@@ -988,23 +1008,33 @@ class PullsIndexTest(unittest.TestCase):
         found = self.adapter.pulls_index("acme/app", 10)
         self.assertEqual(self.numbers(found, 7), [9])
 
+    def test_a_closed_payload_in_the_open_listing_is_skipped(self):
+        self.listing(
+            [
+                pr_payload(9, "Closes #7"),
+                pr_payload(10, "Closes #7", state="closed"),
+            ]
+        )
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+
     def test_the_index_costs_no_per_pr_call(self):
         self.listing([pr_payload(9, "Closes #7"), pr_payload(10, "Closes #8")])
         found = self.adapter.pulls_index("acme/app", 10)
         self.assertEqual(self.numbers(found, 7), [9])
         self.assertEqual(self.numbers(found, 8), [10])
-        self.assertEqual(self.gh.paths(), [self.LISTING])
+        self.assertEqual(self.gh.paths(), [self.OPEN])
 
     def test_a_listing_failure_is_a_tracker_error(self):
-        self.gh.fail(self.LISTING)
+        self.gh.fail(self.OPEN)
         with self.assertRaises(tracker.TrackerError) as ctx:
             self.adapter.pulls_index("acme/app", 10)
         self.assertEqual(ctx.exception.exit_code, 3)
 
-    def test_pages_combine(self):
+    def test_open_pages_combine(self):
         first = [pr_payload(n, f"Closes #{700 + n}") for n in range(100, 200)]
-        self.gh.routes[self.LISTING] = json.dumps(first)
-        self.gh.routes[self.LISTING + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
+        self.gh.routes[self.OPEN] = json.dumps(first)
+        self.gh.routes[self.OPEN + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
         found = self.adapter.pulls_index("acme/app", 10)
         self.assertEqual(self.numbers(found, 7), [9])
         self.assertEqual(self.numbers(found, 806), [106])
@@ -1013,12 +1043,135 @@ class PullsIndexTest(unittest.TestCase):
 
     def test_an_exhausted_budget_stops_with_an_incomplete_index(self):
         first = [pr_payload(n, f"Closes #{700 + n}") for n in range(100, 200)]
-        self.gh.routes[self.LISTING] = json.dumps(first)
-        self.gh.routes[self.LISTING + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
+        self.gh.routes[self.OPEN] = json.dumps(first)
+        self.gh.routes[self.OPEN + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
         found = self.adapter.pulls_index("acme/app", 1)
         self.assertEqual(found.calls, 1)
         self.assertFalse(found.complete)
-        self.assertEqual(self.gh.paths(), [self.LISTING])
+        self.assertEqual(self.gh.paths(), [self.OPEN])
+
+    def test_no_live_claim_lists_no_closed_pull(self):
+        self.listing([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN])
+
+    def test_a_merged_pr_is_indexed_as_merged(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO1)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED])
+
+    def test_the_merge_time_rides_the_indexed_pull(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO1)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        (item,) = found.by_issue[7]
+        self.assertEqual(item.merged_at, float(T1))
+        self.assertEqual(item.updated_at, float(T0))
+
+    def test_an_unmerged_pull_carries_no_merge_time(self):
+        self.listing([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        (item,) = found.by_issue[7]
+        self.assertEqual(item.merged_at, 0.0)
+
+    def test_a_bad_merge_time_is_a_tracker_error(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at="soon")],
+            state="closed",
+        )
+        with self.assertRaises(tracker.TrackerError):
+            self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+
+    def test_a_merged_flag_pr_is_indexed_as_merged(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged=True)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+
+    def test_a_closed_unmerged_pr_is_not_indexed(self):
+        self.listing([], state="open")
+        self.listing([pr_payload(9, "Closes #7", state="closed")], state="closed")
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertNotIn(7, found.by_issue)
+        self.assertTrue(found.complete)
+
+    def test_a_closed_pull_older_than_the_cutoff_is_not_indexed(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO0)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T1))
+        self.assertNotIn(7, found.by_issue)
+        self.assertTrue(found.complete)
+
+    def test_a_full_but_old_closed_page_stops_paging(self):
+        self.listing([], state="open")
+        history = [
+            pr_payload(n, f"Closes #{700 + n}", state="closed", merged_at=ISO0)
+            for n in range(100, 200)
+        ]
+        self.listing(history, state="closed")
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T1))
+        self.assertEqual(found.by_issue, {})
+        self.assertEqual(found.calls, 2)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED])
+
+    def test_closed_pages_stay_oldest_first(self):
+        self.listing([], state="open")
+        self.listing(
+            [
+                pr_payload(11, "Closes #7", state="closed", updated_at=ISO1, merged_at=ISO1),
+                pr_payload(10, "Closes #7", state="closed", merged_at=ISO0),
+            ],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [item.number for item in found.by_issue[7]],
+            [10, 11],
+        )
+
+    def test_a_recent_closed_page_continues(self):
+        self.listing([], state="open")
+        recent = [
+            pr_payload(n, "Closes #7", state="closed", updated_at=ISO1, merged_at=ISO1)
+            for n in range(200, 100, -1)
+        ]
+        self.listing(recent, state="closed")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO0)],
+            state="closed",
+            page=2,
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [item.number for item in found.by_issue[7]],
+            [9] + list(range(101, 201)),
+        )
+        self.assertEqual(found.calls, 3)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED, self.CLOSED + "&page=2"])
 
 
 if __name__ == "__main__":
