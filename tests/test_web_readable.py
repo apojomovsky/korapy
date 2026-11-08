@@ -309,7 +309,7 @@ class VisualPass(unittest.TestCase):
         # Ticket 659 split the gauge figures (short figure plus small
         # detail line, and durations for running-for) and the cap with
         # it: 160 KB total. Ticket 651 adds the data panels (derived
-        # states, plan band, honest quota, peek caption, sort menu,
+        # states, plan band, honest quota, sort menu,
         # placeholders) and the cap with it: 170 KB total, still no
         # framework, no build step, no images.
         total = sum(

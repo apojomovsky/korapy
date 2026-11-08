@@ -59,6 +59,16 @@ class AgentState(unittest.TestCase):
             "working",
         )
 
+    def test_substrings_are_not_signals(self):
+        for note in (
+            "task sync running",
+            "latest deploy",
+            "rebuild image",
+            "contest results",
+        ):
+            got = dashboard.agent_state(entry(note=note), "live", T0)
+            self.assertEqual(got["derived"], "working", note)
+
     def test_idle_when_note_empty_and_old(self):
         got = dashboard.agent_state(entry(note="", last_seen=T0 - 400), "live", T0)
         self.assertEqual(got["derived"], "idle")
@@ -152,6 +162,17 @@ class HonestQuota(unittest.TestCase):
         )
         self.assertEqual(got["source"], "estimate")
 
+    def test_bare_ok_state_reads_unknown(self):
+        got = dashboard.quota_honesty({"state": "ok"})
+        self.assertEqual(got["source"], "unknown")
+        self.assertEqual(got["error_trimmed"], "unknown")
+
+    def test_ok_with_a_reading_reads_measured(self):
+        got = dashboard.quota_honesty(
+            {"state": "ok", "windows": None, "error": None, "read_at": T0 - 10}
+        )
+        self.assertEqual(got["source"], "measured")
+
     def test_unknown_when_no_provider(self):
         got = dashboard.quota_honesty(None)
         self.assertEqual(got["source"], "unknown")
@@ -197,13 +218,13 @@ class Attention(unittest.TestCase):
 
 class PlanBand(unittest.TestCase):
     def test_unknown_when_drive_missing(self):
-        got = dashboard.plan_projection(None, None, T0)
+        got = dashboard.plan_projection(None, T0)
         self.assertEqual(got["state"], "unknown")
         self.assertEqual(got["next"], "unknown")
 
     def test_names_next_pass_from_last_pass(self):
         drive = {"last_pass_at": T0 - 100, "starts_remaining": 2, "skipped_by_reason": {}}
-        got = dashboard.plan_projection(drive, {"live": 1}, T0)
+        got = dashboard.plan_projection(drive, T0)
         self.assertEqual(got["state"], "ready")
         self.assertTrue(got["next_pass_in_s"] is not None and got["next_pass_in_s"] >= 0)
         self.assertTrue(len(got["next"]) >= 1)
@@ -214,7 +235,7 @@ class PlanBand(unittest.TestCase):
             "starts_remaining": 2,
             "skipped_by_reason": {"quota": 3},
         }
-        got = dashboard.plan_projection(drive, {"live": 1}, T0)
+        got = dashboard.plan_projection(drive, T0)
         self.assertIn("quota", got["waits"])
 
     def test_several_skips_sort_and_cap_the_next_list(self):
@@ -223,10 +244,20 @@ class PlanBand(unittest.TestCase):
             "starts_remaining": 5,
             "skipped_by_reason": {"quota": 3, "cap": 1, "hold": 2, "lock": 1},
         }
-        got = dashboard.plan_projection(drive, {"live": 1}, T0)
+        got = dashboard.plan_projection(drive, T0)
         self.assertEqual(got["waits"], ["cap", "hold", "lock", "quota"])
         self.assertEqual(len(got["next"]), 3)
         self.assertEqual([item["waits"] for item in got["next"]], ["cap", "hold", "lock"])
+
+    def test_no_starts_left_means_empty_next(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 0,
+            "skipped_by_reason": {"quota": 3},
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"], [])
 
 
 class LocalTime(unittest.TestCase):

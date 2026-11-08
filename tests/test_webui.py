@@ -332,8 +332,8 @@ class SourceDiscipline(unittest.TestCase):
         # figure plus small detail line, and durations for
         # running-for) and the total with it: 160 KB, still no
         # framework, no build step, no images. Ticket 651 adds the
-        # data panels (derived states, plan band, honest quota, peek
-        # caption, sort menu, placeholders) and the caps with it:
+        # data panels (derived states, plan band, honest quota,
+        # sort menu, placeholders) and the caps with it:
         # 82 KB a file, 170 KB total.
         total = 0
         for name in WEB_FILES:

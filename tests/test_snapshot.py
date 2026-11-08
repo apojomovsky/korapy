@@ -306,7 +306,6 @@ class FullDocument(unittest.TestCase):
                     "state": "unknown",
                     "needs_decision": "unknown",
                     "ready_to_merge": "unknown",
-                    "doctor_failing": "unknown",
                     "coordinator_handled": "unknown",
                     "items": "unknown",
                 },
@@ -724,6 +723,32 @@ class ResourcesSection(unittest.TestCase):
                 "notes",
             ],
         )
+
+    def test_rows_time_against_the_given_clock(self):
+        from korapy import dashboard
+
+        real = dashboard.agent_state
+        moments = []
+
+        def spy(entry, state, now):
+            moments.append(now)
+            return real(entry, state, now)
+
+        rows = default_rows()
+        with mock.patch.object(dashboard, "agent_state", spy):
+            snapshot.resources_section(
+                rows,
+                HOST,
+                doc_limits(),
+                doc_pressure(),
+                [],
+                None,
+                live_by_owner=live_listing(rows),
+                project_names=names_of(rows),
+                now=T0,
+            )
+        self.assertTrue(moments)
+        self.assertTrue(all(moment == T0 for moment in moments))
 
     def test_no_budget_still_reports_charged_and_pressure(self):
         section = snapshot.resources_section(

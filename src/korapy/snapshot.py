@@ -441,11 +441,7 @@ def build(
     except Exception as exc:  # noqa: BLE001 - the panel never breaks the document
         attention = {"state": "error", "error": error_text(exc)}
     try:
-        plan = dashboard.plan_projection(
-            drive_view,
-            capacity if not is_error_section(capacity) else None,
-            now,
-        )
+        plan = dashboard.plan_projection(drive_view, now)
     except Exception as exc:  # noqa: BLE001 - the panel never breaks the document
         plan = {"state": "error", "error": error_text(exc)}
     return {
@@ -773,6 +769,7 @@ def collect_kwargs() -> dict:
                 default_measured,
                 live_by_owner=listing,
                 project_names=[entry.name for entry in registered],
+                now=now,
             )
         except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
             resources_view = exc

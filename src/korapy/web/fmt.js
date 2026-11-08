@@ -145,10 +145,33 @@ export function formatIdle(value) {
 }
 
 // A stamp carrying the machine's local offset, sliced for display:
-// the server stamps the offset, the page only formats it in local
-// wall-clock time. Unknown stays unknown, never a converted guess.
+// the server stamps the offset, the page only slices its wall-clock
+// fields. A string stamp never round-trips through Date: that would
+// render it in the viewer's zone instead of the machine's. Unknown
+// stays unknown, never a converted guess.
 export function formatLocalTime(value) {
-  const ms = typeof value === "string" ? parseIso(value) : parseEpoch(value);
+  if (value === null || value === undefined) {
+    return "unknown";
+  }
+  if (typeof value === "string") {
+    const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(value);
+    if (match === null) {
+      return value;
+    }
+    return (
+      match[1].slice(2) +
+      "-" +
+      match[2] +
+      "-" +
+      match[3] +
+      " " +
+      match[4] +
+      ":" +
+      match[5] +
+      " local"
+    );
+  }
+  const ms = parseEpoch(value);
   if (ms === null || ms === undefined) {
     return "unknown";
   }

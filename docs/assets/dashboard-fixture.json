@@ -215,7 +215,6 @@
   "state": "ready",
   "needs_decision": [],
   "ready_to_merge": [],
-  "doctor_failing": "unknown",
   "coordinator_handled": 0,
   "items": []
  },

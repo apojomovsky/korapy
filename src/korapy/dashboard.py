@@ -6,6 +6,7 @@ source is missing. No subprocess, no network, no file reads here; the
 snapshot layer owns collecting, this module owns deriving.
 """
 
+import re as _re
 import time as _time
 
 #: Derived agent states, most urgent first. The order is the panel's
@@ -28,6 +29,21 @@ URGENCY = {name: rank for rank, name in enumerate(DERIVED)}
 
 #: Quota error text shown on screen, trimmed to this many characters.
 ERROR_TRIM = 120
+
+#: Note-signal words, matched as whole words: substrings misclassify
+#: notes like "task sync running" (which holds "ask") or "latest
+#: deploy" (which holds "test"). `\w*` keeps inflections ("tests",
+#: "asking", "building") matching while their carriers do not.
+_SIGNAL = {
+    name: _re.compile(r"\b" + name + r"\w*\b")
+    for name in ("blocked", "waiting", "ask", "question", "test", "build", "review")
+}
+
+
+def _has(signal, text):
+    """Whether the whole-word `signal` appears in `text`."""
+    return _SIGNAL[signal].search(text) is not None
+
 
 #: Seconds between drive passes (`korapy-drive.timer` `*:0/5`): the one
 #: source for the plan band's "next pass in N".
@@ -80,15 +96,15 @@ def agent_state(entry, state, now):
         derived = "failed" if outcome == "failed" else "finished"
     elif state == "stale":
         derived = "stalled"
-    elif "blocked" in lowered or "waiting" in lowered:
+    elif _has("blocked", lowered) or _has("waiting", lowered):
         derived = "blocked"
-    elif "?" in text or "ask" in lowered or "question" in lowered:
+    elif "?" in text or _has("ask", lowered) or _has("question", lowered):
         derived = "asking"
-    elif "test" in lowered:
+    elif _has("test", lowered):
         derived = "testing"
-    elif "build" in lowered:
+    elif _has("build", lowered):
         derived = "building"
-    elif "review" in lowered:
+    elif _has("review", lowered):
         derived = "review"
     elif isinstance(entry, dict) and entry.get("role") == "reviewer":
         derived = "review"
@@ -117,10 +133,11 @@ def quota_honesty(provider):
 
     `source` reads `measured` for fresh windows, `estimate` for stale
     ones (old numbers, labelled as such) and when the panel would
-    otherwise show a guess, and `unknown` when there is no provider at
-    all. `read_failed` names a recorded read failure; `error_trimmed`
-    carries its text trimmed to `ERROR_TRIM`, or `"unknown"` when
-    nothing was recorded.
+    otherwise show a guess, and `unknown` when there is no reading at
+    all: a bare `ok` state with no windows and no `read_at` reads
+    `unknown`, never a measured zero. `read_failed` names a recorded
+    read failure; `error_trimmed` carries its text trimmed to
+    `ERROR_TRIM`, or `"unknown"` when nothing was recorded.
     """
     if not isinstance(provider, dict):
         return {"source": "unknown", "read_failed": False, "error_trimmed": "unknown"}
@@ -129,7 +146,11 @@ def quota_honesty(provider):
     read_failed = isinstance(error, str) and bool(error)
     if isinstance(windows, dict) and windows:
         source = "estimate" if provider.get("stale") else "measured"
-    elif provider.get("state") in ("ok", "low", "exhausted"):
+    elif provider.get("read_at") is not None and provider.get("state") in (
+        "ok",
+        "low",
+        "exhausted",
+    ):
         source = "measured"
     elif read_failed or provider.get("read_at") is not None:
         source = "estimate"
@@ -181,16 +202,15 @@ def attention(events):
     or the exception reading them raised. `needs_decision` carries the
     question rows, `ready_to_merge` the held-merge rows, each with its
     ref and one line of evidence. `coordinator_handled` counts the rows
-    the coordinator owns (`coordinator-review`). `doctor_failing`
-    reads `"unknown"`: the doctor has no panel reader yet (a later
-    ticket adds it; the panel says so instead of guessing).
+    the coordinator owns (`coordinator-review`). Failing doctor rows
+    are not part of this band: they need their own reader, which a
+    later change adds.
     """
     if events is None:
         return {
             "state": "unknown",
             "needs_decision": "unknown",
             "ready_to_merge": "unknown",
-            "doctor_failing": "unknown",
             "coordinator_handled": "unknown",
             "items": "unknown",
         }
@@ -199,7 +219,6 @@ def attention(events):
             "state": "error",
             "needs_decision": [],
             "ready_to_merge": [],
-            "doctor_failing": "unknown",
             "coordinator_handled": 0,
             "items": [],
             "error": str(events) or repr(events),
@@ -226,18 +245,19 @@ def attention(events):
         "state": "ready",
         "needs_decision": needs,
         "ready_to_merge": merges,
-        "doctor_failing": "unknown",
         "coordinator_handled": handled,
         "items": list(needs) + list(merges),
     }
 
 
-def plan_projection(drive_view, capacity_view, now):
-    """The plan band from the drive and capacity sections (pure).
+def plan_projection(drive_view, now):
+    """The plan band from the drive section (pure).
 
     `next` names the starts the loop would make next: one row per free
     slot while the daily budget holds, each carrying the reason it
     waits (the top skip codes from the last pass, else `slot free`).
+    With no starts left the list is empty, so the panel reads the
+    empty state instead of naming starts that can never start.
     `next_pass_in_s` counts down from the last pass on the 5-minute
     timer cadence. A missing drive section reads `unknown`; a broken
     one reads `error`. Neither invents candidates: with no pass data
@@ -270,11 +290,13 @@ def plan_projection(drive_view, capacity_view, now):
     remaining = max(0, remaining)
     skipped = drive_view.get("skipped_by_reason") or {}
     waits = sorted(skipped) if isinstance(skipped, dict) else []
-    if remaining and not waits:
+    if not remaining:
+        nxt = []
+    elif not waits:
         nxt = [{"what": "start", "waits": "slot free"} for _ in range(min(remaining, 3))]
     else:
         nxt = [{"what": "start", "waits": wait} for wait in waits[:3]]
-        if remaining and len(nxt) < min(remaining, 3):
+        if len(nxt) < min(remaining, 3):
             nxt += [
                 {"what": "start", "waits": "slot free"} for _ in range(min(remaining, 3) - len(nxt))
             ]

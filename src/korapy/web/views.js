@@ -1047,23 +1047,17 @@ export function sortAgentRows(rows, mode) {
     return list;
   }
   if (mode === "project") {
-    const keyOf = (row) => [
-      (row && row.project) || "",
-      (row && row.repo) || "",
-      row && row.number !== null && row.number !== undefined ? 0 : 1,
-      (row && row.number) || 0,
-      (row && row.id) || "",
-    ];
+    // Alphabetical projects, server order within each: the sort is
+    // stable, so rows keep the server's urgency order inside a
+    // project and the tiebreak lives server-side only.
     list.sort((a, b) => {
-      const ka = keyOf(a);
-      const kb = keyOf(b);
-      for (let i = 0; i < ka.length; i++) {
-        if (ka[i] < kb[i]) {
-          return -1;
-        }
-        if (ka[i] > kb[i]) {
-          return 1;
-        }
+      const pa = (a && a.project) || "";
+      const pb = (b && b.project) || "";
+      if (pa < pb) {
+        return -1;
+      }
+      if (pa > pb) {
+        return 1;
       }
       return 0;
     });
@@ -1513,9 +1507,9 @@ export function attentionItems(doc, nowMs) {
   if (pressure !== null && pressure.saturated) {
     items.push("the host is saturated: " + pressureText(pressure));
   }
-  // The attention panel: built from the store and the doctor, never
-  // a GitHub call. Unknown reads unknown; a missing panel still
-  // reports that it could not be read.
+  // The attention panel: built from the event store the page already
+  // polls, never a GitHub call. Unknown reads unknown; a missing
+  // panel still reports that it could not be read.
   const panel = doc && !isErrorSection(doc.attention) ? doc.attention : null;
   if (panel === null || panel === undefined) {
     items.push("the attention state could not be read");
@@ -1604,14 +1598,6 @@ function attentionCard(doc, nowMs) {
       }),
     );
     section.appendChild(fold);
-  }
-  // The doctor has no panel reader yet: the band says so instead of
-  // guessing at failing rows.
-  const panel = doc && !isErrorSection(doc.attention) ? doc.attention : null;
-  if (panel !== null && panel !== undefined && panel.doctor_failing === "unknown") {
-    section.appendChild(
-      el("p", "doctor checks: not reported yet", { class: "desc dim" }),
-    );
   }
   return section;
 }
@@ -1799,13 +1785,6 @@ export function renderDetail(row, { nowMs }) {
   document.getElementById("board").hidden = true;
   const back = document.getElementById("detail-back");
   back.setAttribute("href", backHref);
-  // The peek pane is read-only and bounded: the server caps the
-  // lines, the page never edits them.
-  if (ticketed) {
-    lines.push(
-      el("p", "peek: read-only, bounded by the server", { class: "desc dim" }),
-    );
-  }
   document.getElementById("detail-fields").replaceChildren(...lines);
   document.getElementById("tail-controls").hidden = !ticketed;
   document.getElementById("tail").hidden = !ticketed;
