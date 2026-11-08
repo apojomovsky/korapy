@@ -64,7 +64,7 @@ def _verb(fn):
 
 
 def _role_arg(p):
-    p.add_argument("role", choices=list(prompts.ROLES), help="worker, reviewer or triage")
+    p.add_argument("role", choices=list(prompts.ROLES), help="worker, reviewer, triage or research")
     p.add_argument("--ops", default=None, help="the ops root (default: nearest korapy.toml upward)")
 
 

@@ -79,8 +79,10 @@ def eligible(rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]: ..
 `repo`, `number`, `title`, `labels`, `priority`, `state`, `agent`,
 `status`, `external`, and linked pull requests with their check and
 review state as data. `StartRequest` names `repo`, `number` and `kind`
-(`start`, `resume`, `review`, `fix`) and may carry a project-local
-weight used only to order within that project.
+(`start`, `resume`, `review`, `fix`, `research`) and may carry a project-local
+weight used only to order within that project. `research` is a
+research question (see section 5): it claims and launches like
+`start`, but finishes as a Findings comment.
 
 The policy module lives in the project's own ops root, beside
 `korapy.toml`: the registration above loads `blue_policy.py` from
@@ -152,9 +154,10 @@ registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
-`blocked_by` and no `blocked` label), and with no open linked pull
+`blocked_by` and no `blocked` label), not already `researched`, and with no open linked pull
 request, claimed or not: in-flight rows stay requested so the loop
-never withdraws them by omission. Weight is the board priority rank,
+never withdraws them by omission. A research ticket is selected like
+any other, but asks for kind `research` (see section 5). Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
@@ -573,6 +576,43 @@ re-check below.
   ticket with a live unit keeps its claim instead, whatever the
   eligibility says. A failed decision write keeps the claim for a
   later pass.
+
+Research tickets: some tickets are questions, not changes, and finish
+as a written finding with no pull request. A ticket carrying the
+`research` label starts with the research worker prompt (read-only on
+the repository, writes no commits, posts one comment on the ticket
+whose first line starts with `Findings`). Eligibility selects research
+tickets like any other, but asks for kind `research` (`basic` maps the
+label; `researched` rows are never selected, since answering twice is
+not work). The kind claims and launches exactly like `start` and
+counts toward the same caps; the launch runs the `research` role
+prompt, overridable as `prompts.research` like the other roles.
+
+The loop treats a research ticket as done when its Findings comment
+exists. Done detection is one pure function over the ticket's
+comments (`research.findings`): the first comment whose first line
+starts with `Findings`. The comments are the only new GitHub calls
+the research finish adds: one `Tracker.comments` read per finished
+research ticket, in the pass that already lists its pulls. After the
+orphan recovery, the pass settles each claimed research row whose
+finished registry entry names the research role behind the current
+holder: with findings, it adds `researched` through the label seam
+and releases the claim (the agent and status clears flow through the
+mirror as usual); without findings, it releases bare, so the ticket
+is startable again instead of waiting on a reviewer that never comes.
+A failed label write keeps the claim for a later pass, never released
+unlabeled; unreadable comments keep it too. A row with a live unit
+keeps its claim whatever the comments say.
+
+A settled research ticket never takes a reviewer: the gate refuses a
+`review` requested on a research row, a finished research holder
+never takes over as one, and the research rows skip both linked-pull
+checks, so the finish never waits for a pull request. A finding
+addressed to the maintainer is reported as an attention item on the
+dashboard (a `research` event in the project's queue, carrying the
+finding's first line) until acknowledged: re-reporting an acked
+finding does not reopen it. A stuck research worker restarts with the
+research prompt, like any other start.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 

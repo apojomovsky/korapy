@@ -538,6 +538,7 @@ class ProtocolShapeTests(unittest.TestCase):
                 "pulls_index",
                 "write",
                 "comment",
+                "comments",
                 "add_label",
                 "ensure_labels",
                 "missing_labels",

@@ -54,13 +54,17 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     a missing or non-string title reads as empty and a non-tuple labels
     value reads as none, so odd data selects or skips without raising.
     Unreadable pulls (None) are never selected: a ticket whose links
-    the pass could not read fails closed here, as in the gate.
+    the pass could not read fails closed here, as in the gate. A
+    researched row is never selected: its Findings comment already
+    finished it, so selecting it would research it twice.
     """
     if row.state != "open":
         return False
     if row.external:
         return False
     labels = row.labels if isinstance(row.labels, tuple) else ()
+    if tracker.RESEARCHED in labels:
+        return False
     if any(label in HOLD_LABELS for label in labels):
         return False
     title = row.title if isinstance(row.title, str) else ""
@@ -77,18 +81,28 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     return all(getattr(pull, "state", "") != "open" for pull in pulls)
 
 
+def _kind(row: eligibility.TicketRow) -> str:
+    """The request kind for a selectable row: research for questions. Pure."""
+    labels = row.labels if isinstance(row.labels, tuple) else ()
+    if tracker.RESEARCH in labels:
+        return "research"
+    return "start"
+
+
 def basic(rows: Sequence[eligibility.TicketRow], *, now: float) -> list[eligibility.StartRequest]:
     """One start request per startable ticket, in row order. Pure.
 
     `now` is accepted for the eligibility contract and unused: whether a
-    ticket is startable depends only on the rows. Equal weights keep row
+    ticket is startable depends only on the rows. A research ticket is
+    selected like any other, but asks for kind `research` so the loop
+    starts it with the research worker prompt. Equal weights keep row
     order; the drive loop breaks those ties by (repo, number).
     """
     return [
         eligibility.StartRequest(
             repo=row.repo,
             number=row.number,
-            kind="start",
+            kind=_kind(row),
             weight=_weight(row.priority),
         )
         for row in rows

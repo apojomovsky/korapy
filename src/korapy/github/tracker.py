@@ -12,7 +12,7 @@ import re
 from korapy import tracker as iface
 from korapy.github import forge as ghforge
 from korapy.github.gh import body_linked_issue_refs, is_rate_limited, retry_after_s
-from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
+from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX, RESEARCHED
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
@@ -25,6 +25,8 @@ _BOOTSTRAP_COLORS = {
     "needs-triage": "fbca04",
     "needs-decision": "d93f0b",
     "hold": "5319e7",
+    "research": "1d76db",
+    "researched": "0e8a16",
     "priority:urgent": "b60205",
     "priority:high": "d93f0b",
     "priority:normal": "fbca04",
@@ -406,16 +408,37 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
 
-    def add_label(self, repo: str, number: int, label: str) -> None:
-        """Add the one decision label through the issues-labels endpoint.
+    def comments(self, repo: str, number: int) -> list[str]:
+        """The comment bodies on an issue, oldest first, through the API.
 
-        Only ``NEEDS_DECISION`` is accepted; there is no general label
-        write, so any other name is refused with ``ValueError`` and no
-        ``gh`` call runs. A failed call raises ``TrackerError`` through
-        ``_write_error``.
+        Pages until a short page ends the list, like the feed. A
+        missing or malformed page is a ``TrackerError``, never a
+        partial list: a truncated read would miss the Findings comment
+        the research finish looks for.
         """
-        if label != NEEDS_DECISION:
-            raise ValueError(f"refusing to add non-decision label {label!r}")
+        base = f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}"
+        bodies = []
+        page = 1
+        while True:
+            entries = self._page(base if page == 1 else f"{base}&page={page}")
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("body"), str):
+                    raise _fail(f"bad comment {entry!r} on {repo}#{number}")
+                bodies.append(entry["body"])
+            if len(entries) < PER_PAGE:
+                return bodies
+            page += 1
+
+    def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add one loop-owned label through the issues-labels endpoint.
+
+        Only ``NEEDS_DECISION`` and ``RESEARCHED`` are accepted; there
+        is no general label write, so any other name is refused with
+        ``ValueError`` and no ``gh`` call runs. A failed call raises
+        ``TrackerError`` through ``_write_error``.
+        """
+        if label not in (NEEDS_DECISION, RESEARCHED):
+            raise ValueError(f"refusing to add non-loop label {label!r}")
         try:
             self._run(
                 [

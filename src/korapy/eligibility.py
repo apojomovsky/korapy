@@ -40,7 +40,10 @@ from typing import Any, NamedTuple
 from korapy import accounts, board
 
 #: The request kinds a policy may return (section 2 of `04-dispatch-loop.md`).
-KINDS = ("start", "resume", "review", "fix")
+#: `research` starts a research ticket with the research worker prompt;
+#: it claims and launches like `start` but finishes as a Findings
+#: comment, never a pull request.
+KINDS = ("start", "resume", "review", "fix", "research")
 
 
 class EligibilityError(ValueError):

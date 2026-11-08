@@ -72,7 +72,13 @@ class AttentionBand(unittest.TestCase):
 
     def test_attention_items_cover_the_panel(self):
         body = function_body(web_text("views.js"), "attentionItems")
-        for bit in ("needs decision", "ready to merge", "unknown", "could not be read"):
+        for bit in (
+            "needs decision",
+            "ready to merge",
+            "research findings",
+            "unknown",
+            "could not be read",
+        ):
             self.assertIn(bit, body)
 
     def test_coordinator_share_folds_up_dim(self):

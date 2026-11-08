@@ -1,10 +1,10 @@
 """Built-in role prompts, their overrides, and ejection.
 
-Each role (worker, reviewer, triage) has a built-in template packaged
-under ``korapy/prompts/``. Placeholders are ``{name}``; the allowed set
-is fixed, and a literal brace is written ``{{`` / ``}}``. Rendering is
-strict: an unknown placeholder, or a known one with no value, is a
-``PromptsError``.
+Each role (worker, reviewer, triage, research) has a built-in template
+packaged under ``korapy/prompts/``. Placeholders are ``{name}``; the
+allowed set is fixed, and a literal brace is written ``{{`` / ``}}``.
+Rendering is strict: an unknown placeholder, or a known one with no
+value, is a ``PromptsError``.
 
 An override replaces the built-in for one role. The first that exists
 wins: the ``prompts.<role>`` setting (a path, relative to the ops root),
@@ -19,7 +19,7 @@ from importlib import resources
 from korapy import settings
 
 #: The roles with a built-in template. Anything else is a PromptsError.
-ROLES = ("worker", "reviewer", "triage")
+ROLES = ("worker", "reviewer", "triage", "research")
 
 #: The role a launch without `--role` runs as, and the role resume and
 #: tail assume unless told otherwise. One name, one place: session
@@ -80,6 +80,12 @@ settings.register(
 )
 settings.register(
     "prompts.triage", str, "", "override file for the triage prompt (relative to the ops root)"
+)
+settings.register(
+    "prompts.research",
+    str,
+    "",
+    "override file for the research prompt (relative to the ops root)",
 )
 
 

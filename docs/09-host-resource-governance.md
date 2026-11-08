@@ -56,7 +56,7 @@ place):
    ceiling, mirroring the count floors and ceilings in `admission.py` so the
    two compose without a second mental model.
 3. **Per-agent charge.** Each launch is charged by role (worker, reviewer,
-   triage): a fixed CPU and memory cost, like a price tag, decided before
+   triage, research): a fixed CPU and memory cost, like a price tag, decided before
    anything is measured.
 
 Enforcement maps to nested slices under the user manager:

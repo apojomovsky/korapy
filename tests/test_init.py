@@ -328,6 +328,7 @@ TAIL = """# Defaults: uncomment to override.
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
@@ -468,6 +469,7 @@ commits.conventional = false
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)

@@ -69,21 +69,35 @@ class BootstrapLabel(NamedTuple):
     description: str
 
 
-#: The only people-owned label korapy ever adds. The decision protocol
-#: holds a ticket for a human with this label; no adapter exposes a
-#: general label write, so any other name is refused.
+#: The people-owned labels korapy ever adds. The decision protocol
+#: holds a ticket for a human with `needs-decision`; the research
+#: finish adds `researched` to an answered question. No adapter
+#: exposes a general label write, so any other name is refused.
 NEEDS_DECISION = "needs-decision"
+
+#: A ticket carrying this label is a research question, not a change:
+#: it starts with the research worker prompt and finishes as a
+#: Findings comment, never a pull request.
+RESEARCH = "research"
+
+#: The loop adds this label to a research ticket whose Findings
+#: comment exists. A ticket carrying it is done; the finding stays
+#: visible as an attention item until acknowledged.
+RESEARCHED = "researched"
 
 #: The fixed board label set `github setup` bootstraps: exactly the
 #: labels the rest of korapy reads, no more. `ready` is what
 #: `board.ready` defaults to; `needs-triage` and `needs-decision` are
-#: the triage and decision flow; `hold` blocks `resume`; the
-#: `priority:*` names follow `PRIORITIES` in rank order.
+#: the triage and decision flow; `hold` blocks `resume`;
+#: `research` marks a research question and `researched` marks one
+#: answered; the `priority:*` names follow `PRIORITIES` in rank order.
 BOOTSTRAP_LABELS = (
     BootstrapLabel("ready", "marks an issue an agent may take"),
     BootstrapLabel("needs-triage", "waiting for triage to a repository"),
     BootstrapLabel(NEEDS_DECISION, "waiting on a human decision"),
     BootstrapLabel("hold", "held for a human; resume refuses while present"),
+    BootstrapLabel(RESEARCH, "a research question, answered by a Findings comment"),
+    BootstrapLabel(RESEARCHED, "a research question with its Findings comment"),
     BootstrapLabel(f"{PRIORITY_PREFIX}urgent", "handled first"),
     BootstrapLabel(f"{PRIORITY_PREFIX}high", "a correctness bug, a broken gate, or a flaky test"),
     BootstrapLabel(f"{PRIORITY_PREFIX}normal", "a feature"),
@@ -212,12 +226,23 @@ class Tracker(Protocol):
         """
         ...
 
-    def add_label(self, repo: str, number: int, label: str) -> None:
-        """Add one decision label to an item, for the decision protocol only.
+    def comments(self, repo: str, number: int) -> list[str]:
+        """The comment bodies on an item, oldest first.
 
-        The loop calls this with the single hold label; any other name is
-        refused with ``ValueError``. A failed call raises ``TrackerError``;
-        a rate-limit answer raises ``TrackerRateLimited`` with the seconds
+        Read-only: the loop reads these for research tickets only, to
+        find the Findings comment that finishes them. A failed call
+        raises ``TrackerError``; a rate-limit answer raises
+        ``TrackerRateLimited`` with the seconds to wait.
+        """
+        ...
+
+    def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add one loop-owned label to an item, for the protocols only.
+
+        The loop calls this with the decision hold label or the
+        research finish label; any other name is refused with
+        ``ValueError``. A failed call raises ``TrackerError``; a
+        rate-limit answer raises ``TrackerRateLimited`` with the seconds
         to wait.
         """
         ...

@@ -86,6 +86,8 @@ class FakeTracker:
         self.items_break_after = None
         self.write_errors = {}
         self.comment_errors = {}
+        self.comments_errors = {}
+        self.comment_bodies = {}
         self.label_errors = {}
         self.repo_labels = {repo: set(names) for repo, names in labels}
         self.refused = set(refused)
@@ -157,6 +159,13 @@ class FakeTracker:
         self.calls.append(("comment", repo, number, body))
         if (repo, number) in self.comment_errors:
             raise self.comment_errors[(repo, number)]
+
+    def comments(self, repo, number):
+        """Programmed comment bodies, oldest first; programmed errors raise."""
+        self.calls.append(("comments", repo, number))
+        if (repo, number) in self.comments_errors:
+            raise self.comments_errors[(repo, number)]
+        return list(self.comment_bodies.get((repo, number), []))
 
     def add_label(self, repo, number, label):
         """Record one decision label; programmed errors raise."""
@@ -496,6 +505,8 @@ class BootstrapLabelsTest(unittest.TestCase):
                 "needs-triage",
                 "needs-decision",
                 "hold",
+                "research",
+                "researched",
                 "priority:urgent",
                 "priority:high",
                 "priority:normal",
