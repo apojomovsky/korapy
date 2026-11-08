@@ -152,8 +152,9 @@ export function formatClock(value) {
   return pad(at.getHours()) + ":" + pad(at.getMinutes());
 }
 
-// A provider reading rendered in plain words: its age, and whether
-// the server counts it as stale. Anything missing reads as never
+// A provider reading rendered in plain words: its age. Whether the
+// server counts it as stale rides the badge and the pill state, so
+// this sentence never suffixes it. Anything missing reads as never
 // recorded, never as a fresh zero.
 export function formatQuotaRead(info, nowMs) {
   if (info === null || info === undefined || typeof info !== "object") {
@@ -167,7 +168,7 @@ export function formatQuotaRead(info, nowMs) {
     return "read " + String(readAt);
   }
   const aged = formatAge(readAt, nowMs);
-  return info.stale ? "read " + aged + ", stale" : "read " + aged;
+  return "read " + aged;
 }
 
 // How long until a stamp, in plain words. Null reads as not reported;
@@ -230,9 +231,37 @@ export function clamp01(frac) {
   return Math.min(1, Math.max(0, frac));
 }
 
-// Host load as "1.60 on 4 cores (0.40 per core)". A missing reading
+// How long something has run, in plain words: "4h". Null reads as
+// not reported; anything unparseable is shown verbatim, the same
+// degradation rule as the timestamp parsers above.
+export function formatDuration(startMs, nowMs) {
+  if (startMs === null || startMs === undefined) {
+    return "not reported";
+  }
+  if (typeof startMs !== "number" || typeof nowMs !== "number") {
+    return String(startMs);
+  }
+  const secs = Math.max(0, Math.round((nowMs - startMs) / 1000));
+  if (secs < 5) {
+    return "just now";
+  }
+  if (secs < 60) {
+    return secs + "s";
+  }
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) {
+    return mins + "m";
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return hours + "h";
+  }
+  return Math.floor(hours / 24) + "d";
+}
+
+// Host load as a short figure: "0.40 per core". A missing reading
 // is not reported, never an idle zero.
-export function formatLoad(load1min, ncpu) {
+export function formatLoadFigure(load1min, ncpu) {
   if (load1min === null || load1min === undefined || ncpu === null || ncpu === undefined) {
     return "not reported";
   }
@@ -243,18 +272,34 @@ export function formatLoad(load1min, ncpu) {
     !Number.isFinite(ncpu) ||
     ncpu <= 0
   ) {
-    return String(load1min) + " on " + String(ncpu) + " cores";
+    return String(load1min) + " per core";
   }
-  const per = load1min / ncpu;
-  const shown = load1min.toFixed(2) + " on " + String(ncpu) + " cores";
-  return shown + " (" + per.toFixed(2) + " per core)";
+  return (load1min / ncpu).toFixed(2) + " per core";
 }
 
-// Host memory used from the totals: "used 3.5 of 7.8 GB (45%)". A
-// missing half reads as not reported, never as empty or full. An
-// impossible reading (available above total, or below zero) is a
-// broken meter, not an idle host, so it reads as not reported too.
-export function formatMemUsed(totalMb, availMb) {
+// The load total behind the figure: "1.60 load on 4 cores". Missing
+// readings leave an empty detail, so the gauge renders no sub-line.
+export function formatLoadDetail(load1min, ncpu) {
+  if (load1min === null || load1min === undefined || ncpu === null || ncpu === undefined) {
+    return "";
+  }
+  if (
+    typeof load1min !== "number" ||
+    !Number.isFinite(load1min) ||
+    typeof ncpu !== "number" ||
+    !Number.isFinite(ncpu) ||
+    ncpu <= 0
+  ) {
+    return String(load1min) + " load on " + String(ncpu) + " cores";
+  }
+  return load1min.toFixed(2) + " load on " + String(ncpu) + " cores";
+}
+
+// Host memory used as a short figure: "4.2 GB". A missing half
+// reads as not reported, never as empty or full. An impossible
+// reading (available above total, or below zero) is a broken meter,
+// not an idle host, so it reads as not reported too.
+export function formatMemFigure(totalMb, availMb) {
   if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
     return "not reported";
   }
@@ -265,14 +310,34 @@ export function formatMemUsed(totalMb, availMb) {
     !Number.isFinite(availMb) ||
     totalMb <= 0
   ) {
-    return String(totalMb) + " of " + String(availMb);
+    return "not reported";
   }
   if (availMb > totalMb || availMb < 0) {
     return "not reported";
   }
-  const usedMb = Math.max(0, totalMb - availMb);
-  const pct = Math.round((usedMb / totalMb) * 100);
-  return "used " + (usedMb / 1024).toFixed(1) + " of " + (totalMb / 1024).toFixed(1) + " GB (" + String(pct) + "%)";
+  return ((totalMb - availMb) / 1024).toFixed(1) + " GB";
+}
+
+// The memory total behind the figure: "of 7.6 GB". Missing or
+// broken readings leave an empty detail, so the gauge renders no
+// sub-line.
+export function formatMemDetail(totalMb, availMb) {
+  if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
+    return "";
+  }
+  if (
+    typeof totalMb !== "number" ||
+    !Number.isFinite(totalMb) ||
+    typeof availMb !== "number" ||
+    !Number.isFinite(availMb) ||
+    totalMb <= 0
+  ) {
+    return "";
+  }
+  if (availMb > totalMb || availMb < 0) {
+    return "";
+  }
+  return "of " + (totalMb / 1024).toFixed(1) + " GB";
 }
 
 // A quota window reset as local wall-clock time plus the wait in
