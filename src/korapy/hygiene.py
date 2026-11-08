@@ -50,6 +50,11 @@ HYGIENE_SESSION = "hygiene-session"
 DAY_S = 24 * 60 * 60
 
 
+def _aged_days(now, mtime):
+    """Whole days since `mtime`, never negative (a future mtime reads as 0)."""
+    return max(0, int((now - mtime) // DAY_S))
+
+
 @dataclass(frozen=True)
 class DirEntry:
     """One immediate entry under a rule root, as the `scan` seam reports it.
@@ -568,7 +573,7 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
         saw_ticket = True
         state = "done" if ticket in done else "open"
         is_live = live is not None and ticket in live
-        aged = int((now - found.mtime) // DAY_S)
+        aged = _aged_days(now, found.mtime)
         old = found.mtime < cutoff
         if state == "done" and not is_live and live is not None and old:
             rows.append(
@@ -619,7 +624,7 @@ def _plan_age(rule, live, *, now):
     rows = []
     for found in live:
         assert found.mtime is not None
-        aged = int((now - found.mtime) // DAY_S)
+        aged = _aged_days(now, found.mtime)
         if found.mtime < cutoff:
             rows.append(
                 Candidate(
