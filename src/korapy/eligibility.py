@@ -54,10 +54,10 @@ class LinkedPull:
     """One pull request linked to a ticket, as plain data.
 
     `updated_at` is the tracker's last-update time for the pull, as
-    epoch seconds; a merged pull read from the listing carries the
-    time it last changed, which is how the gate tells a merge that
-    landed during the current claim from an older one. It defaults
-    to zero for rows built without a tracker read.
+    epoch seconds. `merged_at` is when the pull merged, else 0.0; the
+    gate scopes a merged pull against the merge time, falling back to
+    `updated_at` only when the listing carries no merge time. Both
+    default to zero for rows built without a tracker read.
     """
 
     number: int
@@ -65,6 +65,7 @@ class LinkedPull:
     checks: str = ""
     review: str = ""
     updated_at: float = 0.0
+    merged_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -108,17 +109,21 @@ class TicketRow:
 def merged_pull(row: TicketRow):
     """The row's first in-scope merged linked pull, else None. Pure.
 
-    A merged pull newer than the ticket's current claim start means
-    the work landed during this round, so no new round starts on it,
+    A pull merged since the ticket's current claim start means the
+    work landed during this round, so no new round starts on it,
     whatever else the row says; a ticket with no claim withdraws the
-    same way. A merged pull older than the claim start reads as
+    same way. A pull merged before the claim start reads as
     landed-before-this-round (a reopened ticket picked up again), so
     it does not withdraw; a merge at exactly the claim start, or
     with no readable time, withdraws, failing closed without an
-    ordering proof. The first in-scope merge is named, so the reason
-    stays stable. A pull closed without merging is not merged: the
-    ticket still needs its round. Unreadable pulls (None) read as no
-    merged pull; readers refuse those rows on their own check.
+    ordering proof. The scope reads the merge time (`merged_at`),
+    falling back to the last-update time (`updated_at`) only when
+    the listing carries no merge time, so a comment on a long-merged
+    pull never re-arms the withdrawal. The first in-scope merge is
+    named, so the reason stays stable. A pull closed without merging
+    is not merged: the ticket still needs its round. Unreadable pulls
+    (None) read as no merged pull; readers refuse those rows on their
+    own check.
     """
     claimed_at = getattr(row, "claimed_at", None)
     for pull in row.pulls or ():
@@ -126,8 +131,10 @@ def merged_pull(row: TicketRow):
             continue
         if claimed_at is None:
             return pull
-        updated_at = getattr(pull, "updated_at", 0.0)
-        if not isinstance(updated_at, (int, float)) or updated_at >= claimed_at:
+        merged_at = getattr(pull, "merged_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at <= 0:
+            merged_at = getattr(pull, "updated_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at >= claimed_at:
             return pull
     return None
 

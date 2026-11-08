@@ -133,16 +133,21 @@ class TrackerItem(NamedTuple):
     agent: str = ""  # derived from the agent:* label, else ""
     status: str = ""  # derived from the status:* label, else ""
     extra: dict | None = None  # board concepts; normalized to {} on read
+    # Epoch seconds of the merge for a merged pull, else 0.0: the scope
+    # reads the merge time, not the last activity, so a comment after
+    # the merge never re-arms the withdrawal.
+    merged_at: float = 0.0
 
 
 class PullsIndex(NamedTuple):
-    """One repo's open and merged pull requests, keyed by linked ticket number.
+    """One repo's open and recently merged pull requests, keyed by ticket.
 
-    ``by_issue`` maps each linked ticket to its open or merged pull
-    requests, oldest first; ``calls`` counts the listing calls the
-    index cost; ``complete`` is False when the caller's budget stopped
-    the listing early, leaving a partial index the caller must fail
-    closed on. Pull requests closed without merging are filed nowhere.
+    ``by_issue`` maps each linked ticket to its open pull requests plus
+    its merged pull requests updated since ``merged_since``, oldest
+    first; ``calls`` counts the listing calls the index cost;
+    ``complete`` is False when the caller's budget stopped the listing
+    early, leaving a partial index the caller must fail closed on.
+    Pull requests closed without merging are filed nowhere.
     """
 
     by_issue: dict[int, list[TrackerItem]]
@@ -172,21 +177,26 @@ class Tracker(Protocol):
         """Every item, for a full resync."""
         ...
 
-    def pulls_index(self, repo: str, max_calls: int) -> PullsIndex:
-        """The open and merged pull requests on ``repo``, keyed by linked ticket.
+    def pulls_index(
+        self, repo: str, max_calls: int, *, merged_since: float | None = None
+    ) -> PullsIndex:
+        """The open and recently merged pull requests on ``repo``, by ticket.
 
-        One paged listing, not one read per ticket: a pull request
-        links to a ticket when it references it the way the adapter
-        reads as closing or relating it (on GitHub: a close keyword
-        or `Refs` line naming the ticket in the title or body, outside
-        fenced code). ``by_issue`` maps each linked ticket number to
-        its open or merged pull requests, oldest first; ``calls``
-        counts the listing calls the index cost; ``complete`` is False
-        when ``max_calls`` stopped the listing early, in which case the
-        index is partial and callers fail closed. A pull request closed
-        without merging is filed nowhere. A failed call raises
-        `TrackerError`; a rate-limit answer raises `TrackerRateLimited`
-        with the seconds to wait.
+        One paged listing per state, not one read per ticket: a pull
+        request links to a ticket when it references it the way the
+        adapter reads as closing or relating it (on GitHub: a close
+        keyword or `Refs` line naming the ticket in the title or body,
+        outside fenced code). ``by_issue`` maps each linked ticket
+        number to its open pull requests plus its merged pull requests
+        updated since ``merged_since``, oldest first; ``calls`` counts
+        the listing calls the index cost; ``complete`` is False when
+        ``max_calls`` stopped the listing early, in which case the
+        index is partial and callers fail closed. ``merged_since``
+        None lists no closed pull requests: with no live claim behind
+        the tickets only open pulls can still change a verdict. A pull
+        request closed without merging is filed nowhere. A failed call
+        raises `TrackerError`; a rate-limit answer raises
+        `TrackerRateLimited` with the seconds to wait.
         """
         ...
 

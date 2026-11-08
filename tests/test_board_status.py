@@ -206,7 +206,7 @@ class FakeStatusReader:
         self.writes = []
         self.index_calls = []
 
-    def pulls_index(self, repo, max_calls):
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
         self.index_calls.append((repo, max_calls))
         if self.index_error is not None:
             raise self.index_error
@@ -782,7 +782,7 @@ class RealTrackerStatusTest(unittest.TestCase):
     stands in for the shared bucket, and the store is a temporary file.
     """
 
-    PULLS_PATH = f"repos/{REPO}/pulls?state=all&sort=updated&direction=asc&per_page=100"
+    PULLS_PATH = f"repos/{REPO}/pulls?state=open&sort=updated&direction=asc&per_page=100"
     FEED_PATH = f"repos/{REPO}/issues?state=all&sort=updated&direction=asc&per_page=100"
     WRITE_MARKER = "BoardWriteSelect"
 

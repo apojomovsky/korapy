@@ -153,11 +153,12 @@ returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
 `blocked_by` and no `blocked` label), and with no open linked pull
-request and no merged linked pull newer than the claim start,
-claimed or not: in-flight rows stay requested
+request and no linked pull merged since the claim start (by merge
+time, falling back to the last-update time when the listing carries
+no merge time), claimed or not: in-flight rows stay requested
 so the loop never withdraws them by omission, while a ticket whose
 work landed during its claim stays withdrawn so no new round starts
-on landed work. A merged pull older than the claim start reads as
+on landed work. A pull merged before the claim start reads as
 landed-before-this-round, so a reopened ticket picked up again still
 selects. Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
@@ -195,18 +196,25 @@ along as row fields, so the same shape filters on any of them.
 The store carries no linked pulls (pull-request rows are never ticket
 rows, and the sync drops them), so the pass lists each fetchable
 ticket's repository once through the tracker (`Tracker.pulls_index`,
-implemented once by each adapter: one paged open- and merged-pulls
-listing per repository, filed by linked ticket; pulls closed without
-merging are filed nowhere) and the rows a policy sees arrive
-with `pulls` populated: only tickets some project wants and the gate
-could still decide trigger a listing (open, unheld or managed-held
-rows in a repository the pass drives; anything else never fetches,
-and with none to check the tracker is never contacted). Each row
-also carries its pull times from that one listing and its claim start
-from the store, so the policy and the gate scope old merges against
-the same times. `basic`'s own pull filter refuses a
-ticket with an open linked pull or a merged pull newer than the claim
-start, and the shared gate reads the same row
+implemented once by each adapter: one paged open-pulls listing per
+repository, plus one paged closed-pulls listing newest first, filed
+by linked ticket; pulls closed without merging are filed nowhere)
+and the rows a policy sees arrive with `pulls` populated: only
+tickets some project wants and the gate could still decide trigger a
+listing (open, unheld or managed-held rows in a repository the pass
+drives; anything else never fetches, and with none to check the
+tracker is never contacted). The closed-pull listing only covers
+pulls updated since the oldest live claim start on the repository,
+stopping at the first older page, so a long pull history costs a
+bounded number of calls; a repository with no live claim lists no
+closed pulls at all, and an unclaimed ticket's merged link stays
+invisible there until something on the repository is claimed again.
+Each row also carries its pull times from that one listing (the merge
+time, falling back to the last-update time when the listing carries
+no merge time) and its claim start from the store, so the policy and
+the gate scope old merges against the same times. `basic`'s own pull
+filter refuses a ticket with an open linked pull or a linked pull
+merged since the claim start, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
 The `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md)) caps the listing calls
 per pass: repositories past the cap leave their tickets unreadable, and
@@ -239,8 +247,8 @@ and re-reads live state before every start, never a cached count.
 
 Per-candidate gate order, cheapest first:
 
-1. Non-open (a closed issue reads as merged), a merged linked
-   pull newer than the ticket's claim start for every kind (checked
+1. Non-open (a closed issue reads as merged), a linked pull
+   merged since the ticket's claim start for every kind (checked
    before external ownership, so a listed row with a merged pull
    still logs `merged` even when also externally owned; external rows
    are never listed, so in production they carry no pulls and log
@@ -250,11 +258,12 @@ Per-candidate gate order, cheapest first:
    by this pass's eligibility: skip with reason `merged` for the
    first two. No new round of any kind starts on a ticket whose work
    landed during its claim, claimed or not, while a running unit is
-   never stopped by this verdict. A merged pull older than the claim
+   never stopped by this verdict. A pull merged before the claim
    start reads as landed-before-this-round, so a reopened ticket
    picked up again keeps its round; a ticket with no claim withdraws
-   on any merged link. A pull closed without merging is not merged:
-   the ticket still needs its round.
+   on any listed merged link (a repository with no live claim lists
+   no closed pulls, so the link stays invisible there). A pull closed
+   without merging is not merged: the ticket still needs its round.
 2. Claim routing by request kind against the row's live holder.
    `resume`, `fix`, `review` and stuck restarts are classified here,
    before any claimed check, so the check below never sees them as
@@ -682,7 +691,7 @@ is tested through the seam its production code already injects:
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
-| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull rows stay withdrawn, as do merged-pull rows unless the merge predates the claim start | pure policy call over fixture rows |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |

@@ -274,14 +274,16 @@ def _resolve_status_pulls(reader, repo, *, max_calls):
     Resolves the repo's linked pull requests once through the tracker's
     ``pulls_index`` seam and files the open ones by linked ticket, so
     the step spends at most ``max_calls`` listing calls per repo per
-    pass instead of one read per card. A merged or closed pull never
-    reads as in review: its work already landed or was abandoned. A
-    non-positive budget lists nothing and reads as capped. Returns
-    ``(None, cause)`` when the listing is unreadable or the budget
-    stopped it early: open cards then keep their Status (closed cards
-    still derive Done, which needs no pulls). A rate-limit answer
-    raises ``TrackerRateLimited``; any other failure raises
-    ``TrackerError``; the caller turns both into lines, never a crash.
+    pass instead of one read per card. The listing runs with no live
+    claims, so it reads open pulls only and costs no closed-pull
+    calls. A merged or closed pull never reads as in review: its work
+    already landed or was abandoned. A non-positive budget lists
+    nothing and reads as capped. Returns ``(None, cause)`` when the
+    listing is unreadable or the budget stopped it early: open cards
+    then keep their Status (closed cards still derive Done, which needs
+    no pulls). A rate-limit answer raises ``TrackerRateLimited``; any
+    other failure raises ``TrackerError``; the caller turns both into
+    lines, never a crash.
     """
     if max_calls <= 0:
         return None, f"pulls lookup limited at {max_calls} call(s)"

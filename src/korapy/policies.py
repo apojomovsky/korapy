@@ -56,8 +56,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     skips without raising. Unreadable pulls (None) are never selected:
     a ticket whose links the pass could not read fails closed here, as
     in the gate. An in-scope merged linked pull means the work landed
-    during the current claim (or with no claim behind it), so the
-    ticket stays withdrawn; a merged pull older than the claim start
+    since the current claim start (or with no claim behind it), so the
+    ticket stays withdrawn; a pull merged before the claim start
     reads as landed-before-this-round and still selects, as does a
     pull closed without merging.
     """

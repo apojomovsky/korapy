@@ -106,17 +106,18 @@ def _positive_calls(value):
     return value
 
 
-#: Default cap on the GitHub calls one pass spends listing open and
-#: merged pull requests: one listing per repository, so a handful of
-#: repositories cost a handful of calls. Tickets past the cap fail closed.
+#: Default cap on the GitHub calls one pass spends listing open pulls
+#: plus recently updated closed pulls: one listing per repository, so a
+#: handful of repositories cost a handful of calls. Tickets past the
+#: cap fail closed.
 DEFAULT_PULLS_MAX_CALLS = 20
 
 settings.register(
     "drive.pulls_max_calls",
     int,
     DEFAULT_PULLS_MAX_CALLS,
-    "max GitHub calls one pass spends listing open and merged pull requests "
-    "(tickets past the cap fail closed)",
+    "max GitHub calls one pass spends listing open pulls plus recently "
+    "updated closed pulls (tickets past the cap fail closed)",
     check=_positive_calls,
 )
 
@@ -336,12 +337,12 @@ def gate(
     (repo, number)) approves with no finding at or above
     `fix_threshold` is merge-ready too: no fix round opens for lows,
     and no fresh start launches on approved work. A ticket whose
-    issue is closed, or whose linked pull merged during the current
-    claim (or with no claim behind it), is withdrawn with reason
-    `merged`: no new round of any kind starts on it, claimed or not,
-    while a running unit is never stopped by this verdict. A merged
-    pull older than the claim start reads as landed-before-this-round:
-    a reopened ticket picked up again keeps its round. A ticket with
+    issue is closed, or whose linked pull merged since the claim start
+    (or with no claim behind it), is withdrawn with reason `merged`:
+    no new round of any kind starts on it, claimed or not, while a
+    running unit is never stopped by this verdict. A pull merged
+    before the claim start reads as landed-before-this-round: a
+    reopened ticket picked up again keeps its round. A ticket with
     no claim withdraws on any merged link. A pull closed without
     merging is not merged: the ticket still needs its round. None
     (the default)
@@ -1460,19 +1461,23 @@ def log_missing_reviews(out, finished, reviews, rows, *, driven=None) -> int:
 def pulls_index_for(tracker_factory):
     """A per-repo pulls index over the pass's trackers.
 
-    Each call lists the repo's open and merged pull requests once and
-    files them by linked ticket as `LinkedPull` rows for the pass's row
-    building. A repo with no tracker reads as no linked pulls; a
-    tracker failure propagates, and the pass map marks the repo's
-    tickets unreadable instead of starting blind.
+    Each call lists the repo's open pull requests plus its merged
+    pull requests updated since `merged_since` once and files them by
+    linked ticket as `LinkedPull` rows for the pass's row building.
+    `merged_since` None lists no closed pull requests: with no live
+    claim behind the tickets only open pulls can still change a
+    verdict, and the repo costs no extra call. A repo with no tracker
+    reads as no linked pulls; a tracker failure propagates, and the
+    pass map marks the repo's tickets unreadable instead of starting
+    blind.
     """
 
-    def index_for(repo, budget):
+    def index_for(repo, budget, *, merged_since=None):
         try:
             tracker = tracker_factory(repo)
         except KeyError:
             return {}, 0, True
-        found = tracker.pulls_index(repo, budget)
+        found = tracker.pulls_index(repo, budget, merged_since=merged_since)
         return (
             {
                 number: tuple(
@@ -1480,6 +1485,7 @@ def pulls_index_for(tracker_factory):
                         number=item.number,
                         state=item.state,
                         updated_at=getattr(item, "updated_at", 0.0),
+                        merged_at=getattr(item, "merged_at", 0.0),
                     )
                     for item in pulls
                     if getattr(item, "kind", "pr") == "pr"
@@ -1520,21 +1526,41 @@ def pulls_check_needed(row, *, hold_label) -> bool:
     return is_managed_agent(holder)
 
 
-def linked_pulls_map(keys, index_for, *, max_calls, errors=None):
+def merged_since_for(repo, numbers, claims_by_key) -> float | None:
+    """The oldest live claim start behind these tickets, else None. Pure.
+
+    Only claimed tickets bound the closed-pull listing: a merge older
+    than every live claim predates them all, so the merged-pull scope
+    could never fire on it. A repo with no live claim lists no closed
+    pull requests and costs no extra call.
+    """
+    starts = []
+    for number in numbers:
+        if claims_by_key is None:
+            continue
+        claimed_at = claims_by_key.get((repo, number))
+        if isinstance(claimed_at, (int, float)) and not isinstance(claimed_at, bool):
+            starts.append(claimed_at)
+    return min(starts) if starts else None
+
+
+def linked_pulls_map(keys, index_for, *, max_calls, errors=None, claims_by_key=None):
     """{(repo, number): linked pulls} for these tickets, one listing per repo.
 
     The pass's one linked-pull source: the row builders (eligibility
     and gating) read from this map, so the policies and the gate see
-    the same pulls with no second lookup. Each repo lists its open and
-    merged pull requests once and every ticket looks itself up in that
-    listing; a ticket in no listing reads as carrying no pulls. An
-    unreadable repo maps its tickets to None, and readers fail those
-    tickets closed; a ticket the listing reads as empty maps to ().
-    When `errors` is given, the first error string per unreadable
-    ticket is recorded there, so the rows built from the map can name
-    the cause. `max_calls` caps the listing calls for the pass: repos
-    past the cap map to None with a "pulls lookup limited" cause.
-    Returns (found, calls, limited).
+    the same pulls with no second lookup. Each repo lists its open
+    pull requests plus its merged pull requests updated since the
+    oldest live claim behind its tickets (`merged_since_for`, None
+    when nothing is claimed) once, and every ticket looks itself up
+    in that listing; a ticket in no listing reads as carrying no
+    pulls. An unreadable repo maps its tickets to None, and readers
+    fail those tickets closed; a ticket the listing reads as empty
+    maps to (). When `errors` is given, the first error string per
+    unreadable ticket is recorded there, so the rows built from the
+    map can name the cause. `max_calls` caps the listing calls for the
+    pass: repos past the cap map to None with a "pulls lookup
+    limited" cause. Returns (found, calls, limited).
     """
     by_repo: dict = {}
     for key in dict.fromkeys(keys):
@@ -1556,7 +1582,11 @@ def linked_pulls_map(keys, index_for, *, max_calls, errors=None):
             refuse(f"pulls lookup limited at {max_calls} call(s)")
             continue
         try:
-            by_issue, used, complete = index_for(repo, remaining)
+            by_issue, used, complete = index_for(
+                repo,
+                remaining,
+                merged_since=merged_since_for(repo, by_repo[repo], claims_by_key),
+            )
         except Exception as exc:
             refuse(str(exc) or type(exc).__name__)
             continue
@@ -1789,7 +1819,9 @@ def _gate_all(
     gate read the same row pulls with no second lookup.
     `claims_by_key` ({(repo, number): claim start} from `claim_starts`,
     None reads every row as unclaimed) scopes the merged-pull check to
-    merges newer than the claim start. `pulls_max_calls` (None reads
+    merges newer than the claim start, and bounds the closed-pull
+    listing to the same cutoff, so every merge the scope could fire
+    on is listed. `pulls_max_calls` (None reads
     the `drive.pulls_max_calls` host setting) caps the listing calls
     for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
@@ -1865,7 +1897,11 @@ def _gate_all(
                     problems.append(f"korapy drive: {problem}")
                     pulls_max_calls = DEFAULT_PULLS_MAX_CALLS
             pulls_by_key, pulls_calls, pulls_limited = linked_pulls_map(
-                fetch_keys, index_for, max_calls=pulls_max_calls, errors=pull_errors
+                fetch_keys,
+                index_for,
+                max_calls=pulls_max_calls,
+                errors=pull_errors,
+                claims_by_key=claims_by_key,
             )
             if pulls_limited:
                 unchecked = sum(1 for key in fetch_keys if pulls_by_key.get(key) is None)

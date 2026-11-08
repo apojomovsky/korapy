@@ -171,10 +171,12 @@ class MergedScopeTest(unittest.TestCase):
     """merged_pull fires only for merges the current claim did not start after.
 
     A merged pull with no claim behind it withdraws, as does one merged
-    during the current claim. A merged pull older than the claim start
-    reads as landed-before-this-round (a reopened ticket picked up
-    again), so the round proceeds. A merge at exactly the claim start
-    withdraws: without an ordering proof the gate fails closed.
+    since the claim start. A pull merged before the claim start reads
+    as landed-before-this-round (a reopened ticket picked up again),
+    so the round proceeds. A merge at exactly the claim start
+    withdraws: without an ordering proof the gate fails closed. The
+    scope reads the merge time, falling back to the last-update time
+    only when the listing carries no merge time.
     """
 
     def test_no_merged_pull_is_none(self):
@@ -202,6 +204,20 @@ class MergedScopeTest(unittest.TestCase):
 
     def test_merge_at_the_claim_start_withdraws_fail_closed(self):
         pull = eligibility.LinkedPull(number=9, state="merged", updated_at=2000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
+        )
+        self.assertIs(eligibility.merged_pull(row), pull)
+
+    def test_merge_time_wins_over_a_later_update(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=3000.0, merged_at=1000.0)
+        row = eligibility.TicketRow(
+            repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
+        )
+        self.assertIsNone(eligibility.merged_pull(row))
+
+    def test_a_missing_merge_time_falls_back_to_the_update(self):
+        pull = eligibility.LinkedPull(number=9, state="merged", updated_at=3000.0)
         row = eligibility.TicketRow(
             repo="app", number=7, agent="drive-host-1-x", claimed_at=2000.0, pulls=(pull,)
         )

@@ -126,6 +126,24 @@ def _parse_updated(text):
         raise _fail(f"bad updated_at {text!r}") from None
 
 
+def _parse_merged_at(payload):
+    """Epoch seconds of the merge for a pulls-endpoint object, else 0.0.
+
+    A missing or null ``merged_at`` reads as never merged; anything
+    else short of a timestamp is a ``TrackerError``, never a guess.
+    Issues-endpoint objects carry no ``merged_at`` and read as 0.0.
+    """
+    text = payload.get("merged_at")
+    if text is None:
+        return 0.0
+    if not isinstance(text, str):
+        raise _fail(f"bad merged_at {text!r}")
+    try:
+        return iface.parse_cursor(text)
+    except iface.TrackerError:
+        raise _fail(f"bad merged_at {text!r}") from None
+
+
 def _parse_names(entries, field):
     """Label or assignee names from a payload list, else ``TrackerError``."""
     if not isinstance(entries, list):
@@ -210,8 +228,10 @@ class GithubTracker:
         endpoint's ``pull_request`` marker, which is how they read as
         ``kind="pr"``. A closed pull request the endpoint reports as
         merged reads as ``"merged"``; the issues feed never carries the
-        merged encoding, so its items keep reading ``"closed"``. With
-        ``forks`` False the fork lookup is skipped
+        merged encoding, so its items keep reading ``"closed"``. The
+        merge time rides along as ``merged_at`` (0.0 when the payload
+        carries none), so the scope reads the merge, not the last
+        activity. With ``forks`` False the fork lookup is skipped
         (the item reads as not from a fork): the pulls index needs no
         fork info and must not spend a call per pull request on it.
         """
@@ -247,6 +267,7 @@ class GithubTracker:
         if not isinstance(url, str):
             raise _fail(f"bad url {url!r}")
         updated_at = _parse_updated(payload.get("updated_at"))
+        merged_at = _parse_merged_at(payload)
         return iface.TrackerItem(
             repo=repo,
             number=number,
@@ -260,6 +281,7 @@ class GithubTracker:
             assignees=assignees,
             url=url,
             updated_at=updated_at,
+            merged_at=merged_at,
             from_fork=(self._from_fork(repo, number) if forks else False)
             if kind == "pr"
             else False,
@@ -344,44 +366,91 @@ class GithubTracker:
         for entry in self._feed(repo, None):
             yield self._parse(repo, entry)
 
-    def pulls_index(self, repo: str, max_calls: int) -> iface.PullsIndex:
-        """The open and merged pull requests on ``repo``, keyed by linked ticket.
+    def pulls_index(
+        self, repo: str, max_calls: int, *, merged_since: float | None = None
+    ) -> iface.PullsIndex:
+        """The open and recently merged pull requests on ``repo``, by ticket.
 
-        Lists the repo's pull requests oldest first, one paged listing
-        shared by every ticket, and files each open or merged pull
-        request under the tickets its title or body links through
+        Lists the repo's open pull requests oldest first, one paged
+        listing shared by every ticket, and files each under the
+        tickets its title or body links through
         ``body_linked_issue_refs`` (close keywords and ``Refs`` lines,
-        outside fenced code; same-repo links only). A pull request
-        closed without merging is filed nowhere: its ticket still needs
-        its round, so readers see it exactly as they saw no pull at
-        all. Pages until a short page ends the list, like the feed, or
-        ``max_calls`` pages run out (then the index is partial and
-        ``complete`` is False). A missing or malformed page is a
-        ``TrackerError``, never a partial list. The parse skips the
-        per-pull fork lookup: the index needs no fork info, and one
-        extra call per pull request is what the per-ticket lookup cost
-        before.
+        outside fenced code; same-repo links only). Then, only when
+        ``merged_since`` is not None, pages the closed pull requests
+        newest first and files each merged one updated since
+        ``merged_since`` the same way, stopping at the first page
+        older than the cutoff: older merges predate every live claim,
+        so the scope could never fire on them. ``merged_since`` None
+        lists no closed pull requests: with no live claim behind the
+        tickets only open pulls can still change a verdict, and the
+        repo costs no extra call. A pull request closed without
+        merging is filed nowhere: its ticket still needs its round, so
+        readers see it exactly as they saw no pull at all. Pages until
+        a short page ends the list, like the feed, or ``max_calls``
+        pages run out (then the index is partial and ``complete`` is
+        False). A missing or malformed page is a ``TrackerError``,
+        never a partial list. The parse skips the per-pull fork
+        lookup: the index needs no fork info, and one extra call per
+        pull request is what the per-ticket lookup cost before.
         """
         by_issue: dict[int, list] = {}
+        closed_by_issue: dict[int, list] = {}
         calls = 0
-        page = 1
         budget = max(1, max_calls)
+
+        def file(item, into: dict[int, list]) -> None:
+            """One open or merged pull under its linked tickets."""
+            text = f"{item.title}\n{item.body}"
+            for linked_repo, linked_number in body_linked_issue_refs(text, repo):
+                if linked_repo == repo:
+                    into.setdefault(int(linked_number), []).append(item)
+
+        def page_path(state: str, direction: str, page: int) -> str:
+            base = (
+                f"repos/{repo}/pulls?state={state}&sort=updated"
+                f"&direction={direction}&per_page={PER_PAGE}"
+            )
+            return base if page == 1 else f"{base}&page={page}"
+
+        def finish(complete: bool) -> iface.PullsIndex:
+            """The index with the closed pages folded oldest first."""
+            for number, pulls in closed_by_issue.items():
+                by_issue.setdefault(number, []).extend(reversed(pulls))
+            return iface.PullsIndex(by_issue, calls, complete)
+
+        page = 1
         while True:
-            base = f"repos/{repo}/pulls?state=all&sort=updated&direction=asc&per_page={PER_PAGE}"
-            entries = self._page(base if page == 1 else f"{base}&page={page}")
+            entries = self._page(page_path("open", "asc", page))
             calls += 1
             for entry in entries:
                 item = self._parse(repo, entry, forks=False)
                 if item.state == "closed":
                     continue
-                text = f"{item.title}\n{item.body}"
-                for linked_repo, linked_number in body_linked_issue_refs(text, repo):
-                    if linked_repo == repo:
-                        by_issue.setdefault(int(linked_number), []).append(item)
+                file(item, by_issue)
             if len(entries) < PER_PAGE:
-                return iface.PullsIndex(by_issue, calls, True)
+                break
             if calls >= budget:
-                return iface.PullsIndex(by_issue, calls, False)
+                return finish(False)
+            page += 1
+        if merged_since is None:
+            return finish(True)
+        cutoff = merged_since
+        page = 1
+        while True:
+            entries = self._page(page_path("closed", "desc", page))
+            calls += 1
+            older = True
+            for entry in entries:
+                item = self._parse(repo, entry, forks=False)
+                if item.updated_at >= cutoff:
+                    older = False
+                    if item.state != "merged":
+                        continue
+                    file(item, closed_by_issue)
+            if older or len(entries) < PER_PAGE:
+                return finish(True)
+            if calls >= budget:
+                return finish(False)
             page += 1
 
     def _write_error(self, err: Exception) -> iface.TrackerError:

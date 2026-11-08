@@ -103,7 +103,7 @@ class FakeBoardTracker:
             raise AssertionError(f"unexpected poll cursor {after!r}")
         return list(self._items), None
 
-    def pulls_index(self, repo, max_calls):
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
         self.pulls_calls.append((repo, max_calls))
         if self.pulls_error is not None:
             raise self.pulls_error
