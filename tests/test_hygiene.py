@@ -705,13 +705,8 @@ class DirPlanSizeCase(unittest.TestCase):
 
 
 class DirPlanScopeCase(unittest.TestCase):
-    def test_image_and_session_rules_are_skipped(self):
-        candidates, notes = plan_rules(
-            {
-                "acme-images": image_rule(),
-                "acme-old": session_rule(),
-            }
-        )
+    def test_image_rules_are_skipped(self):
+        candidates, notes = plan_rules({"acme-images": image_rule()})
         self.assertEqual(candidates, ())
         self.assertEqual(notes, ())
 
@@ -741,6 +736,279 @@ class DirPlanScopeCase(unittest.TestCase):
         rules = hygiene.check_table({"acme-scratch": dir_rule()}, "korapy.toml")
         with self.assertRaisesRegex(settings.SettingsError, "acme-scratch"):
             hygiene.plan(rules, {}, now=NOW, scan=lambda root: [])
+
+
+def finished_entry(repo, number, ended_ago=100):
+    return {
+        "id": f"agent-{repo}-{number}",
+        "started_at": NOW - 2000,
+        "last_seen": NOW - 2000,
+        "ended_at": NOW - ended_ago,
+        "ticket": {"project": "", "repo": repo, "number": number},
+    }
+
+
+def live_entry(repo, number):
+    return {
+        "id": f"agent-{repo}-{number}",
+        "started_at": NOW - 10,
+        "last_seen": NOW,
+        "ticket": {"project": "", "repo": repo, "number": number},
+    }
+
+
+def session_plan(raw, entries_by_root, *, entries=(), live=frozenset(), now=NOW, roots=None):
+    """`hygiene.plan` over `raw` tables with a fake `scan` and registry data."""
+    rules = hygiene.check_table(raw, "korapy.toml")
+    if roots is None:
+        roots = {name: f"/sessions/{name}" for name in raw}
+
+    def scan(root):
+        return list(entries_by_root.get(root, []))
+
+    return hygiene.plan(rules, roots, now=now, scan=scan, entries=list(entries), live=live)
+
+
+def leaf(root, name, *, mtime, size=500, symlink=False, realpath=None):
+    return entry(
+        os.path.join(root, name), mtime=mtime, size=size, symlink=symlink, realpath=realpath
+    )
+
+
+class SessionPlanProofCase(unittest.TestCase):
+    def test_done_old_idle_leaf_is_safe_naming_rule_and_retention(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(
+            (found.kind, found.path, found.safe),
+            ("hygiene-session", "/sessions/acme-old/acme-7", True),
+        )
+        self.assertIn("acme-old", found.proof)
+        self.assertIn("40d", found.proof)
+        self.assertIn("30d", found.proof)
+
+    def test_leaf_with_a_live_unit_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live={("acme", 7)},
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "hygiene-session")
+        self.assertFalse(found.safe)
+        self.assertIn("live unit", found.proof)
+
+    def test_leaf_with_an_open_entry_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[live_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertIn("still open", found.proof)
+
+    def test_young_leaf_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 2 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertIn("retention", found.proof)
+
+    def test_boundary_retention_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 30 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+
+    def test_unreadable_mtime_is_kept_as_a_session_row(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=None)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "hygiene-session")
+        self.assertFalse(found.safe)
+        self.assertIn("modification time is unreadable", found.proof)
+
+    def test_unparseable_name_is_an_unproven_keep(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {
+                "/sessions/acme-old": [
+                    leaf("/sessions/acme-old", "scratch-notes", mtime=NOW - 40 * DAY)
+                ]
+            },
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "unproven")
+        self.assertFalse(found.safe)
+        self.assertIn("has no registry entry: cannot prove nothing is lost", found.proof)
+
+    def test_parsed_name_with_no_registry_entry_is_an_unproven_keep(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-9", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "unproven")
+        self.assertFalse(found.safe)
+        self.assertIn("has no registry entry", found.proof)
+
+    def test_unreadable_live_listing_keeps_every_leaf(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=None,
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertIn("live listing failed", found.proof)
+        self.assertTrue(any("unreadable" in note for note in notes), f"no unreadable note: {notes}")
+
+    def test_unreadable_live_listing_notes_each_session_rule(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule(), "acme-older": session_rule()},
+            {
+                "/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)],
+                "/sessions/acme-older": [
+                    leaf("/sessions/acme-older", "acme-8", mtime=NOW - 40 * DAY)
+                ],
+            },
+            entries=[finished_entry("acme", 7), finished_entry("acme", 8)],
+            live=None,
+        )
+        self.assertEqual(len(candidates), 2)
+        for found in candidates:
+            self.assertFalse(found.safe)
+            self.assertIn("live listing failed", found.proof)
+        for name in ("acme-old", "acme-older"):
+            self.assertTrue(
+                any(f"rule {name}:" in note and "unreadable" in note for note in notes),
+                f"no unreadable note for {name}: {notes}",
+            )
+
+    def test_ticket_with_a_live_entry_among_finished_ones_is_kept(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7), live_entry("acme", 7)],
+            live=set(),
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "hygiene-session")
+        self.assertFalse(found.safe)
+        self.assertIn("still open", found.proof)
+
+    def test_done_tickets_agree_with_disk(self):
+        from korapy import disk as disk_mod
+
+        entries = [
+            finished_entry("acme", 7),
+            live_entry("acme", 7),
+            finished_entry("acme", 8),
+            finished_entry("acme", 8, ended_ago=200),
+            finished_entry("acme", 9, ended_ago=2 * DAY),
+        ]
+        self.assertFalse(hasattr(hygiene, "_done_tickets"))
+        self.assertEqual(disk_mod.done_tickets(entries, NOW), {("acme", 8), ("acme", 9)})
+
+
+class SessionPlanScopeCase(unittest.TestCase):
+    def test_other_repo_leaf_is_skipped_with_a_note(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "other-7", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("other", 7)],
+            live=set(),
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("belongs to repo", notes[0])
+        self.assertIn("other", notes[0])
+        self.assertIn("acme", notes[0])
+
+    def test_reviews_entry_is_never_a_candidate(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-old": [leaf("/sessions/acme-old", "reviews", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("reviews", notes[0])
+
+    def test_symlink_leaf_is_dropped_with_a_note_and_no_candidate(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {
+                "/sessions/acme-old": [
+                    leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY, symlink=True)
+                ]
+            },
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("is a symlink", notes[0])
+
+    def test_image_rules_are_still_skipped(self):
+        candidates, notes = session_plan({"acme-images": image_rule()}, {})
+        self.assertEqual(candidates, ())
+        self.assertEqual(notes, ())
+
+    def test_missing_root_is_refused_naming_the_rule(self):
+        rules = hygiene.check_table({"acme-old": session_rule()}, "korapy.toml")
+        with self.assertRaisesRegex(settings.SettingsError, "acme-old"):
+            hygiene.plan(rules, {}, now=NOW, scan=lambda root: [])
+
+    def test_dir_and_session_rules_plan_together(self):
+        candidates, _notes = session_plan(
+            {
+                "acme-scratch": dir_rule(),
+                "acme-old": session_rule(),
+            },
+            {
+                "/sessions/acme-scratch": [
+                    entry("/sessions/acme-scratch/run-4", mtime=NOW - 9 * DAY, size=100)
+                ],
+                "/sessions/acme-old": [
+                    leaf("/sessions/acme-old", "acme-7", mtime=NOW - 40 * DAY, size=200)
+                ],
+            },
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+            roots={"acme-scratch": "/sessions/acme-scratch", "acme-old": "/sessions/acme-old"},
+        )
+        by_path = {found.path: found for found in candidates}
+        self.assertTrue(by_path["/sessions/acme-scratch/run-4"].safe)
+        self.assertEqual(by_path["/sessions/acme-scratch/run-4"].kind, "hygiene-dir")
+        self.assertTrue(by_path["/sessions/acme-old/acme-7"].safe)
+        self.assertEqual(by_path["/sessions/acme-old/acme-7"].kind, "hygiene-session")
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"

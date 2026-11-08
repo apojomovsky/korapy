@@ -19,13 +19,18 @@ the command when either raises. Live worktree leaves under a
 worktree-base root are not enumerated here (listing them needs the
 git seam); the worktree root itself is protected ground, and the
 per-ticket planning tickets exclude live leaves at plan time.
+
+Planning (`plan`) is pure over injected scans: `dir` rules plan age,
+count and size selectors, and `session` rules plan the `disk.py`
+session proof unchanged (done registry entry, no live unit, older
+than `retention_days`). Image rules are skipped: ticket 3 plans them.
 """
 
 import os
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from korapy import heavy, paths, settings, worktrees
+from korapy import disk, heavy, paths, registry, settings, worktrees
 
 #: The fixed vocabulary of directory bases. Each resolves through its
 #: existing helper; anything else is exit 4, never a guessed dir.
@@ -35,6 +40,11 @@ DIR_SELECTORS = ("age", "count", "size")
 
 #: The candidate kind directory rows join the `disk` plan as.
 HYGIENE_DIR = "hygiene-dir"
+
+#: The candidate kind proven-shape session rows join the `disk` plan
+#: as. Leaves with no registry entry read as `disk.UNPROVEN` keep
+#: rows instead, the `disk.py` precedent.
+HYGIENE_SESSION = "hygiene-session"
 
 #: Seconds in a day, for the `age` cutoff.
 DAY_S = 24 * 60 * 60
@@ -416,21 +426,28 @@ def _below_any(resolved, roots):
     return False
 
 
-def _eligible(rule, entries, roots, notes):
-    """`(kept, live)` after the symlink and escape drops.
+def _drop_note(found, roots):
+    """The drop note for an unscannable entry, else None.
 
     Symlinks are never candidates and never followed; anything resolving
-    outside every declared root is dropped with a note. Both drops are
-    notes, never rows: a dropped path must not read as kept or safe.
+    outside every declared root is dropped. Both drops are notes, never
+    rows: a dropped path must not read as kept or safe.
     """
+    if found.is_symlink:
+        return f"dropped {found.path}: is a symlink"
+    if not _below_any(_resolved(found), roots):
+        return f"dropped {found.path}: resolves outside a declared root"
+    return None
+
+
+def _eligible(rule, entries, roots, notes):
+    """`(kept, live)` after the symlink and escape drops."""
     kept = []
     live = []
     for found in entries:
-        if found.is_symlink:
-            notes.append(f"dropped {found.path}: is a symlink")
-            continue
-        if not _below_any(_resolved(found), roots):
-            notes.append(f"dropped {found.path}: resolves outside a declared root")
+        dropped = _drop_note(found, roots)
+        if dropped is not None:
+            notes.append(dropped)
             continue
         if found.mtime is None:
             kept.append(
@@ -445,6 +462,136 @@ def _eligible(rule, entries, roots, notes):
             continue
         live.append(found)
     return kept, live
+
+
+def _session_eligible(rule, entries, roots, notes):
+    """`(kept, live)` for a session rule after the session drops.
+
+    Symlink and escape drops read as notes, the directory precedent. A
+    `reviews` record dir is never a candidate (review evidence is
+    append-only proof), and a leaf parsed for another repo is skipped
+    with a note, never a candidate under this rule. An unreadable
+    mtime is a `hygiene-session` keep row, the `disk.py` session
+    precedent, never a `hygiene-dir` row.
+    """
+    kept = []
+    live = []
+    for found in entries:
+        dropped = _drop_note(found, roots)
+        if dropped is not None:
+            notes.append(dropped)
+            continue
+        if os.path.basename(found.path) == "reviews":
+            notes.append(
+                f"dropped {found.path}: reviews record dirs are never candidates (rule {rule.name})"
+            )
+            continue
+        parsed = paths.parse_ticket_dirname(os.path.basename(found.path))
+        if parsed is not None and parsed[0] != rule.repo:
+            notes.append(
+                f"dropped {found.path}: belongs to repo {parsed[0]!r}, rule is for {rule.repo!r}"
+            )
+            continue
+        if found.mtime is None:
+            kept.append(
+                Candidate(
+                    HYGIENE_SESSION,
+                    found.path,
+                    found.size,
+                    f"kept: its modification time is unreadable (rule {rule.name})",
+                    False,
+                )
+            )
+            continue
+        live.append(found)
+    return kept, live
+
+
+def _plan_session(rule, idle, *, now, entries, live, notes):
+    """Safe rows for done, idle leaves past `retention_days`, keeps else.
+
+    The `disk.py` session proof unchanged: the registry entry for the
+    ticket is done, no live unit holds it, and the newest mtime under
+    the leaf is older than `retention_days`. Leaf names that do not
+    parse as ticket dirs, or parse but hold no registry entry, are
+    `disk.UNPROVEN` keep rows. A `None` live set (the listing itself
+    failed) keeps every leaf with its reason, once noted.
+    """
+    assert rule.retention_days is not None
+    cutoff = now - rule.retention_days * DAY_S
+    done = disk.done_tickets(entries, now)
+    rows = []
+    saw_ticket = False
+    for found in idle:
+        assert found.mtime is not None
+        name = os.path.basename(found.path)
+        parsed = paths.parse_ticket_dirname(name)
+        ticket = None
+        if parsed is not None:
+            if parsed in done:
+                ticket = parsed
+            else:
+                for record in entries:
+                    if registry.ticket_of(record) == parsed:
+                        ticket = parsed
+                        break
+        if ticket is None:
+            rows.append(
+                Candidate(
+                    disk.UNPROVEN,
+                    found.path,
+                    found.size,
+                    f"rule {rule.name}; session dir {name} has no registry entry: "
+                    "cannot prove nothing is lost",
+                    False,
+                )
+            )
+            continue
+        saw_ticket = True
+        state = "done" if ticket in done else "open"
+        is_live = live is not None and ticket in live
+        aged = int((now - found.mtime) // DAY_S)
+        old = found.mtime < cutoff
+        if state == "done" and not is_live and live is not None and old:
+            rows.append(
+                Candidate(
+                    HYGIENE_SESSION,
+                    found.path,
+                    found.size,
+                    f"rule {rule.name}; registry done; no live unit; "
+                    f"untouched for {aged}d, rule keeps {rule.retention_days}d",
+                    True,
+                )
+            )
+            continue
+        reasons = []
+        if state != "done":
+            reasons.append("the registry entry is still open")
+        if live is None:
+            reasons.append("the live listing failed")
+        elif is_live:
+            reasons.append("a live unit holds it")
+        if not old:
+            reasons.append("it was modified within the retention")
+        rows.append(
+            Candidate(
+                HYGIENE_SESSION,
+                found.path,
+                found.size,
+                f"kept: {'; '.join(reasons)} (rule {rule.name})",
+                False,
+            )
+        )
+    if (
+        live is None
+        and saw_ticket
+        and not any(
+            note.startswith(f"rule {rule.name}:") and "live units unreadable" in note
+            for note in notes
+        )
+    ):
+        notes.append(f"rule {rule.name}: live units unreadable: session candidates are kept")
+    return rows
 
 
 def _plan_age(rule, live, *, now):
@@ -548,33 +695,42 @@ def _plan_size(rule, live, unreadable_bytes):
     return rows
 
 
-def plan(rules, roots, *, now, scan):
-    """`(candidates, notes)` planning every `dir` rule over injected scans.
+def plan(rules, roots, *, now, scan, entries=(), live=None):
+    """`(candidates, notes)` planning `dir` and `session` rules over scans.
 
     `rules` is `{name: Rule}`, `roots` is `{name: realpath}` from
-    `declared_roots` (a missing root for a dir rule refuses, naming the
-    rule), and `scan(root)` lists that root's `DirEntry` rows. Image and
-    session rules are skipped: tickets 3 and 4 plan them. Nothing is
-    deleted and nothing joins a base and a path here; `declared_roots`
-    stays the one join.
+    `declared_roots` (a missing root for a planned rule refuses, naming
+    the rule), and `scan(root)` lists that root's `DirEntry` rows.
+    `entries` is `registry.load_all()` output and `live` is the
+    `(repo, number)` ticket set, None when the listing itself failed
+    (every session leaf is then kept). Image rules are skipped: ticket
+    3 plans them. Nothing is deleted and nothing joins a base and a
+    path here; `declared_roots` stays the one join.
     """
     candidates: list[Candidate] = []
     notes: list[str] = []
     grounds = tuple(roots.values())
     for name, rule in rules.items():
-        if rule.kind != "dir":
+        if rule.kind == "image":
             continue
         root = roots.get(name)
         if root is None:
             raise settings.SettingsError(f"[hygiene.{name}] has no declared root")
-        kept, live = _eligible(rule, scan(root), grounds, notes)
+        if rule.kind == "session":
+            kept, idle = _session_eligible(rule, scan(root), grounds, notes)
+            candidates.extend(kept)
+            candidates.extend(
+                _plan_session(rule, idle, now=now, entries=entries, live=live, notes=notes)
+            )
+            continue
+        kept, idle = _eligible(rule, scan(root), grounds, notes)
         candidates.extend(kept)
         if rule.selector == "age":
-            candidates.extend(_plan_age(rule, live, now=now))
+            candidates.extend(_plan_age(rule, idle, now=now))
         elif rule.selector == "count":
-            candidates.extend(_plan_count(rule, live, notes=notes))
+            candidates.extend(_plan_count(rule, idle, notes=notes))
         elif rule.selector == "size":
-            candidates.extend(_plan_size(rule, live, sum(found.bytes for found in kept)))
+            candidates.extend(_plan_size(rule, idle, sum(found.bytes for found in kept)))
         else:  # pragma: no cover - check_table refuses any other selector
             raise settings.SettingsError(
                 f"[hygiene.{name}] selector {rule.selector!r} is not planned"
