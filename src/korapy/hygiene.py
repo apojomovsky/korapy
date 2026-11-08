@@ -22,6 +22,7 @@ per-ticket planning tickets exclude live leaves at plan time.
 """
 
 import os
+from dataclasses import dataclass
 from typing import NamedTuple
 
 from korapy import heavy, paths, settings, worktrees
@@ -31,6 +32,40 @@ from korapy import heavy, paths, settings, worktrees
 BASES = ("cache", "state", "sessions", "worktree")
 
 DIR_SELECTORS = ("age", "count", "size")
+
+#: The candidate kind directory rows join the `disk` plan as.
+HYGIENE_DIR = "hygiene-dir"
+
+#: Seconds in a day, for the `age` cutoff.
+DAY_S = 24 * 60 * 60
+
+
+@dataclass(frozen=True)
+class DirEntry:
+    """One immediate entry under a rule root, as the `scan` seam reports it.
+
+    `mtime` is the newest modification time under the entry, None when
+    unreadable; `size` is the bytes under it. `realpath` is the entry
+    resolved past symlinks (the scanner resolves it); it defaults to
+    `path` when the scanner already hands back resolved paths.
+    """
+
+    path: str
+    mtime: float | None
+    size: int
+    is_symlink: bool = False
+    realpath: str | None = None
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One directory row: what, how big, why, and whether proven safe."""
+
+    kind: str
+    path: str
+    bytes: int
+    proof: str
+    safe: bool
 
 
 class Rule(NamedTuple):
@@ -363,3 +398,185 @@ def declared_roots(rules, *, root=None, env=None, worktrees_setting=None, home=N
                 )
         found[name] = real
     return found
+
+
+def _resolved(entry):
+    """The entry resolved past symlinks, as the scanner reported it."""
+    return entry.realpath if entry.realpath is not None else entry.path
+
+
+def _below_any(resolved, roots):
+    """Whether `resolved` sits strictly below one of `roots` (pure strings)."""
+    for root in roots:
+        try:
+            if worktrees.inside(resolved, root):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _eligible(rule, entries, roots, notes):
+    """`(kept, live)` after the symlink and escape drops.
+
+    Symlinks are never candidates and never followed; anything resolving
+    outside every declared root is dropped with a note. Both drops are
+    notes, never rows: a dropped path must not read as kept or safe.
+    """
+    kept = []
+    live = []
+    for found in entries:
+        if found.is_symlink:
+            notes.append(f"dropped {found.path}: is a symlink")
+            continue
+        if not _below_any(_resolved(found), roots):
+            notes.append(f"dropped {found.path}: resolves outside a declared root")
+            continue
+        if found.mtime is None:
+            kept.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"kept: modification time is unreadable (rule {rule.name})",
+                    False,
+                )
+            )
+            continue
+        live.append(found)
+    return kept, live
+
+
+def _plan_age(rule, live, *, now):
+    """Safe rows for entries older than `rule.days`, keep rows for the rest."""
+    assert rule.days is not None
+    cutoff = now - rule.days * DAY_S
+    rows = []
+    for found in live:
+        assert found.mtime is not None
+        aged = int((now - found.mtime) // DAY_S)
+        if found.mtime < cutoff:
+            rows.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"rule {rule.name}; untouched for {aged}d, rule keeps {rule.days}d",
+                    True,
+                )
+            )
+        else:
+            rows.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"kept: touched {aged}d ago, rule keeps {rule.days}d",
+                    False,
+                )
+            )
+    return rows
+
+
+def _by_mtime_name(found):
+    """Oldest first; ties break by ascending basename (the count/size order)."""
+    assert found.mtime is not None
+    return (found.mtime, os.path.basename(found.path))
+
+
+def _plan_count(rule, live, *, notes):
+    """All but the newest `rule.keep` are safe; the survivors are named."""
+    assert rule.keep is not None
+    ordered = sorted(live, key=_by_mtime_name)
+    survivors = ordered[-rule.keep :] if rule.keep else []
+    safe = {found.path for found in ordered[: len(ordered) - len(survivors)]}
+    rows = []
+    for found in live:
+        if found.path in safe:
+            rows.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"rule {rule.name}; outside newest {rule.keep} by mtime",
+                    True,
+                )
+            )
+        else:
+            rows.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"kept: within newest {rule.keep} by mtime (rule {rule.name})",
+                    False,
+                )
+            )
+    if survivors:
+        notes.append(f"rule {rule.name}: keeps {', '.join(found.path for found in survivors)}")
+    return rows
+
+
+def _plan_size(rule, live, unreadable_bytes):
+    """Oldest first, safe until the root would measure under `max_bytes`."""
+    assert rule.max_bytes is not None
+    ordered = sorted(live, key=_by_mtime_name)
+    remaining = unreadable_bytes + sum(found.size for found in ordered)
+    rows = []
+    for found in ordered:
+        if remaining <= rule.max_bytes:
+            rows.append(
+                Candidate(
+                    HYGIENE_DIR,
+                    found.path,
+                    found.size,
+                    f"kept: under budget now (rule {rule.name})",
+                    False,
+                )
+            )
+            continue
+        rows.append(
+            Candidate(
+                HYGIENE_DIR,
+                found.path,
+                found.size,
+                f"rule {rule.name}; oldest-first until under {rule.max_bytes} bytes",
+                True,
+            )
+        )
+        remaining -= found.size
+    return rows
+
+
+def plan(rules, roots, *, now, scan):
+    """`(candidates, notes)` planning every `dir` rule over injected scans.
+
+    `rules` is `{name: Rule}`, `roots` is `{name: realpath}` from
+    `declared_roots` (a missing root for a dir rule refuses, naming the
+    rule), and `scan(root)` lists that root's `DirEntry` rows. Image and
+    session rules are skipped: tickets 3 and 4 plan them. Nothing is
+    deleted and nothing joins a base and a path here; `declared_roots`
+    stays the one join.
+    """
+    candidates: list[Candidate] = []
+    notes: list[str] = []
+    grounds = tuple(roots.values())
+    for name, rule in rules.items():
+        if rule.kind != "dir":
+            continue
+        root = roots.get(name)
+        if root is None:
+            raise settings.SettingsError(f"[hygiene.{name}] has no declared root")
+        kept, live = _eligible(rule, scan(root), grounds, notes)
+        candidates.extend(kept)
+        if rule.selector == "age":
+            candidates.extend(_plan_age(rule, live, now=now))
+        elif rule.selector == "count":
+            candidates.extend(_plan_count(rule, live, notes=notes))
+        elif rule.selector == "size":
+            candidates.extend(_plan_size(rule, live, sum(found.bytes for found in kept)))
+        else:  # pragma: no cover - check_table refuses any other selector
+            raise settings.SettingsError(
+                f"[hygiene.{name}] selector {rule.selector!r} is not planned"
+            )
+    return tuple(candidates), tuple(notes)
