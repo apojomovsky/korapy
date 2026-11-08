@@ -88,7 +88,9 @@ class FakeTracker:
         self.comment_errors = {}
         self.comments_errors = {}
         self.comment_bodies = {}
+        self.posted_comments = {}
         self.label_errors = {}
+        self.remove_errors = {}
         self.repo_labels = {repo: set(names) for repo, names in labels}
         self.refused = set(refused)
         self.ensure_error = ensure_error
@@ -159,19 +161,39 @@ class FakeTracker:
         self.calls.append(("comment", repo, number, body))
         if (repo, number) in self.comment_errors:
             raise self.comment_errors[(repo, number)]
+        self.posted_comments.setdefault((repo, number), []).append(body)
 
     def comments(self, repo, number):
-        """Programmed comment bodies, oldest first; programmed errors raise."""
+        """Comment bodies, oldest first, as a tuple; programmed errors raise.
+
+        A ticket with programmed `comment_bodies` reads those (the
+        research tests preload them); otherwise the bodies posted
+        through `comment` read back (the decision tests post their
+        decision line, then list to prove idempotency).
+        """
         self.calls.append(("comments", repo, number))
         if (repo, number) in self.comments_errors:
             raise self.comments_errors[(repo, number)]
-        return list(self.comment_bodies.get((repo, number), []))
+        if (repo, number) in self.comment_bodies:
+            return tuple(self.comment_bodies[(repo, number)])
+        return tuple(self.posted_comments.get((repo, number), ()))
 
     def add_label(self, repo, number, label):
         """Record one decision label; programmed errors raise."""
         self.calls.append(("add_label", repo, number, label))
         if (repo, number) in self.label_errors:
             raise self.label_errors[(repo, number)]
+
+    def remove_label(self, repo, number, label):
+        """Record one decision label removal; programmed errors raise.
+
+        Removing a label the item does not carry is a no-op, the way
+        the adapter reads a 404 answer.
+        """
+        self.calls.append(("remove_label", repo, number, label))
+        if (repo, number) in self.remove_errors:
+            raise self.remove_errors[(repo, number)]
+        self.repo_labels.setdefault(repo, set()).discard(label)
 
     def missing_labels(self, repo):
         """Names of the bootstrap labels absent on ``repo``; a programmed error raises."""
@@ -772,6 +794,19 @@ class DecisionRecordTest(unittest.TestCase):
         with self.assertRaises(tracker.TrackerError):
             fake.comment("acme/app", 7, "body")
 
+    def test_comments_lists_posted_bodies_oldest_first(self):
+        fake = FakeTracker()
+        fake.comment("acme/app", 7, "first")
+        fake.comment("acme/app", 7, "second")
+        self.assertEqual(fake.comments("acme/app", 7), ("first", "second"))
+        self.assertIn(("comments", "acme/app", 7), fake.calls)
+
+    def test_scripted_comments_error_raises(self):
+        fake = FakeTracker()
+        fake.comments_errors[("acme/app", 7)] = tracker.TrackerError("down")
+        with self.assertRaises(tracker.TrackerError):
+            fake.comments("acme/app", 7)
+
     def test_scripted_label_error_raises(self):
         fake = FakeTracker()
         fake.label_errors[("acme/app", 7)] = tracker.TrackerError("down")
@@ -801,6 +836,43 @@ class DecisionAdapterTest(unittest.TestCase):
         self.assertIn("POST", posted)
         self.assertIn("repos/acme/app/issues/7/comments", posted)
         self.assertIn("body=Which shape should this take?", posted)
+
+    def comments_adapter(self, run):
+        return ghtracker.GithubTracker(run)
+
+    def test_comments_lists_bodies(self):
+        run = FakeRun().add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"body": "first"}, {"body": "second"}],
+        )
+        self.assertEqual(self.comments_adapter(run).comments("acme/app", 7), ("first", "second"))
+
+    def test_comments_pages_until_a_short_page(self):
+        run = FakeRun()
+        run.add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"body": f"n{i}"} for i in range(100)],
+        )
+        run.add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=2",
+            [{"body": "last"}],
+        )
+        found = self.comments_adapter(run).comments("acme/app", 7)
+        self.assertEqual(len(found), 101)
+        self.assertEqual(found[-1], "last")
+
+    def test_comments_malformed_body_is_an_error(self):
+        run = FakeRun().add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"nobody": "here"}],
+        )
+        with self.assertRaises(tracker.TrackerError):
+            self.comments_adapter(run).comments("acme/app", 7)
+
+    def test_comments_failure_is_a_tracker_error(self):
+        run = FakeRun().fail("repos/acme/app/issues/7/comments?per_page=100&page=1")
+        with self.assertRaises(tracker.TrackerError):
+            self.comments_adapter(run).comments("acme/app", 7)
 
     def test_add_label_posts_needs_decision(self):
         self.adapter.add_label("acme/app", 7, "needs-decision")

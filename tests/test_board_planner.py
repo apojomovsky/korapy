@@ -540,6 +540,7 @@ class ProtocolShapeTests(unittest.TestCase):
                 "comment",
                 "comments",
                 "add_label",
+                "remove_label",
                 "ensure_labels",
                 "missing_labels",
                 "canonical_repo",

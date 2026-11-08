@@ -338,18 +338,18 @@ class TrackerCommentsTest(unittest.TestCase):
     def test_comments_read_bodies_oldest_first(self):
         run = FakeRun()
         run.add(
-            "repos/acme/app/issues/7/comments?per_page=100",
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
             [
                 {"body": "first"},
                 {"body": "Findings: go"},
             ],
         )
         tracker = ghtracker.GithubTracker(run)
-        self.assertEqual(tracker.comments("acme/app", 7), ["first", "Findings: go"])
+        self.assertEqual(tracker.comments("acme/app", 7), ("first", "Findings: go"))
 
     def test_comments_refuse_a_malformed_page(self):
         run = FakeRun()
-        run.add("repos/acme/app/issues/7/comments?per_page=100", [{"nobody": 1}])
+        run.add("repos/acme/app/issues/7/comments?per_page=100&page=1", [{"nobody": 1}])
         adapter = ghtracker.GithubTracker(run)
         with self.assertRaises(tracker.TrackerError):
             adapter.comments("acme/app", 7)

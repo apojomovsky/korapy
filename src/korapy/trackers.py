@@ -175,8 +175,8 @@ class BoardBackedTracker(BoardTracker):
         """One decision-protocol comment, through the REST adapter."""
         self._issues.comment(repo, number, body)
 
-    def comments(self, repo: str, number: int) -> list[str]:
-        """The comment bodies, through the REST adapter.
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, through the REST adapter.
 
         Comments live on the repository whatever the tracker variant,
         so a board repo reads through the same adapter call as a
@@ -187,6 +187,15 @@ class BoardBackedTracker(BoardTracker):
     def add_label(self, repo: str, number: int, label: str) -> None:
         """The loop-owned labels, through the REST adapter."""
         self._issues.add_label(repo, number, label)
+
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """The one decision label's removal, through the REST adapter.
+
+        Labels live on the repository whatever the tracker variant, so
+        a board repo removes through the same adapter call as a labels
+        one.
+        """
+        self._issues.remove_label(repo, number, label)
 
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """The bootstrap labels, through the REST adapter.
