@@ -67,6 +67,11 @@ def _ci_workflow_file() -> str:
     return names[0]
 
 
+def _is_title_heading(line):
+    """The README title, accepting the maintainer's capitalization."""
+    return line.lower().startswith("# korapy")
+
+
 def runtimes_bullet():
     """The runtimes line, the one that must name every runtime."""
     text = readme_text()
@@ -110,7 +115,7 @@ class FrontDoor(unittest.TestCase):
         headings = [
             line for line in self.lines if line.startswith("#") and not line.startswith("##")
         ]
-        self.assertTrue(headings and headings[0].startswith("# korapy"))
+        self.assertTrue(headings and _is_title_heading(headings[0]))
         order = (
             "What it does",
             "Features",
@@ -131,6 +136,17 @@ class FrontDoor(unittest.TestCase):
             self.assertIsNotNone(hit, f"no ## heading for {expected!r}: {found}")
             assert hit is not None
             cursor = hit + 1
+
+    def test_the_title_check_rejects_a_foreign_heading(self):
+        cases = (
+            ("# korapy", True),
+            ("# Korapy", True),
+            ("# KORAPY", True),
+            ("# some other project", False),
+        )
+        for heading, expected in cases:
+            with self.subTest(heading=heading):
+                self.assertEqual(_is_title_heading(heading), expected)
 
     def test_the_logo_and_badges_come_first(self):
         self.assertIn("docs/assets/korapy-logo.svg", self.text.split("## ", 1)[0])
