@@ -23,6 +23,7 @@ DERIVED = (
     "review",
     "finished",
     "failed",
+    "timed-out",
 )
 
 URGENCY = {name: rank for rank, name in enumerate(DERIVED)}
@@ -79,8 +80,9 @@ def agent_state(entry, state, now):
     """One agent's derived panel fact: `{derived, idle_s, doing}` (pure).
 
     `state` is the registry status (`live`, `stale`, `finished`).
-    Finished rows read their outcome (`failed` stays `failed`, anything
-    else reads `finished`). Stale rows read `stalled`. Live rows read
+    Finished rows read their outcome (`failed` stays `failed`,
+    `timed-out` stays `timed-out`, anything else reads `finished`).
+    Stale rows read `stalled`. Live rows read
     their note's first signal word (blocked, asking, testing, building,
     review), else `working` while recently seen and `idle` when the
     note is empty and the row is old. `doing` is the note's first line,
@@ -93,7 +95,12 @@ def agent_state(entry, state, now):
     idle = _idle_s(entry if isinstance(entry, dict) else {}, now)
     if state == "finished":
         outcome = entry.get("outcome") if isinstance(entry, dict) else None
-        derived = "failed" if outcome == "failed" else "finished"
+        if outcome == "failed":
+            derived = "failed"
+        elif outcome == "timed-out":
+            derived = "timed-out"
+        else:
+            derived = "finished"
     elif state == "stale":
         derived = "stalled"
     elif _has("blocked", lowered) or _has("waiting", lowered):

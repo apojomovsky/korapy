@@ -134,7 +134,7 @@ What each flag is, and the evidence:
   exec help shows no time flag (only `--max-model-steps` and
   `--max-tool-output-bytes`, which this design leaves at defaults), so
   the muse adapter takes `max_time` and sets nothing from it. The
-  unit's `RuntimeMaxSec` (`RUNTIME_MAX_S`) still bounds the run.
+  unit's `RuntimeMaxSec` (`agents.max_time`) still bounds the run.
 
 Settings versus fixed, in one line: the models declaration picks the
 model; the effort tier and the tool-call shape are profile options

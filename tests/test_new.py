@@ -794,7 +794,12 @@ class ProviderLoading(unittest.TestCase):
     def _evict_launch(self):
         saved_module = sys.modules.pop("korapy.launch", None)
         saved = {}
-        for key in ("clone.path", "clone.default_branch"):
+        for key in (
+            "clone.path",
+            "clone.default_branch",
+            "agents.max_time",
+            "agents.reviewer_max_time",
+        ):
             if key in settings.REGISTRY:
                 saved[key] = settings.REGISTRY.pop(key)
         self.addCleanup(self._restore_launch, saved_module, saved)

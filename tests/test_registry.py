@@ -119,6 +119,25 @@ class LifecycleTest(RegistryCase):
             reg.done("a1", outcome="failed", now=T0 + 2, path=self.path)
         self.assertEqual(self.entry()["outcome"], "ok")
 
+    def test_timed_out_is_a_known_outcome(self):
+        self.register()
+        reg.done("a1", outcome="timed-out", now=T0 + 1, path=self.path)
+        self.assertEqual(self.entry()["outcome"], "timed-out")
+
+    def test_register_records_the_launch_limit(self):
+        self.register(max_time_s=1800)
+        self.assertEqual(self.entry()["max_time_s"], 1800)
+
+    def test_reregister_without_a_limit_keeps_the_recorded_one(self):
+        self.register(max_time_s=1800, now=T0)
+        self.register(now=T0 + 100)
+        self.assertEqual(self.entry()["max_time_s"], 1800)
+
+    def test_a_bad_launch_limit_is_refused(self):
+        for bad in (0, -5, True, "30m"):
+            with self.subTest(bad=bad), self.assertRaises(reg.RegistryError):
+                self.register(max_time_s=bad)
+
     def test_a_pid_below_one_is_refused(self):
         for pid in (0, -1, True):
             with self.subTest(pid=pid), self.assertRaises(reg.RegistryError):
