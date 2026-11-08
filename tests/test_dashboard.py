@@ -215,6 +215,11 @@ class Attention(unittest.TestCase):
         got = dashboard.attention(ValueError("boom"))
         self.assertEqual(got["state"], "error")
 
+    def test_wrong_shaped_source_reads_error_not_ready(self):
+        for bad in ("oops", {"needs_decision": []}, 42, ["oops"]):
+            got = dashboard.attention(bad)
+            self.assertEqual(got["state"], "error", repr(bad))
+
 
 class PlanBand(unittest.TestCase):
     def test_unknown_when_drive_missing(self):
@@ -258,6 +263,145 @@ class PlanBand(unittest.TestCase):
         got = dashboard.plan_projection(drive, T0)
         self.assertEqual(got["state"], "ready")
         self.assertEqual(got["next"], [])
+
+    def test_wrong_shaped_source_reads_error_not_ready(self):
+        for bad in ("oops", ["last_pass_at"], 42):
+            got = dashboard.plan_projection(bad, T0)
+            self.assertEqual(got["state"], "error", repr(bad))
+
+    def test_waits_name_ticket_and_reason(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {"cap": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(
+            got["next"][0],
+            {
+                "what": "start",
+                "ticket": "app#7",
+                "tickets": ["app#7"],
+                "waits": "day cap reached (1 of 1 today), not started",
+                "count": 1,
+            },
+        )
+
+    def test_identical_waits_collapse_with_a_count(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 5,
+            "skipped_by_reason": {"cap": 2},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+                {
+                    "ticket": "app#9",
+                    "code": "cap",
+                    "reason": "app#9: day cap reached (1 of 1 today), not started",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        rows = [row for row in got["next"] if row["ticket"] is not None]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ticket"], "app#7")
+        self.assertEqual(rows[0]["count"], 2)
+        self.assertEqual(rows[0]["tickets"], ["app#7", "app#9"])
+
+    def test_distinct_waits_stay_separate_rows(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 5,
+            "skipped_by_reason": {"cap": 1, "quota": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+                {
+                    "ticket": "app#9",
+                    "code": "quota",
+                    "reason": "app#9: quota low, holding new starts",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        rows = [row for row in got["next"] if row["ticket"] is not None]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["ticket"] for row in rows], ["app#7", "app#9"])
+
+    def test_free_slots_start_next_pass(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 3,
+            "skipped_by_reason": {"cap": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        fillers = [row for row in got["next"] if row["ticket"] is None]
+        self.assertEqual(len(fillers), 1)
+        self.assertEqual(fillers[0]["waits"], "slot free")
+        self.assertEqual(fillers[0]["count"], 2)
+
+    def test_wrong_shaped_waits_read_error(self):
+        for bad in ("oops", ["app#7"]):
+            drive = {
+                "last_pass_at": T0 - 100,
+                "starts_remaining": 2,
+                "skipped_by_reason": {},
+                "waits": bad,
+            }
+            got = dashboard.plan_projection(drive, T0)
+            self.assertEqual(got["state"], "error", repr(bad))
+
+    def test_bool_or_non_int_starts_remaining_reads_error(self):
+        for bad in (True, False, "3", 2.5, None):
+            drive = {
+                "last_pass_at": T0 - 100,
+                "starts_remaining": bad,
+                "skipped_by_reason": {},
+            }
+            got = dashboard.plan_projection(drive, T0)
+            self.assertEqual(got["state"], "error", repr(bad))
+
+    def test_wrong_shaped_counts_read_error_not_empty(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": "lots",
+            "skipped_by_reason": {"quota": 3},
+        }
+        self.assertEqual(dashboard.plan_projection(drive, T0)["state"], "error")
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": True,
+            "skipped_by_reason": {"quota": 3},
+        }
+        self.assertEqual(dashboard.plan_projection(drive, T0)["state"], "error")
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": ["quota"],
+        }
+        self.assertEqual(dashboard.plan_projection(drive, T0)["state"], "error")
 
 
 class LocalTime(unittest.TestCase):
