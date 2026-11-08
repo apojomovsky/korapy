@@ -216,6 +216,16 @@ class Tracker(Protocol):
         """
         ...
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, oldest first, for the decision protocol only.
+
+        The decision verb lists before posting, so a retry posts only
+        when its decision line is absent. Read-only: a failed call
+        raises ``TrackerError``; a rate-limit answer raises
+        ``TrackerRateLimited`` with the seconds to wait.
+        """
+        ...
+
     def add_label(self, repo: str, number: int, label: str) -> None:
         """Add one decision label to an item, for the decision protocol only.
 
@@ -223,6 +233,18 @@ class Tracker(Protocol):
         refused with ``ValueError``. A failed call raises ``TrackerError``;
         a rate-limit answer raises ``TrackerRateLimited`` with the seconds
         to wait.
+        """
+        ...
+
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """Remove one decision label from an item, for the decision protocol only.
+
+        The decision verb calls this with the single needs-decision label;
+        any other name is refused with ``ValueError``. Removing a label the
+        item does not carry succeeds, so a retry converges instead of
+        failing on its own earlier write. A failed call raises
+        ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
+        with the seconds to wait.
         """
         ...
 

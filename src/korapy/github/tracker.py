@@ -48,6 +48,10 @@ _REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
 #: already-exists shape is matched first by its own callers, so it
 #: never reaches the rejection mapping.
 _HTTP_422_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
+#: A label removal for a label the item does not carry, in the
+#: provider's shape. Removing an absent label is already the wanted
+#: state, so it succeeds and a retry converges.
+_HTTP_404_RE = re.compile(r"\(HTTP 404\)", re.IGNORECASE)
 _ALREADY_EXISTS_PHRASE_RE = re.compile(r"already[_-]?exists", re.IGNORECASE)
 
 #: Korapy-owned fields live on the tracker as labels. One label per field
@@ -421,6 +425,38 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, oldest first, through the API.
+
+        Pages until a short page ends the list, like the feed. Anything
+        short of a list of ``body`` strings is a ``TrackerError``, never
+        a partial list: a truncated list would read a posted decision
+        line as absent and post it twice.
+        """
+        found: list[str] = []
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._get(
+                        f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}"
+                    )
+                )
+            except iface.TrackerError:
+                raise
+            except Exception as err:
+                raise _fail(f"comments of {repo}#{number} are not JSON: {err}") from err
+            if not isinstance(payload, list):
+                raise _fail(f"comments of {repo}#{number} are not a list")
+            for entry in payload:
+                body = entry.get("body") if isinstance(entry, dict) else None
+                if not isinstance(body, str):
+                    raise _fail(f"bad comment entry {entry!r} on {repo}#{number}")
+                found.append(body)
+            if len(payload) < PER_PAGE:
+                return tuple(found)
+            page += 1
+
     def add_label(self, repo: str, number: int, label: str) -> None:
         """Add the one decision label through the issues-labels endpoint.
 
@@ -443,6 +479,31 @@ class GithubTracker:
                 ]
             )
         except Exception as err:
+            raise self._write_error(err) from err
+
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """Remove the one decision label through the issues-labels endpoint.
+
+        Only ``NEEDS_DECISION`` is accepted; there is no general label
+        write, so any other name is refused with ``ValueError`` and no
+        ``gh`` call runs. A removal for a label the item does not carry
+        answers 404 and reads as done; anything else fails closed
+        through ``_write_error``.
+        """
+        if label != NEEDS_DECISION:
+            raise ValueError(f"refusing to remove non-decision label {label!r}")
+        try:
+            self._run(
+                [
+                    "api",
+                    "--method",
+                    "DELETE",
+                    f"repos/{repo}/issues/{number}/labels/{label}",
+                ]
+            )
+        except Exception as err:
+            if _HTTP_404_RE.search(str(err)) is not None:
+                return
             raise self._write_error(err) from err
 
     def _list_label_names(self, repo: str) -> set[str]:
