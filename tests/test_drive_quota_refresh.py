@@ -8,6 +8,7 @@ import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from korapy import accounts, admission, drive, projects, quota, quota_ledger
 from tests.test_drive import driven_for, policy_source, stored
@@ -412,6 +413,147 @@ class PassRefreshTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(reader.calls, 0)
+        self.assertEqual(err, "")
+
+
+class PoolNoneRefreshTest(unittest.TestCase):
+    """The pass loads the pool itself when none is injected.
+
+    Offline: the pool comes from a patched `accounts.providers`, the
+    readers from the injected loader, temporary board stores and an
+    injected ledger dict. No network, no real state dir.
+    """
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-quota-none-"))
+        self.db = os.path.join(self.tmp, "board.sqlite")
+        self.lock = os.path.join(self.tmp, "drive.lock")
+        self.policies = os.path.join(self.tmp, "policies")
+        os.makedirs(self.policies)
+
+    def write_policy(self, name, wants):
+        path = os.path.join(self.policies, name + ".py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(policy_source(wants))
+        return path + ":eligible"
+
+    def project(self, name, entry):
+        return projects.Project(
+            name=name,
+            unit_prefix=name + "-agent-",
+            root=os.path.join(self.tmp, "ops", name),
+            eligibility=entry,
+        )
+
+    def run_pass(self, store, found, **fields):
+        out, err = io.StringIO(), io.StringIO()
+        values = {
+            "plan": False,
+            "store": store,
+            "lock_path": self.lock,
+            "out": out,
+            "err": err,
+            "now": T0,
+            "projects_fn": lambda: found,
+            "live": frozenset(),
+            "limits": admission.Limits(
+                total=4, projects={p.name: {"floor": 0, "ceiling": None} for p in found}
+            ),
+            "read_labels": lambda kind, repo, number: [],
+            "hold_label": "hold",
+            "present_agents": frozenset(),
+            "live_units": frozenset(),
+            "gone_s": 3600.0,
+        }
+        values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
+        code = drive.run_pass(**values)
+        return code, out.getvalue(), err.getvalue()
+
+    def quotas(self, **fields):
+        values = {"stale_after": AGE, "low_pct": 90, "unknown_blocks": True}
+        values.update(fields)
+        return {"blue": drive.QuotaSource(chains={"worker": ["provider-a/model"]}, **values)}
+
+    def test_a_none_pool_refreshes_through_the_listed_providers(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        old = {
+            "windows": {"weekly": {"used_pct": 10.0, "resets_at": None}},
+            "read_at": T0 - 6 * 86400,
+        }
+        reader = CountingReader()
+        with mock.patch.object(accounts, "providers", return_value=[provider()]):
+            code, out, err = self.run_pass(
+                store,
+                [self.project("blue", entry)],
+                quotas=self.quotas(),
+                ledger={"readings": {"provider-a": old}, "marks": {}},
+                quota_refresh_after_s=AGE,
+                quota_load_reader=loader_for(reader),
+            )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        self.assertNotIn("quota", err)
+
+    def test_a_none_pool_with_no_providers_runs_no_reader(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        reader = CountingReader()
+        with mock.patch.object(accounts, "providers", return_value=[]):
+            code, _, err = self.run_pass(
+                store,
+                [self.project("blue", entry)],
+                quotas=self.quotas(),
+                ledger={"readings": {}, "marks": {}},
+                quota_refresh_after_s=AGE,
+                quota_load_reader=loader_for(reader),
+            )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+    def test_a_none_pool_whose_listing_fails_exits_usage(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        reader = CountingReader()
+        with mock.patch.object(
+            accounts, "providers", side_effect=accounts.AccountsError("accounts: gone")
+        ):
+            code, _, err = self.run_pass(
+                store,
+                [self.project("blue", entry)],
+                quotas=self.quotas(),
+                ledger={"readings": {}, "marks": {}},
+                quota_refresh_after_s=AGE,
+                quota_load_reader=loader_for(reader),
+            )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(code, drive.USAGE)
+        self.assertIn("accounts: gone", err)
+
+    def test_a_none_pool_plan_pass_lists_no_providers(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        reader = CountingReader()
+        with mock.patch.object(accounts, "providers", return_value=[provider()]) as listed:
+            code, _, err = self.run_pass(
+                store,
+                [self.project("blue", entry)],
+                plan=True,
+                quotas=self.quotas(),
+                ledger={"readings": {}, "marks": {}},
+                quota_refresh_after_s=AGE,
+                quota_load_reader=loader_for(reader),
+            )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(listed.call_count, 0)
+        self.assertEqual(code, 0)
         self.assertEqual(err, "")
 
 
