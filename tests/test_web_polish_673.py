@@ -61,6 +61,20 @@ class PlanBandWording(unittest.TestCase):
     def test_no_repeated_slot_free_rows(self):
         self.assertNotIn("next start waits: ", web_text("views.js"))
 
+    def test_non_list_next_reads_the_error_body(self):
+        body = function_body(web_text("views.js"), "planItems")
+        self.assertNotIn("? plan.next : []", body)
+        self.assertIn("the plan could not be read", body)
+
+    def test_dropped_rows_read_unreadable_not_silent(self):
+        body = function_body(web_text("views.js"), "planItems")
+        self.assertIn("unreadable", body)
+
+    def test_collapsed_rows_show_the_ticket_list(self):
+        body = function_body(web_text("views.js"), "planItems")
+        self.assertIn("item.tickets", body)
+        self.assertIn("more", body)
+
 
 class PlaceholdersRemoved(unittest.TestCase):
     """Point 3: the Later panel is gone; placeholders belong in the schema."""

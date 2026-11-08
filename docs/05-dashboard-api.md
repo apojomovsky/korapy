@@ -50,8 +50,9 @@ use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
 `attention` (needs-decision questions, ready-to-merge rows and the
 coordinator-handled count from the event queue, `unknown` when the
 queue has no reading) and `plan` (the next starts with their named
-waits, identical waits collapsed with a count, and the next-pass
-countdown, `unknown` when the drive journal has no reading).
+waits, identical waits collapsed with a count and the ticket list,
+and the next-pass countdown, `unknown` when the drive journal has no
+reading).
 `GET /v1/snapshot` returns that
 document unchanged, built by the same `snapshot.build` with the same
 injected views, so the CLI and the API can never disagree.

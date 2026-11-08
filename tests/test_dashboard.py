@@ -318,6 +318,29 @@ class PlanBand(unittest.TestCase):
         self.assertEqual(rows[0]["ticket"], "app#7")
         self.assertEqual(rows[0]["count"], 2)
 
+    def test_distinct_waits_stay_separate_rows(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 5,
+            "skipped_by_reason": {"cap": 1, "quota": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+                {
+                    "ticket": "app#9",
+                    "code": "quota",
+                    "reason": "app#9: quota low, holding new starts",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        rows = [row for row in got["next"] if row["ticket"] is not None]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["ticket"] for row in rows], ["app#7", "app#9"])
+
     def test_free_slots_start_next_pass(self):
         drive = {
             "last_pass_at": T0 - 100,
@@ -352,6 +375,12 @@ class PlanBand(unittest.TestCase):
         drive = {
             "last_pass_at": T0 - 100,
             "starts_remaining": "lots",
+            "skipped_by_reason": {"quota": 3},
+        }
+        self.assertEqual(dashboard.plan_projection(drive, T0)["state"], "error")
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": True,
             "skipped_by_reason": {"quota": 3},
         }
         self.assertEqual(dashboard.plan_projection(drive, T0)["state"], "error")

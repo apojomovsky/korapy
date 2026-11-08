@@ -236,9 +236,7 @@ def attention(events):
     needs = []
     merges = []
     handled = 0
-    for row in events or ():
-        if not isinstance(row, dict):
-            continue
+    for row in events:
         kind = row.get("kind")
         ref = row.get("ref")
         if kind == "question":
@@ -330,7 +328,9 @@ def plan_projection(drive_view, now):
     raw_remaining = drive_view.get("starts_remaining", 0)
     if raw_remaining is None:
         remaining = 0
-    elif isinstance(raw_remaining, bool) or not isinstance(raw_remaining, (int, float)):
+    elif isinstance(raw_remaining, bool):
+        return _shape_error(f"starts_remaining is {type(raw_remaining).__name__}")
+    elif not isinstance(raw_remaining, (int, float)):
         try:
             remaining = int(raw_remaining)
         except (TypeError, ValueError):

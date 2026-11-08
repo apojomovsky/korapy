@@ -1605,10 +1605,13 @@ function attentionCard(doc, nowMs) {
 // ticket and reason each waits. Built from the drive journal and
 // the capacity the snapshot already polls, never a dry-run pass.
 // Each row names its ticket ("repo#41 waits: ceiling reached");
-// identical rows collapse into the first with a count; free slots
-// name no ticket ("slot free, starts next pass") because the source
-// does not say which ticket takes a free slot. An empty fleet names
-// the next pass; unknown reads unknown.
+// identical rows collapse into one row with a count and the ticket
+// list (the first two names, then "+N more"); free slots name no
+// ticket ("slot free, starts next pass") because the source does not
+// say which ticket takes a free slot. A non-list next reads the
+// error body, never a healthy empty; rows the band cannot read stay
+// visible as an unreadable note. An empty fleet names the next pass;
+// unknown reads unknown.
 export function planItems(doc) {
   const plan = doc && !isErrorSection(doc.plan) ? doc.plan : null;
   if (plan === null || plan === undefined) {
@@ -1620,9 +1623,18 @@ export function planItems(doc) {
   if (plan.state === "error") {
     return ["the plan could not be read"];
   }
+  if (!Array.isArray(plan.next)) {
+    return ["the plan could not be read"];
+  }
   const lines = [];
-  for (const item of Array.isArray(plan.next) ? plan.next : []) {
-    if (item === null || typeof item !== "object") {
+  let dropped = 0;
+  for (const item of plan.next) {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      dropped += 1;
+      continue;
+    }
+    if ("count" in item && (typeof item.count !== "number" || !Number.isFinite(item.count))) {
+      dropped += 1;
       continue;
     }
     const wait =
@@ -1635,11 +1647,24 @@ export function planItems(doc) {
       typeof item.count === "number" && Number.isFinite(item.count) && item.count > 1
         ? Math.floor(item.count)
         : 1;
+    const names = Array.isArray(item.tickets)
+      ? item.tickets.filter((name) => typeof name === "string" && name !== "")
+      : [];
     const ticket =
-      typeof item.ticket === "string" && item.ticket !== "" ? item.ticket : null;
+      names.length > 0
+        ? names[0]
+        : typeof item.ticket === "string" && item.ticket !== ""
+          ? item.ticket
+          : null;
     if (ticket !== null) {
+      const shown =
+        names.length > 2
+          ? names.slice(0, 2).join(", ") + " +" + String(names.length - 2) + " more"
+          : names.length === 2
+            ? names.join(", ")
+            : ticket;
       lines.push(
-        ticket + " waits: " + wait + (count > 1 ? " (" + String(count) + " tickets)" : ""),
+        shown + " waits: " + wait + (count > 1 ? " (" + String(count) + " tickets)" : ""),
       );
     } else if (wait === "slot free") {
       lines.push(
@@ -1650,6 +1675,9 @@ export function planItems(doc) {
     } else {
       lines.push("1 ticket waits: " + wait);
     }
+  }
+  if (dropped > 0) {
+    lines.push(dropped === 1 ? "1 plan row unreadable" : String(dropped) + " plan rows unreadable");
   }
   return lines;
 }
