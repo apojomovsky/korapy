@@ -35,10 +35,20 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
     except freeze.FreezeError as problem:
         print(f"korapy freeze: {problem}", file=err)
         return USAGE
-    if os.path.exists(freeze_file):
+    reason = args.reason or ""
+    try:
+        directory = os.path.dirname(freeze_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        created = os.open(freeze_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(created)
+    except FileExistsError:
         print("korapy freeze: a freeze is already active", file=err)
         return RACE
-    reason = args.reason or ""
+    except OSError as problem:
+        print(f"korapy freeze: cannot write the freeze state: {problem}", file=err)
+        return USAGE
+    owned = False
     try:
         owned = not os.path.exists(pause_file)
         freeze.write_freeze(
@@ -52,6 +62,7 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
             with open(pause_file, "w", encoding="utf-8") as handle:
                 handle.write(freeze.pause_text(reason) + "\n")
     except OSError as problem:
+        _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
         print(f"korapy freeze: cannot write the freeze state: {problem}", file=err)
         return USAGE
     try:
@@ -60,6 +71,9 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
         _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
         print(f"korapy freeze: {problem} (freeze rolled back)", file=err)
         return UNREACHABLE
+    except Exception:
+        _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
+        raise
     print(freeze.pause_text(reason), file=out)
     return OK
 
@@ -140,7 +154,7 @@ def cmd_end(*, out, err, freeze_file, pause_file):
     except OSError as problem:
         print(f"korapy freeze: cannot remove the freeze state: {problem}", file=err)
         return USAGE
-    if removed_pause:
+    if removed_pause or not os.path.exists(pause_file):
         print("korapy freeze: resumed", file=out)
         return OK
     print("korapy freeze: freeze ended", file=out)

@@ -138,6 +138,56 @@ class FreezeStartTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.paths["freeze_file"]))
         self.assertFalse(os.path.exists(self.paths["pause_file"]))
 
+    def test_pause_write_failure_rolls_back_the_freeze(self):
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("in the way\n")
+        self.paths["pause_file"] = os.path.join(blocker, "drive.pause")
+        code, _, err, _ = self.run_start(start_args(), [0])
+        self.assertEqual(code, 4)
+        self.assertIn("freeze", err)
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+
+    def test_stale_check_loses_a_concurrent_start_without_clobbering(self):
+        from unittest import mock
+
+        from korapy import freeze
+
+        freeze.write_freeze(
+            self.paths["freeze_file"],
+            reason="rival sweep",
+            until=["app#9"],
+            now=1000.0,
+            owned_pause=True,
+        )
+        with mock.patch("os.path.exists", return_value=False):
+            code, _, err, sleeps = self.run_start(start_args(until=["app#7"]), [0])
+        self.assertEqual(code, 2)
+        self.assertIn("already active", err)
+        self.assertEqual(sleeps, [])
+        record = read_json(self.paths["freeze_file"])
+        self.assertEqual(record["reason"], "rival sweep")
+        self.assertEqual(record["until"], ["app#9"])
+        self.assertFalse(os.path.exists(self.paths["pause_file"]))
+
+    def test_unexpected_drain_error_rolls_back_and_reraises(self):
+        def broken():
+            raise RuntimeError("boom")
+
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(RuntimeError):
+            freezecli.cmd_freeze(
+                start_args(),
+                live_total=broken,
+                sleep=lambda seconds: None,
+                now=2000.0,
+                out=out,
+                err=err,
+                **self.paths,
+            )
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+        self.assertFalse(os.path.exists(self.paths["pause_file"]))
+
     def test_drain_failure_keeps_an_operator_pause(self):
         from korapy import units
 
@@ -222,6 +272,27 @@ class FreezeEndTest(unittest.TestCase):
         with open(self.paths["pause_file"], encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "operator break\n")
         self.assertIn("left in place", err)
+
+    def test_end_beside_a_removed_operator_pause_resumes_quietly(self):
+        with open(self.paths["pause_file"], "w", encoding="utf-8") as handle:
+            handle.write("operator break\n")
+        out, err = io.StringIO(), io.StringIO()
+        code = freezecli.cmd_freeze(
+            start_args(),
+            live_total=lambda: 0,
+            sleep=lambda s: None,
+            now=2000.0,
+            out=out,
+            err=err,
+            **self.paths,
+        )
+        self.assertEqual(code, 0)
+        os.remove(self.paths["pause_file"])
+        code, out_text, err_text = self.run_end()
+        self.assertEqual(code, 0)
+        self.assertIn("resumed", out_text)
+        self.assertNotIn("remove it by hand", err_text)
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
 
     def test_end_with_a_corrupt_freeze_is_a_usage_error(self):
         self.start_owned()
