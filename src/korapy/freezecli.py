@@ -71,9 +71,10 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
         _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
         print(f"korapy freeze: {problem} (freeze rolled back)", file=err)
         return UNREACHABLE
-    except Exception:
+    except Exception as problem:
         _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
-        raise
+        print(f"korapy freeze: cannot count live agents: {problem} (freeze rolled back)", file=err)
+        return UNREACHABLE
     print(freeze.pause_text(reason), file=out)
     return OK
 

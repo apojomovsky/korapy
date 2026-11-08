@@ -753,7 +753,8 @@ def _release_freeze(freeze_path, pause_path, tracker_factory, out):
 
     Read-only when no freeze stands, when it names no gate, or when no
     tracker factory can check the gate: then the pause holds. A merged
-    gate removes the freeze (and the pause it owns) and the pass runs.
+    gate removes the freeze (and the pause it owns); the pass then
+    re-reads the pause file, so an operator pause still holds it.
     An unreadable or half-removed freeze keeps the pause, so the next
     pass retries instead of starting on broken state.
     """
@@ -5416,7 +5417,8 @@ def run_pass(
     existing pause file, or `freeze_path` a standing freeze, either
     pass reports it and exits 1, starting nothing; the non-plan pass
     first ends a freeze whose until tickets all read merged, through
-    `tracker_factory`, and then runs. A plan never releases, so a dry
+    `tracker_factory`, and then runs; a pause file the freeze did not
+    own still holds the pass. A plan never releases, so a dry
     run changes nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
     `max_starts` are set, starts beyond the day's budget become `cap`
@@ -5460,8 +5462,12 @@ def run_pass(
                 and freeze_path is not None
                 and _release_freeze(freeze_path, pause_path, tracker_factory, out)
             ):
-                reason = None
-            else:
+                try:
+                    reason = pause_reason(pause_path)
+                except (OSError, freeze.FreezeError) as problem:
+                    print(f"korapy drive: cannot read the pause file: {problem}", file=err)
+                    return USAGE
+            if reason is not None:
                 print(f"korapy drive: paused: {reason}", file=err)
                 return NO
     args = {

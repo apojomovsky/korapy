@@ -356,6 +356,29 @@ class DriveFreezeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.frost))
         self.assertFalse(os.path.exists(self.pause))
 
+    def test_released_freeze_honors_a_standing_operator_pause(self):
+        from tests.test_drive import stored
+
+        freeze.write_freeze(
+            self.frost, reason="sweep", until=["app#7"], now=1000.0, owned_pause=False
+        )
+        with open(self.pause, "w", encoding="utf-8") as handle:
+            handle.write("operator break\n")
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        code, out, err, launcher = self.passing(
+            store,
+            plan=False,
+            found=[("blue", [("app", 8, "start")])],
+            tracker_factory=lambda repo: closed_tracker(),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("operator break", err)
+        self.assertEqual(launcher.calls, [])
+        self.assertFalse(os.path.exists(self.frost))
+        with open(self.pause, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "operator break\n")
+
     def test_open_until_keeps_the_pass_paused(self):
         from tests.test_drive import stored
 

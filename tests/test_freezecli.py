@@ -170,21 +170,22 @@ class FreezeStartTest(unittest.TestCase):
         self.assertEqual(record["until"], ["app#9"])
         self.assertFalse(os.path.exists(self.paths["pause_file"]))
 
-    def test_unexpected_drain_error_rolls_back_and_reraises(self):
+    def test_unexpected_drain_error_rolls_back_with_exit_3(self):
         def broken():
             raise RuntimeError("boom")
 
         out, err = io.StringIO(), io.StringIO()
-        with self.assertRaises(RuntimeError):
-            freezecli.cmd_freeze(
-                start_args(),
-                live_total=broken,
-                sleep=lambda seconds: None,
-                now=2000.0,
-                out=out,
-                err=err,
-                **self.paths,
-            )
+        code = freezecli.cmd_freeze(
+            start_args(),
+            live_total=broken,
+            sleep=lambda seconds: None,
+            now=2000.0,
+            out=out,
+            err=err,
+            **self.paths,
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("boom", err.getvalue())
         self.assertFalse(os.path.exists(self.paths["freeze_file"]))
         self.assertFalse(os.path.exists(self.paths["pause_file"]))
 
