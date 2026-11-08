@@ -529,6 +529,20 @@ class DirPlanAgeCase(unittest.TestCase):
         self.assertFalse(found.safe)
         self.assertEqual(found.proof, "kept: touched 2d ago, rule keeps 7d")
 
+    def test_future_mtime_is_kept_with_zero_age(self):
+        candidates, _notes = plan_rules(
+            {"acme-scratch": dir_rule()},
+            roots={"acme-scratch": "/cache/acme/scratch"},
+            entries={
+                "/cache/acme/scratch": [
+                    entry("/cache/acme/scratch/future", mtime=NOW + 2 * DAY, size=100)
+                ]
+            },
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertEqual(found.proof, "kept: touched 0d ago, rule keeps 7d")
+
     def test_boundary_age_is_kept(self):
         candidates, _notes = plan_rules(
             {"acme-scratch": dir_rule()},
