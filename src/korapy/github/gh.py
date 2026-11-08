@@ -932,6 +932,21 @@ def body_linked_issue_refs(
     return pairs + [p for p in refs_issue_refs(body, default_repo) if p not in pairs]
 
 
+def is_merged_pull(payload) -> bool:
+    """Whether a pull-request payload reports a merged pull.
+
+    The one reader of GitHub's merged encoding (an explicit ``merged``
+    flag or a ``merged_at`` timestamp) every adapter shares, so the
+    tracker and the forge never disagree on what merged means.
+    Anything but an object reads as unmerged, never as merged.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("merged") is True:
+        return True
+    return bool(payload.get("merged_at"))
+
+
 def closing_issue_refs(pr: dict, default_repo: str | None = None) -> list[tuple[str | None, int]]:
     """(repo, number) pairs from ``closingIssuesReferences``.
 

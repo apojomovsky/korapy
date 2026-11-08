@@ -535,7 +535,10 @@ class SharedPullsAccessorTest(SweepCase):
 
     def test_plan_with_an_open_card_lists_pulls_once(self):
         self.seed(7)
-        tracker = FakeBoardTracker([card(7, status="Available")], pulls={(REPO, 7): [object()]})
+        tracker = FakeBoardTracker(
+            [card(7, status="Available")],
+            pulls={(REPO, 7): [reading(repo=REPO, number=9, kind="pr")]},
+        )
         code = self.sweep([entry()], [tracker], plan=True)
         self.assertEqual(code, 1)
         self.assertIn(f"{REPO}#7: state open, set Status to 'In review'", self.out.getvalue())

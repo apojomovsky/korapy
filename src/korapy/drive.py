@@ -106,16 +106,16 @@ def _positive_calls(value):
     return value
 
 
-#: Default cap on the GitHub calls one pass spends listing open pull
-#: requests: one listing per repository, so a handful of repositories
-#: cost a handful of calls. Tickets past the cap fail closed.
+#: Default cap on the GitHub calls one pass spends listing open and
+#: merged pull requests: one listing per repository, so a handful of
+#: repositories cost a handful of calls. Tickets past the cap fail closed.
 DEFAULT_PULLS_MAX_CALLS = 20
 
 settings.register(
     "drive.pulls_max_calls",
     int,
     DEFAULT_PULLS_MAX_CALLS,
-    "max GitHub calls one pass spends listing open pull requests "
+    "max GitHub calls one pass spends listing open and merged pull requests "
     "(tickets past the cap fail closed)",
     check=_positive_calls,
 )
@@ -318,7 +318,8 @@ def gate(
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
     Row state first (missing, non-open with closed reading as merged,
-    a merged linked pull for every kind, external, withdrawn), then claim
+    a merged linked pull for every kind before external ownership,
+    then external, withdrawn), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
     role, outcome)} for the newest finished entry per ticket), then the
@@ -337,8 +338,10 @@ def gate(
     withdrawn with reason `merged`: no new round of any kind starts
     on it, claimed or not, while a running unit is never stopped by
     this verdict. A pull closed without merging is not merged: the
-    ticket still needs its round, and a reopened issue reads open
-    with no merged pull, so it stays startable. None (the default)
+    ticket still needs its round. A reopened issue whose old merged
+    link is still in place stays withdrawn until that link is
+    removed; scoping the signal to merges newer than the last round
+    is open work. None (the default)
     reads the shared default threshold, so the gate follows it past
     import time; a falsy value falls back the same way. A finished reviewer
     with outcome `ok` and no review record for the ticket is a protocol
@@ -386,8 +389,6 @@ def gate(
         return _skip(
             candidate, request.kind, "row", f"{ref}: state is {row.state}, not open, skipped"
         )
-    if row.external:
-        return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
     merged = eligibility.merged_pull(row)
     if merged is not None:
         return _skip(
@@ -396,6 +397,8 @@ def gate(
             "row",
             f"{ref}: pull #{merged.number} is merged, not a fresh round, skipped",
         )
+    if row.external:
+        return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
 
     holder = row.agent or ""
     kind = route_kind(request.kind, holder)
@@ -1454,11 +1457,11 @@ def log_missing_reviews(out, finished, reviews, rows, *, driven=None) -> int:
 def pulls_index_for(tracker_factory):
     """A per-repo pulls index over the pass's trackers.
 
-    Each call lists the repo's open pull requests once and files them
-    by linked ticket as `LinkedPull` rows for the pass's row building.
-    A repo with no tracker reads as no linked pulls; a tracker failure
-    propagates, and the pass map marks the repo's tickets unreadable
-    instead of starting blind.
+    Each call lists the repo's open and merged pull requests once and
+    files them by linked ticket as `LinkedPull` rows for the pass's row
+    building. A repo with no tracker reads as no linked pulls; a
+    tracker failure propagates, and the pass map marks the repo's
+    tickets unreadable instead of starting blind.
     """
 
     def index_for(repo, budget):
@@ -1515,8 +1518,8 @@ def linked_pulls_map(keys, index_for, *, max_calls, errors=None):
 
     The pass's one linked-pull source: the row builders (eligibility
     and gating) read from this map, so the policies and the gate see
-    the same pulls with no second lookup. Each repo lists its open
-    pull requests once and every ticket looks itself up in that
+    the same pulls with no second lookup. Each repo lists its open and
+    merged pull requests once and every ticket looks itself up in that
     listing; a ticket in no listing reads as carrying no pulls. An
     unreadable repo maps its tickets to None, and readers fail those
     tickets closed; a ticket the listing reads as empty maps to ().
@@ -2135,7 +2138,7 @@ def sync_all(store, tracker_factory, *, operators, now, pulls_max_calls=None):
     board, built by the one factory); board repos run the feed step then
     the board step, and a complete board poll also adopts the tracker's
     missing issues onto the board through the same reader, while every
-    poll also syncs the Status column from the derived state. Open
+    poll also syncs the Status column from the derived state. Linked
     pulls for the Status step resolve once per repo through each
     reader's ``pulls_index`` seam, capped by ``pulls_max_calls`` (None
     reads the ``drive.pulls_max_calls`` host setting, the same budget

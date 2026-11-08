@@ -271,16 +271,17 @@ def _pulls_budget(pulls_max_calls):
 def _resolve_status_pulls(reader, repo, *, max_calls):
     """``(numbers with an open pull, "")`` for the Status step, one listing.
 
-    Resolves the repo's open pull requests once through the tracker's
-    ``pulls_index`` seam and files them by linked ticket, so the step
-    spends at most ``max_calls`` listing calls per repo per pass instead
-    of one read per card. A non-positive budget lists nothing and reads
-    as capped. Returns ``(None, cause)`` when the listing is
-    unreadable or the budget stopped it early: open cards then keep
-    their Status (closed cards still derive Done, which needs no
-    pulls). A rate-limit answer raises ``TrackerRateLimited``; any
-    other failure raises ``TrackerError``; the caller turns both into
-    lines, never a crash.
+    Resolves the repo's linked pull requests once through the tracker's
+    ``pulls_index`` seam and files the open ones by linked ticket, so
+    the step spends at most ``max_calls`` listing calls per repo per
+    pass instead of one read per card. A merged or closed pull never
+    reads as in review: its work already landed or was abandoned. A
+    non-positive budget lists nothing and reads as capped. Returns
+    ``(None, cause)`` when the listing is unreadable or the budget
+    stopped it early: open cards then keep their Status (closed cards
+    still derive Done, which needs no pulls). A rate-limit answer
+    raises ``TrackerRateLimited``; any other failure raises
+    ``TrackerError``; the caller turns both into lines, never a crash.
     """
     if max_calls <= 0:
         return None, f"pulls lookup limited at {max_calls} call(s)"
@@ -296,7 +297,10 @@ def _resolve_status_pulls(reader, repo, *, max_calls):
         {
             number
             for number, linked in index.by_issue.items()
-            if any(getattr(pull, "kind", "pr") == "pr" for pull in linked)
+            if any(
+                getattr(pull, "kind", "pr") == "pr" and getattr(pull, "state", "") == "open"
+                for pull in linked
+            )
         },
         "",
     )
@@ -370,11 +374,11 @@ def sync_board_status(
 
     ``pulls`` is the per-issue set of issue numbers holding an open
     linked pull, resolved once per repo by the caller through the
-    tracker's ``pulls_index`` seam; ``None`` means the listing was
-    unreadable or capped, with the cause in ``pulls_error``. An open
-    card with unknown pulls rests with one status line naming the
-    cause, while a closed card still derives Done, which needs no
-    pulls.
+    tracker's ``pulls_index`` seam (merged and closed pulls never
+    count); ``None`` means the listing was unreadable or capped, with
+    the cause in ``pulls_error``. An open card with unknown pulls
+    rests with one status line naming the cause, while a closed card
+    still derives Done, which needs no pulls.
     """
     setup = _status_setup(reader, schema, uncapped=uncapped)
     if setup is None:
@@ -554,13 +558,14 @@ def sync_board_repo(
     the derived state through the reader, up to its status cap: each
     card's decision is independent, so a partial view still sets the
     cards it holds. Failed writes are reported without failing the
-    sync. Open pulls resolve once per repo through the reader's
+    sync. Linked pulls resolve once per repo through the reader's
     ``pulls_index`` seam, capped by ``pulls_max_calls`` (None reads
-    the ``drive.pulls_max_calls`` host setting): an unreadable or
-    capped listing rests the open cards with the cause while closed
-    cards still derive Done, and a rate-limited one halts the step
-    with an outage line. The sweep runs uncapped: both caps read as
-    unlimited and every drifted card is fixed in one run.
+    the ``drive.pulls_max_calls`` host setting): only the open ones
+    derive In review, while an unreadable or capped listing rests the
+    open cards with the cause and closed cards still derive Done, and
+    a rate-limited one halts the step with an outage line. The sweep
+    runs uncapped: both caps read as unlimited and every drifted card
+    is fixed in one run.
 
     Every poll also reconciles the board-drift verdicts in the store
     (``adopted`` and ``status_written`` name what this call fixed):

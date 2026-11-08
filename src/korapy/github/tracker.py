@@ -11,7 +11,12 @@ import re
 
 from korapy import tracker as iface
 from korapy.github import forge as ghforge
-from korapy.github.gh import body_linked_issue_refs, is_rate_limited, retry_after_s
+from korapy.github.gh import (
+    body_linked_issue_refs,
+    is_merged_pull,
+    is_rate_limited,
+    retry_after_s,
+)
 from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
 
 #: One page of the issues feed; the maximum the endpoint serves.
@@ -199,7 +204,10 @@ class GithubTracker:
         guess; a PR whose fork info cannot be read is ``from_fork``.
         Pulls-endpoint objects carry ``head`` instead of the issues
         endpoint's ``pull_request`` marker, which is how they read as
-        ``kind="pr"``. With ``forks`` False the fork lookup is skipped
+        ``kind="pr"``. A closed pull request the endpoint reports as
+        merged reads as ``"merged"``; the issues feed never carries the
+        merged encoding, so its items keep reading ``"closed"``. With
+        ``forks`` False the fork lookup is skipped
         (the item reads as not from a fork): the pulls index needs no
         fork info and must not spend a call per pull request on it.
         """
@@ -220,6 +228,8 @@ class GithubTracker:
         state = payload.get("state")
         if state not in ("open", "closed"):
             raise _fail(f"bad state {state!r}")
+        if state == "closed" and is_merged_pull(payload):
+            state = "merged"
         user = payload.get("user")
         if user is None:
             author = ""
@@ -331,30 +341,35 @@ class GithubTracker:
             yield self._parse(repo, entry)
 
     def pulls_index(self, repo: str, max_calls: int) -> iface.PullsIndex:
-        """The open pull requests on ``repo``, keyed by linked ticket.
+        """The open and merged pull requests on ``repo``, keyed by linked ticket.
 
-        Lists the repo's open pull requests oldest first, one paged
-        listing shared by every ticket, and files each pull request
-        under the tickets its title or body links through
+        Lists the repo's pull requests oldest first, one paged listing
+        shared by every ticket, and files each open or merged pull
+        request under the tickets its title or body links through
         ``body_linked_issue_refs`` (close keywords and ``Refs`` lines,
-        outside fenced code; same-repo links only). Pages until a
-        short page ends the list, like the feed, or ``max_calls``
-        pages run out (then the index is partial and ``complete`` is
-        False). A missing or malformed page is a ``TrackerError``,
-        never a partial list. The parse skips the per-pull fork
-        lookup: the index needs no fork info, and one extra call per
-        pull request is what the per-ticket lookup cost before.
+        outside fenced code; same-repo links only). A pull request
+        closed without merging is filed nowhere: its ticket still needs
+        its round, so readers see it exactly as they saw no pull at
+        all. Pages until a short page ends the list, like the feed, or
+        ``max_calls`` pages run out (then the index is partial and
+        ``complete`` is False). A missing or malformed page is a
+        ``TrackerError``, never a partial list. The parse skips the
+        per-pull fork lookup: the index needs no fork info, and one
+        extra call per pull request is what the per-ticket lookup cost
+        before.
         """
         by_issue: dict[int, list] = {}
         calls = 0
         page = 1
         budget = max(1, max_calls)
         while True:
-            base = f"repos/{repo}/pulls?state=open&sort=updated&direction=asc&per_page={PER_PAGE}"
+            base = f"repos/{repo}/pulls?state=all&sort=updated&direction=asc&per_page={PER_PAGE}"
             entries = self._page(base if page == 1 else f"{base}&page={page}")
             calls += 1
             for entry in entries:
                 item = self._parse(repo, entry, forks=False)
+                if item.state == "closed":
+                    continue
                 text = f"{item.title}\n{item.body}"
                 for linked_repo, linked_number in body_linked_issue_refs(text, repo):
                     if linked_repo == repo:

@@ -314,7 +314,7 @@ class PullsLookupPassTest(unittest.TestCase):
             [],
         )
         gh.add(
-            "repos/app/pulls?state=open&sort=updated&direction=asc&per_page=100",
+            "repos/app/pulls?state=all&sort=updated&direction=asc&per_page=100",
             [],
         )
         adapter = ghtracker.GithubTracker(gh)

@@ -163,7 +163,7 @@ class BoardBackedTracker(BoardTracker):
         return self._issues.items(repo)
 
     def pulls_index(self, repo: str, max_calls: int):
-        """The open pull requests on the repository, keyed by ticket.
+        """The open and merged pull requests on the repository, keyed by ticket.
 
         The board variant carries no pull requests of its own, but the
         pull requests still live on the repository, so the index

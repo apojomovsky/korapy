@@ -137,7 +137,7 @@ class FakeTracker:
             yield item
 
     def pulls_index(self, repo, max_calls):
-        """Programmed per-repo open-pulls index: {issue: [TrackerItem]}."""
+        """Programmed per-repo open- and merged-pulls index: {issue: [TrackerItem]}."""
         self.calls.append(("pulls_index", repo, max_calls))
         if repo in self.index_errors:
             raise tracker.TrackerError(self.index_errors[repo])
@@ -268,6 +268,14 @@ class ItemTest(unittest.TestCase):
         found = self.adapter.item("acme/app", 9)
         self.assertTrue(found.from_fork)
         self.assertTrue(board.is_external(found.author, ["alice"], found.from_fork))
+
+    def test_a_closed_pull_request_in_the_feed_reads_closed(self):
+        payload = item_payload(9, state="closed")
+        payload["pull_request"] = {"url": "https://example.com/pulls/9"}
+        self.gh.add("repos/acme/app/issues/9", payload)
+        self.gh.add("repos/acme/app/pulls/9", pull_payload(9, fork=False))
+        found = self.adapter.item("acme/app", 9)
+        self.assertEqual((found.kind, found.state), ("pr", "closed"))
 
     def test_pull_payload_is_cached_per_tracker(self):
         payload = item_payload(9)
@@ -840,9 +848,12 @@ def pr_payload(number, body, fork=False, **over):
 
 
 class PullsIndexTest(unittest.TestCase):
-    """One open-pulls listing per repo, indexed by linked ticket. Fakes only."""
+    """One open- and merged-pulls listing per repo, indexed by linked ticket.
 
-    LISTING = "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    Fakes only.
+    """
+
+    LISTING = "repos/acme/app/pulls?state=all&sort=updated&direction=asc&per_page=100"
 
     def setUp(self):
         self.gh = FakeRun()
@@ -936,6 +947,40 @@ class PullsIndexTest(unittest.TestCase):
         self.assertEqual(found.calls, 1)
         self.assertFalse(found.complete)
         self.assertEqual(self.gh.paths(), [self.LISTING])
+
+    def test_the_listing_requests_every_pull_request(self):
+        self.gh.add(self.LISTING, [])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.LISTING])
+
+    def test_a_merged_pr_is_indexed_as_merged(self):
+        self.gh.add(
+            self.LISTING,
+            [pr_payload(9, "Closes #7", state="closed", merged_at="2026-11-07T12:00:00Z")],
+        )
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+
+    def test_a_merged_flag_pr_is_indexed_as_merged(self):
+        self.gh.add(
+            self.LISTING,
+            [pr_payload(9, "Closes #7", state="closed", merged=True)],
+        )
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+
+    def test_a_closed_unmerged_pr_is_not_indexed(self):
+        self.gh.add(self.LISTING, [pr_payload(9, "Closes #7", state="closed")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertNotIn(7, found.by_issue)
+        self.assertTrue(found.complete)
 
 
 if __name__ == "__main__":

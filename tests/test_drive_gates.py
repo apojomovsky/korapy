@@ -16,9 +16,10 @@ from unittest import mock
 
 from korapy import accounts, admission, board, drive, eligibility, policies, projects, registry
 from korapy.eligibility import LinkedPull, StartRequest, TicketRow
+from korapy.github import tracker as ghtracker
 from tests.test_drive import driven_for, policy_source, stored
 from tests.test_eligibility import item as board_item
-from tests.test_tracker import FakeTracker, reading
+from tests.test_tracker import FakeRun, FakeTracker, pr_payload, reading
 
 
 def request(repo="app", number=7, kind="start", weight=0.0):
@@ -971,6 +972,23 @@ class OpenPullGateTest(unittest.TestCase):
         self.assertIn("pull #4", gated.reason)
         self.assertIn("merged", gated.reason)
 
+    def test_a_resume_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="resume",
+                row_=row(agent="drive-host-1-x", pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_a_merged_pull_names_merged_on_an_externally_owned_row(self):
+        gated = gate(entry(row_=row(external=True, pulls=(LinkedPull(number=9, state="merged"),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
     def test_an_unreadable_pull_lookup_refuses_the_start(self):
         gated = gate(entry(row_=row(pulls=None)))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
@@ -1196,6 +1214,75 @@ class LinkedPullAgreementTest(unittest.TestCase):
         )
         self.assertEqual((gated.verdict, gated.code), ("skip", "hold"))
         self.assertIn("app#12", gated.reason)
+
+
+class RealPullsChainTest(unittest.TestCase):
+    """Merged state through the production linked-pulls path. Real adapter, fake `gh`.
+
+    The listing the pass already reads carries merged pulls, so an open
+    ticket whose pull merged withdraws instead of starting a new round.
+    The `gh` seam is faked at the adapter boundary; everything above it
+    (the index, the row building, the policy and the gate) is production.
+    """
+
+    LISTING = "repos/app/pulls?state=all&sort=updated&direction=asc&per_page=100"
+
+    def tracked_rows(self):
+        gh = FakeRun()
+        gh.add(
+            self.LISTING,
+            [
+                pr_payload(10, "Work in flight.\n\nCloses #8"),
+                pr_payload(
+                    9, "Landed.\n\nCloses #7", state="closed", merged_at="2026-11-07T12:00:00Z"
+                ),
+                pr_payload(11, "Abandoned.\n\nCloses #6", state="closed"),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        index_for = drive.pulls_index_for(lambda repo: adapter)
+        keys = [("app", 6), ("app", 7), ("app", 8)]
+        found, calls, limited = drive.linked_pulls_map(keys, index_for, max_calls=20)
+        items = [board_item(number=number) for _, number in keys]
+        rows = eligibility.rows_from_items(items, pulls_by_key=found)
+        return gh, calls, limited, dict(zip(("six", "seven", "eight"), rows))
+
+    def test_the_listing_costs_one_call(self):
+        gh, calls, limited, _ = self.tracked_rows()
+        self.assertEqual(calls, 1)
+        self.assertFalse(limited)
+        self.assertEqual(gh.paths(), [self.LISTING])
+
+    def test_a_merged_pull_reaches_the_row_as_merged(self):
+        _, _, _, rows = self.tracked_rows()
+        self.assertEqual(rows["seven"].pulls, (LinkedPull(number=9, state="merged"),))
+
+    def test_a_closed_unmerged_pull_never_reaches_the_row(self):
+        _, _, _, rows = self.tracked_rows()
+        self.assertEqual(rows["six"].pulls, ())
+
+    def test_policy_and_gate_withdraw_the_merged_ticket(self):
+        _, _, _, rows = self.tracked_rows()
+        ordered = [rows["six"], rows["seven"], rows["eight"]]
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic(ordered, now=1000.0)],
+            [("app", 6)],
+        )
+        gated = gate(entry(number=7, row_=rows["seven"]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_the_open_ticket_still_refuses_as_open(self):
+        _, _, _, rows = self.tracked_rows()
+        gated = gate(entry(number=8, row_=rows["eight"]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #10 is open", gated.reason)
+
+    def test_the_closed_unmerged_ticket_still_starts(self):
+        _, _, _, rows = self.tracked_rows()
+        gated = gate(entry(number=6, row_=rows["six"]))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
 
 class ReviewThresholdGateTest(unittest.TestCase):

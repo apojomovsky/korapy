@@ -191,13 +191,14 @@ along as row fields, so the same shape filters on any of them.
 The store carries no linked pulls (pull-request rows are never ticket
 rows, and the sync drops them), so the pass lists each fetchable
 ticket's repository once through the tracker (`Tracker.pulls_index`,
-implemented once by each adapter: one paged open-pulls listing per
-repository, filed by linked ticket) and the rows a policy sees arrive
+implemented once by each adapter: one paged open- and merged-pulls
+listing per repository, filed by linked ticket; pulls closed without
+merging are filed nowhere) and the rows a policy sees arrive
 with `pulls` populated: only tickets some project wants and the gate
 could still decide trigger a listing (open, unheld or managed-held
 rows in a repository the pass drives; anything else never fetches,
 and with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
-ticket with an open linked pull, and the shared gate reads the same row
+ticket with an open or merged linked pull, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
 The `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md)) caps the listing calls
 per pass: repositories past the cap leave their tickets unreadable, and
@@ -231,15 +232,18 @@ and re-reads live state before every start, never a cached count.
 Per-candidate gate order, cheapest first:
 
 1. Non-open (a closed issue reads as merged), a merged linked
-   pull for every kind, externally owned (the row's stored
-   `external` field, computed at sync time by `board.is_external`;
-   the loop never re-derives it), or withdrawn by this pass's
-   eligibility: skip with reason `merged` for the first two. No new
-   round of any kind starts on a merged ticket, claimed or not,
-   while a running unit is never stopped by this verdict. A pull
-   closed without merging is not merged: the ticket still needs its
-   round, and a reopened issue reads open with no merged pull, so
-   it stays startable.
+   pull for every kind (checked before external ownership, so a
+   merged and external ticket still logs `merged`), externally owned
+   (the row's stored `external` field, computed at sync time by
+   `board.is_external`; the loop never re-derives it), or withdrawn
+   by this pass's eligibility: skip with reason `merged` for the
+   first two. No new round of any kind starts on a merged ticket,
+   claimed or not, while a running unit is never stopped by this
+   verdict. A pull closed without merging is not merged: the ticket
+   still needs its round. A reopened issue whose old merged link is
+   still in place stays withdrawn until that link is removed;
+   scoping the signal to merges newer than the last finished round
+   is open work.
 2. Claim routing by request kind against the row's live holder.
    `resume`, `fix`, `review` and stuck restarts are classified here,
    before any claimed check, so the check below never sees them as
