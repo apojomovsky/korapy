@@ -23,9 +23,12 @@ import {
   formatAge,
   formatBytes,
   formatCpu,
-  formatLoad,
+  formatDuration,
+  formatLoadDetail,
+  formatLoadFigure,
   formatMem,
-  formatMemUsed,
+  formatMemDetail,
+  formatMemFigure,
   formatQuotaRead,
   formatResetLine,
   formatRetentionWindow,
@@ -386,7 +389,7 @@ function pressureText(pressure) {
   const info = pressure && typeof pressure === "object" ? pressure : {};
   const bits = [];
   if (info.load_per_cpu !== null && info.load_per_cpu !== undefined) {
-    bits.push("load " + pressureValue(info.load_per_cpu, 2) + "/cpu");
+    bits.push(pressureValue(info.load_per_cpu, 2) + " per core");
   }
   if (info.mem_available_pct !== null && info.mem_available_pct !== undefined) {
     bits.push("mem " + pressureValue(info.mem_available_pct, 1) + "% avail");
@@ -398,14 +401,18 @@ function pressureText(pressure) {
   return bits.join(", ");
 }
 
-// One host gauge: the host value as a large number with one bar,
-// the reserved share as a tick inside. Every host card shares this
-// shape so the three read as one row. Severity rides the bar band.
-function hostGauge(help, fracText, frac, label, marker, reserved) {
+// One host gauge: the host value as a short figure with its total
+// on a small line under it, one bar, the reserved share as a tick
+// inside. Every host card shares this shape so the three read as one
+// row. Severity rides the bar band.
+function hostGauge(help, figure, detail, frac, label, marker, reserved) {
   const wrap = document.createElement("div");
   wrap.setAttribute("class", "gauge-body");
   wrap.setAttribute("title", help);
-  wrap.appendChild(el("p", fracText, { class: "giant" }));
+  wrap.appendChild(el("p", figure, { class: "giant" }));
+  if (detail !== null && detail !== undefined && String(detail) !== "") {
+    wrap.appendChild(el("p", String(detail), { class: "sub" }));
+  }
   wrap.appendChild(meter(frac, frac === null ? "unknown" : bandFor(frac), label, marker));
   wrap.appendChild(el("p", reserved, { class: "reserved" }));
   return wrap;
@@ -429,7 +436,8 @@ function cpuGauge(pressure, charged) {
     typeof charged === "object" && charged !== null ? charged.cpu_m : null;
   return hostGauge(
     "Host load from the kernel, per core. The tick inside is the share the loop reserved for its agents.",
-    formatLoad(load1min, ncpu),
+    formatLoadFigure(load1min, ncpu),
+    formatLoadDetail(load1min, ncpu),
     load,
     "host CPU load",
     marker,
@@ -468,7 +476,8 @@ function memoryGauge(pressure, charged) {
     typeof charged === "object" && charged !== null ? charged.memory_mb : null;
   return hostGauge(
     "Host memory used, from MemTotal and MemAvailable. The tick inside is the share the loop reserved for its agents.",
-    formatMemUsed(totalMb, availMb),
+    formatMemFigure(totalMb, availMb),
+    formatMemDetail(totalMb, availMb),
     frac,
     "host memory used",
     marker,
@@ -640,13 +649,8 @@ function diskCard(disk) {
   if (tightest !== null) {
     if (typeof tightest.total === "number" && tightest.total > 0) {
       const used = typeof tightest.used === "number" ? tightest.used / tightest.total : null;
-      section.appendChild(
-        el(
-          "p",
-          formatBytes(tightest.free) + " free of " + formatBytes(tightest.total),
-          { class: "giant" },
-        ),
-      );
+      section.appendChild(el("p", formatBytes(tightest.free) + " free", { class: "giant" }));
+      section.appendChild(el("p", "of " + formatBytes(tightest.total), { class: "sub" }));
       if (used !== null) {
         section.appendChild(meter(used, bandFor(used), "disk use " + String(tightest.path)));
       }
@@ -852,10 +856,8 @@ function agentRow(row, nowMs) {
   stateNode.appendChild(dot);
   stateNode.appendChild(document.createTextNode(cleanText(String(row.state))));
   cell("c-state", stateNode);
-  const running =
-    row.started_at === null || row.started_at === undefined
-      ? "not reported"
-      : age(row.started_at, nowMs);
+  // Running for takes a duration, not an age: "4h", never "4h ago".
+  const running = formatDuration(parseEpoch(row.started_at), nowMs);
   cell("c-running", el("span", running));
   const seen =
     row.last_seen === null || row.last_seen === undefined ? "not reported" : age(row.last_seen, nowMs);
@@ -1216,7 +1218,7 @@ function stripSegments(doc, nowMs) {
       state: "ok",
     });
   } else {
-    segs.push({ label: "Fleet", text: "fleet unknown", state: "unknown" });
+    segs.push({ label: "Fleet", text: "unknown", state: "unknown" });
   }
   const loop = okSection(doc, "drive");
   if (loop !== null) {
@@ -1227,10 +1229,10 @@ function stripSegments(doc, nowMs) {
         typeof loop.pause_reason === "string" && loop.pause_reason !== ""
           ? loop.pause_reason
           : "no reason recorded";
-      text = "loop paused: " + reason;
+      text = "paused: " + reason;
       state = "low";
     } else {
-      text = "loop running, last pass " + age(loop.last_pass_at, nowMs);
+      text = "running, last pass " + age(loop.last_pass_at, nowMs);
     }
     // Half a budget is no budget: one half missing reads as not
     // reported instead of dropping the segment silently.
@@ -1251,39 +1253,39 @@ function stripSegments(doc, nowMs) {
     }
     segs.push({ label: "Loop", text, state });
   } else {
-    segs.push({ label: "Loop", text: "loop unknown", state: "unknown" });
+    segs.push({ label: "Loop", text: "unknown", state: "unknown" });
   }
   const quota = okSection(doc, "quota");
   if (quota !== null) {
     const providers = quota.providers && typeof quota.providers === "object" ? quota.providers : {};
     const names = Object.keys(providers).sort();
     if (names.length === 0) {
-      segs.push({ label: "Quota", text: "quota: no providers", state: "unknown" });
+      segs.push({ label: "Quota", text: "no providers", state: "unknown" });
     } else {
       const staleNames = names.filter((name) => (providers[name] || {}).stale);
       if (staleNames.length > 0) {
         segs.push({
           label: "Quota",
-          text: "quota stale: " + staleNames.join(", "),
+          text: "stale: " + staleNames.join(", "),
           state: "low",
         });
       } else {
-        segs.push({ label: "Quota", text: "quota fresh", state: "ok" });
+        segs.push({ label: "Quota", text: "fresh", state: "ok" });
       }
     }
   } else {
-    segs.push({ label: "Quota", text: "quota unknown", state: "unknown" });
+    segs.push({ label: "Quota", text: "unknown", state: "unknown" });
   }
   const resources = okSection(doc, "resources");
   const pressure = resources && resources.pressure ? resources.pressure : null;
   if (pressure !== null && typeof pressure.load_per_cpu === "number") {
     segs.push({
       label: "Load",
-      text: "load " + pressure.load_per_cpu.toFixed(2) + "/cpu",
+      text: pressure.load_per_cpu.toFixed(2) + " per core",
       state: bandFor(pressure.load_per_cpu),
     });
   } else {
-    segs.push({ label: "Load", text: "load unknown", state: "unknown" });
+    segs.push({ label: "Load", text: "unknown", state: "unknown" });
   }
   const disk = okSection(doc, "disk");
   const paths = disk !== null && Array.isArray(disk.paths) ? disk.paths : [];
@@ -1306,11 +1308,11 @@ function stripSegments(doc, nowMs) {
     }
   }
   if (free === null) {
-    segs.push({ label: "Disk", text: "disk unknown", state: "unknown" });
+    segs.push({ label: "Disk", text: "unknown", state: "unknown" });
   } else {
     segs.push({
       label: "Disk",
-      text: "disk " + formatBytes(free) + " free",
+      text: formatBytes(free) + " free",
       state: worst === null ? "ok" : bandFor(worst),
     });
   }

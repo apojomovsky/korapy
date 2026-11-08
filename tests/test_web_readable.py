@@ -295,11 +295,14 @@ class VisualPass(unittest.TestCase):
         self.assertNotIn("setInterval", app)
 
     def test_shipped_bytes_stay_under_the_maintainer_cap(self):
+        # Ticket 659 split the gauge figures (short figure plus small
+        # detail line, and durations for running-for) and the cap with
+        # it: 160 KB total, still no framework, no build step, no images.
         total = sum(
             len(resources.files("korapy").joinpath(f"web/{name}").read_bytes())
             for name in ("index.html", "app.css", "app.js", "api.js", "fmt.js", "views.js")
         )
-        self.assertLessEqual(total, 150 * 1024)
+        self.assertLessEqual(total, 160 * 1024)
 
 
 if __name__ == "__main__":

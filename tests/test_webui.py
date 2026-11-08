@@ -328,13 +328,16 @@ class SourceDiscipline(unittest.TestCase):
     def test_bundle_stays_small(self):
         # Ticket 642 grew the page (strip, attention, gauges, filter,
         # keyboard, toasts, cache) and the caps with it: 75 KB a file,
-        # 150 KB total, still no framework, no build step, no images.
+        # 150 KB total. Ticket 659 split the gauge figures (short
+        # figure plus small detail line, and durations for
+        # running-for) and the total with it: 160 KB, still no
+        # framework, no build step, no images.
         total = 0
         for name in WEB_FILES:
             size = len(web_bytes(name))
             self.assertLessEqual(size, 75 * 1024, name)
             total += size
-        self.assertLessEqual(total, 150 * 1024)
+        self.assertLessEqual(total, 160 * 1024)
 
     def test_poll_backoff_table_is_pinned(self):
         text = web_bytes("api.js").decode("utf-8")
