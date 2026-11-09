@@ -9,6 +9,7 @@ outside world.
 """
 
 import unittest
+from typing import Any
 
 from korapy import settings, tracker as iface
 from korapy.tracker import (
@@ -27,7 +28,7 @@ from korapy.tracker import (
 
 def table(**over):
     """A ``BoardConfig`` with an addressed board and blank columns."""
-    base = {
+    base: dict[str, Any] = {
         "project_owner": "example",
         "project_number": 3,
         "project_id": None,
@@ -534,11 +535,15 @@ class ProtocolShapeTests(unittest.TestCase):
                 "item",
                 "changes",
                 "items",
+                "pulls_index",
                 "write",
                 "comment",
+                "comments",
                 "add_label",
+                "remove_label",
                 "ensure_labels",
                 "missing_labels",
+                "canonical_repo",
             },
         )
 

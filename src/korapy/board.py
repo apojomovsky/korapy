@@ -40,11 +40,13 @@ import os
 import sqlite3
 from dataclasses import dataclass, field
 
+from korapy import boardstatus
+
 from korapy import paths
 
 #: Schema version stamped as ``PRAGMA user_version``. A database with a
 #: newer or unknown version fails closed instead of migrating.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 #: The store file inside the state dir.
 DB_NAME = "board.sqlite"
@@ -80,6 +82,16 @@ class ExternalItem(Exception):
     """The item is external: every write to it is refused (exit 1)."""
 
     exit_code = 1
+
+
+class RenameRefused(Exception):
+    """The target repo already holds rows: refusing a merge (exit 4)."""
+
+    exit_code = 4
+
+
+#: Every table keyed by tracker repo: the rename verb moves all of them.
+RENAME_TABLES = ("items", "claims", "outbox", "cursors", "status_sets", "drift")
 
 
 @dataclass
@@ -176,6 +188,30 @@ _CURSORS_DDL = """
         PRIMARY KEY(repo, name))
 """
 
+#: The Status korapy last set per card: the option id written and the
+#: derived state behind the write. A card whose live Status differs
+#: from the recorded option id was moved by a person. Created by a
+#: fresh database and by the v2 to v3 migration alike: one definition.
+_STATUS_SETS_DDL = """
+    CREATE TABLE IF NOT EXISTS status_sets(
+        repo TEXT NOT NULL, number INTEGER NOT NULL,
+        option_id TEXT NOT NULL, derived TEXT NOT NULL,
+        set_at REAL NOT NULL,
+        PRIMARY KEY(repo, number))
+"""
+
+#: The board-drift verdicts the board step records: one row per card
+#: out of step with its issue, with the time it was first seen that
+#: way. The doctor and the dashboard read this table; only the board
+#: step writes it, reconciling every poll. Created by a fresh database
+#: and by the v3 to v4 migration alike: one definition.
+_DRIFT_DDL = """
+    CREATE TABLE IF NOT EXISTS drift(
+        repo TEXT NOT NULL, number INTEGER NOT NULL,
+        since REAL NOT NULL,
+        PRIMARY KEY(repo, number))
+"""
+
 
 def _migrate(conn):
     """Create the schema forward from an empty database, in one place."""
@@ -214,12 +250,26 @@ def _migrate(conn):
         """
     )
     conn.execute(_CURSORS_DDL)
+    conn.execute(_STATUS_SETS_DDL)
+    conn.execute(_DRIFT_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _migrate_1_to_2(conn):
     """Forward a version-1 database: add the tracker cursor table."""
     conn.execute(_CURSORS_DDL)
+    conn.execute("PRAGMA user_version=2")
+
+
+def _migrate_2_to_3(conn):
+    """Forward a version-2 database: add the last-set Status table."""
+    conn.execute(_STATUS_SETS_DDL)
+    conn.execute("PRAGMA user_version=3")
+
+
+def _migrate_3_to_4(conn):
+    """Forward a version-3 database: add the board-drift verdicts table."""
+    conn.execute(_DRIFT_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -465,6 +515,66 @@ class Store:
         """Drop the stored cursor for ``repo`` and ``name``, if any."""
         self._conn.execute("DELETE FROM cursors WHERE repo=? AND name=?", (repo, name))
 
+    def status_set_of(self, repo, number):
+        """The Status korapy last set on (``repo``, ``number``), or None.
+
+        Read-only: the recorded option id and derived state, so the
+        pass can tell a person's manual move from its own last write.
+        """
+        row = self._conn.execute(
+            "SELECT option_id, derived FROM status_sets WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        if row is None:
+            return None
+        return boardstatus.StatusRecord(option_id=row[0], derived=row[1])
+
+    def record_status_set(self, repo, number, option_id, derived, *, now):
+        """Remember the Status just set on (``repo``, ``number``).
+
+        Overwrites any earlier record for the card: only the latest
+        write decides whether the live value is still korapy's.
+        """
+        self._conn.execute(
+            "INSERT INTO status_sets(repo, number, option_id, derived, set_at)"
+            " VALUES(?, ?, ?, ?, ?)"
+            " ON CONFLICT(repo, number) DO UPDATE SET"
+            " option_id=excluded.option_id, derived=excluded.derived,"
+            " set_at=excluded.set_at",
+            (repo, number, option_id, derived, now),
+        )
+
+    def note_drift(self, repo, number, *, now):
+        """Flag (``repo``, ``number``) as out of step with its issue.
+
+        The first sighting wins: a card that stays drifted keeps its
+        original ``since``, so the doctor's age counts the whole drift,
+        not the last poll. Only the board step calls this, reconciling
+        every poll; the doctor and the dashboard only read.
+        """
+        self._conn.execute(
+            "INSERT INTO drift(repo, number, since) VALUES(?, ?, ?)"
+            " ON CONFLICT(repo, number) DO NOTHING",
+            (repo, number, now),
+        )
+
+    def clear_drift(self, repo, number):
+        """Clear the drift flag on (``repo``, ``number``), if any."""
+        self._conn.execute("DELETE FROM drift WHERE repo=? AND number=?", (repo, number))
+
+    def drift_flags(self):
+        """Every drift verdict as ``(repo, number, since)``, ordered by repo and number.
+
+        Read-only: the doctor counts one repo's rows against its age
+        setting, and the dashboard sums the whole table.
+        """
+        return [
+            (row[0], row[1], row[2])
+            for row in self._conn.execute(
+                "SELECT repo, number, since FROM drift ORDER BY repo ASC, number ASC"
+            ).fetchall()
+        ]
+
     def queued_writes(self, limit=None):
         """Queued outbox rows, oldest first, at most ``limit``."""
         query = (
@@ -476,6 +586,15 @@ class Store:
             query += " LIMIT ?"
             args.append(limit)
         return [OutboxRow(*row) for row in self._conn.execute(query, args).fetchall()]
+
+    def rename_counts(self, repo):
+        """Row counts per keyed table for ``repo``. Pure reads, no writes."""
+        return {
+            table: self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE repo=?", (repo,)
+            ).fetchone()[0]
+            for table in RENAME_TABLES
+        }
 
     def outbox_rows(self, state=None):
         """Outbox rows for inspection, oldest first, optionally by state."""
@@ -862,6 +981,52 @@ class Store:
             )
             self._set_confidence(row[0], row[1])
 
+    def rename_repo(self, old, new):
+        """Move every ``old`` key to ``new`` across the keyed tables.
+
+        One transaction: items, claims (agent and epoch kept, so the
+        fencing token survives the move), the outbox (queued, sent and
+        dropped rows alike, so settled history stays coherent), the
+        sync cursors and the last-set Status records (``status_sets``,
+        so a later move is still seen as a person's). An unknown ``old``
+        moves nothing and reports zero
+        counts, so a second run is a no-op (even with ``new`` holding
+        the moved rows); an ``old`` that still holds rows while ``new``
+        does too refuses with ``RenameRefused`` instead of merging two
+        repositories.
+        """
+        with _txn(self._conn):
+            counts = self.rename_counts(old)
+            if not sum(counts.values()):
+                return counts
+            for table in RENAME_TABLES:
+                present = self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE repo=? LIMIT 1", (new,)
+                ).fetchone()
+                if present is not None:
+                    raise RenameRefused(
+                        f"{new} already holds store rows: refusing a merge of two repositories"
+                    )
+            for table in RENAME_TABLES:
+                self._conn.execute(f"UPDATE {table} SET repo=? WHERE repo=?", (new, old))
+            return counts
+
+    def backup_into(self, path):
+        """Snapshot the store into ``path`` with ``VACUUM INTO``.
+
+        The snapshot reads a consistent image even beside a live
+        store; the path must not exist yet, so a backup never
+        clobbers one. ``VACUUM INTO`` takes no bound filename, so the
+        path rides as a quoted literal. Raises ``StoreError`` when the
+        snapshot cannot be written.
+        """
+        literal = "'" + str(path).replace("'", "''") + "'"
+        try:
+            self._conn.execute(f"VACUUM INTO {literal}")
+        except sqlite3.Error as err:
+            raise StoreError(f"cannot back up the board store into {path}: {err}") from err
+        return path
+
     def mark_dirty(self, _id, reason):
         """A push failed: count the attempt and flag the item dirty. The
         write stays queued for the next mirror pass."""
@@ -912,6 +1077,15 @@ def open_store(path=None):
         elif version == 1:
             with _txn(conn):
                 _migrate_1_to_2(conn)
+                _migrate_2_to_3(conn)
+                _migrate_3_to_4(conn)
+        elif version == 2:
+            with _txn(conn):
+                _migrate_2_to_3(conn)
+                _migrate_3_to_4(conn)
+        elif version == 3:
+            with _txn(conn):
+                _migrate_3_to_4(conn)
         elif version != SCHEMA_VERSION:
             raise StoreError(
                 f"board store {target} has schema version {version},"

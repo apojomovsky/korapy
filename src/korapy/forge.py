@@ -60,6 +60,10 @@ class PullRequest(NamedTuple):
     labels: tuple[str, ...]
     checks_state: str  # "passing" | "failing" | "pending" on the head SHA
     merge_sha: str | None  # the merge commit once merged, else None
+    # How many checks on the head SHA are still running. Fakes set it
+    # explicitly; the adapter leaves the default and reports the live
+    # count through `pending_checks` instead.
+    checks_pending: int = 0
 
 
 class Forge(Protocol):
@@ -116,6 +120,13 @@ class Forge(Protocol):
         missing."""
         ...
 
+    def pending_checks(self, repo: str, sha: str) -> int:
+        """How many checks on ``sha`` are still running. Raises
+        ``ForgeError`` when the forge is unreachable or answers
+        something unusable. A separate, optional read: it only
+        decorates a pending checks row and never changes the verdict."""
+        ...
+
     def pr_index(self, repo: str) -> dict[str, str]:
         """Every pull request ever opened against ``repo``, keyed by
         head branch name, valued ``"open"`` | ``"merged"`` | ``"closed"``.
@@ -124,12 +135,16 @@ class Forge(Protocol):
         ...
 
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-        """Squash-merge PR ``number`` and return the merge commit SHA.
+        """Merge PR ``number`` and return the merge commit SHA.
 
-        Refuses with ``ForgeRefused`` unless the PR is open at
-        ``head_sha``. Raises ``ForgeError`` when the forge is unreachable
-        or answers something unusable. Only the adapters call ``gh`` or
-        know provider shapes. ``method`` takes one value today,
-        ``"squash"``.
+        ``method`` is ``"squash"`` or ``"merge"``: the verb resolves it
+        from the project's ``merge.method`` setting and carries it here.
+        Anything else is ``ForgeError``. Refuses with ``ForgeRefused``
+        unless the PR is open at ``head_sha``. Raises ``ForgeError``
+        when the forge is unreachable or answers something unusable.
+        Only the adapters call ``gh`` or know provider shapes. For a
+        merge commit the adapter verifies the merge commit's parents
+        include ``head_sha``; anything else is unverified
+        (``ForgeError``), never returned.
         """
         ...

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -249,6 +250,102 @@ class EachCheckFailingAlone(unittest.TestCase):
         self.assertIn("live=2", found[0].detail)
         self.assertIn("stale=1", found[0].detail)
         self.assertIn("finished=0", found[0].detail)
+
+
+NOW = 1_800_000_000.0
+
+
+def finished_entry(run_s, gap_s=0.0):
+    return {
+        "id": "agent-1",
+        "started_at": NOW - gap_s - run_s,
+        "ended_at": NOW - gap_s,
+        "outcome": "ok",
+    }
+
+
+def reviewer_entry(run_s, gap_s=0.0):
+    return {**finished_entry(run_s, gap_s), "role": "reviewer"}
+
+
+class MaxTime(unittest.TestCase):
+    def test_no_row_without_a_limit_reading(self):
+        rows = ((finished_entry(4 * 3600), registry.FINISHED),)
+        checks = doctor.run_checks(env(registry_rows=rows))
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_no_row_without_finished_runs(self):
+        checks = doctor.run_checks(
+            env(registry_rows=((live_entry(), registry.LIVE),), max_time_s=3600.0)
+        )
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_ok_when_the_limit_covers_the_longest_run(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (finished_entry(2 * 3600), registry.FINISHED),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+
+    def test_warn_when_the_limit_is_shorter_than_the_longest_run(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (finished_entry(4 * 3600), registry.FINISHED),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("agents.max_time", found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_live_entries_do_not_count(self):
+        rows = (
+            (finished_entry(3600), registry.FINISHED),
+            (dict(live_entry(), started_at=NOW - 5 * 3600), registry.LIVE),
+        )
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+
+    def test_reviewer_runs_read_the_worker_limit_without_an_override(self):
+        rows = ((reviewer_entry(4 * 3600), registry.FINISHED),)
+        checks = doctor.run_checks(env(registry_rows=rows, max_time_s=3 * 3600.0))
+        found = [check for check in checks if check.name == "agents.max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertNotIn("agents.reviewer_max_time", names(checks))
+
+    def test_warn_when_a_reviewer_run_outruns_the_reviewer_limit(self):
+        rows = ((reviewer_entry(50 * 60), registry.FINISHED),)
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        found = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("agents.reviewer_max_time", found[0].fix)
+
+    def test_ok_when_reviewer_runs_fit_the_reviewer_limit(self):
+        rows = ((reviewer_entry(20 * 60), registry.FINISHED),)
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        found = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertNotIn("agents.max_time", names(checks))
+
+    def test_each_role_reads_its_own_limit(self):
+        rows = (
+            (finished_entry(2 * 3600), registry.FINISHED),
+            (reviewer_entry(50 * 60), registry.FINISHED),
+        )
+        checks = doctor.run_checks(
+            env(registry_rows=rows, max_time_s=3 * 3600.0, reviewer_max_time_s=30 * 60.0)
+        )
+        worker = [check for check in checks if check.name == "agents.max_time"]
+        reviewing = [check for check in checks if check.name == "agents.reviewer_max_time"]
+        self.assertEqual([check.status for check in worker], ["ok"])
+        self.assertEqual([check.status for check in reviewing], ["warn"])
 
 
 class Rendering(unittest.TestCase):
@@ -576,6 +673,88 @@ class DriveRows(unittest.TestCase):
         self.assertLess(ordered.index("user-manager"), ordered.index("drive-timer"))
         self.assertLess(ordered.index("drive-timer"), ordered.index("drive-projects"))
 
+    def test_an_ok_row_names_each_loaded_policy_file(self):
+        checks = doctor.run_checks(
+            env(
+                project_problems=(),
+                project_policies=(
+                    ("blue", "blue_policy:eligible", "/srv/ops/blue/blue_policy.py"),
+                    ("green", "green_policy:eligible", "/srv/ops/green/green_policy.py"),
+                ),
+            )
+        )
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertIn("blue", found[0].detail)
+        self.assertIn("blue_policy:eligible", found[0].detail)
+        self.assertIn("/srv/ops/blue/blue_policy.py", found[0].detail)
+        self.assertIn("green", found[0].detail)
+        self.assertIn("/srv/ops/green/green_policy.py", found[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_an_ok_row_without_a_policy_reading_stays_generic(self):
+        checks = doctor.run_checks(env(project_problems=()))
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertIn("every policy entry resolves", found[0].detail)
+
+    def test_load_project_policies_reports_each_resolving_entry(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-doctor-policies-"))
+        ops = os.path.join(tmp, "ops")
+        os.makedirs(ops)
+        expected = os.path.join(ops, "blue_policy.py")
+        with open(expected, "w", encoding="utf-8") as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        config = os.path.join(tmp, "config")
+        os.makedirs(os.path.join(config, "projects.d"))
+        with open(os.path.join(config, "projects.d", "blue.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'name = "blue"\nunit_prefix = "blue-agent"\n'
+                f'root = "{ops}"\n'
+                'eligibility = "blue_policy:eligible"\n'
+            )
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
+        with mock.patch.dict(os.environ, dict(kept, KORAPY_CONFIG=config), clear=True):
+            try:
+                self.assertEqual(
+                    doctor.load_project_policies(),
+                    [("blue", "blue_policy:eligible", expected)],
+                )
+            finally:
+                sys.modules.pop("blue_policy", None)
+
+    def test_load_project_report_imports_each_policy_once(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-doctor-report-"))
+        ops = os.path.join(tmp, "ops")
+        os.makedirs(ops)
+        marker = os.path.join(tmp, "imports.log")
+        expected = os.path.join(ops, "blue_policy.py")
+        with open(expected, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"with open({marker!r}, 'a', encoding='utf-8') as handle:\n"
+                "    handle.write('imported\\n')\n"
+                "def eligible(rows, *, now):\n"
+                "    return []\n"
+            )
+        config = os.path.join(tmp, "config")
+        os.makedirs(os.path.join(config, "projects.d"))
+        with open(os.path.join(config, "projects.d", "blue.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'name = "blue"\nunit_prefix = "blue-agent"\n'
+                f'root = "{ops}"\n'
+                'eligibility = "blue_policy:eligible"\n'
+            )
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
+        with mock.patch.dict(os.environ, dict(kept, KORAPY_CONFIG=config), clear=True):
+            try:
+                problems, sources = doctor.load_project_report()
+            finally:
+                sys.modules.pop("blue_policy", None)
+        self.assertEqual(problems, [])
+        self.assertEqual(sources, [("blue", "blue_policy:eligible", expected)])
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
+
 
 HUB_URL = "http://host-1:8080"
 
@@ -817,6 +996,37 @@ class ProductionHubGathering(unittest.TestCase):
                 self.assertEqual(probe.status, "unreachable")
                 self.assertIn("404", probe.detail)
 
+    def test_a_refused_probe_closes_the_error_response(self):
+        """An `HTTPError` owns a temp-file wrapper: leaking it warns at GC."""
+        import urllib.error
+        from email.message import Message
+
+        for code in (401, 404, 500):
+            with self.subTest(code=code):
+                fp = io.BytesIO(b"{}")
+                refused = urllib.error.HTTPError(
+                    HUB_URL + "/v1/version", code, "Not Found", Message(), fp
+                )
+                with mock.patch("urllib.request.urlopen", side_effect=refused):
+                    doctor.load_hub_probe(HUB_URL, None)
+                self.assertTrue(fp.closed, f"HTTP {code} response left open")
+
+    def test_a_probe_survives_an_error_that_cannot_close(self):
+        """A close failure stays report data, never a traceback."""
+        import urllib.error
+        from email.message import Message
+
+        refused = urllib.error.HTTPError(
+            HUB_URL + "/v1/version", 500, "Not Found", Message(), io.BytesIO(b"{}")
+        )
+        refused.close = mock.Mock(side_effect=OSError("no fd to close"))
+        with mock.patch("urllib.request.urlopen", side_effect=refused):
+            probe = doctor.load_hub_probe(HUB_URL, None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "unreachable")
+        self.assertIn("500", probe.detail)
+
     def test_probe_never_logs_the_token(self):
         import threading
 
@@ -857,6 +1067,77 @@ class ProductionHubGathering(unittest.TestCase):
             self.assertEqual(probe.status, "ok")
             self.assertFalse(any(token in line for line in records))
             self.assertNotIn(token, probe.detail)
+
+
+class QuotaFreshness(unittest.TestCase):
+    T0 = 1_800_000_000.0
+
+    def view(self, providers):
+        return {"now": self.T0, "providers": providers}
+
+    def entry(self, **fields):
+        values = {
+            "state": "ok",
+            "windows": {"weekly": {"used_pct": 10.0, "resets_at": None}},
+            "read_at": self.T0,
+            "stale": False,
+            "stale_reason": None,
+            "mark": None,
+            "reader": "fake:provider-a",
+            "error": None,
+        }
+        values.update(fields)
+        return values
+
+    def test_no_quota_view_means_no_quota_rows(self):
+        checks = doctor.run_checks(env())
+        self.assertEqual([check.name for check in checks if check.name.startswith("quota:")], [])
+
+    def test_a_fresh_reading_is_an_ok_row_with_its_age(self):
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": self.entry()})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "ok")
+        self.assertIn("just now", rows[0].detail)
+
+    def test_a_too_old_reading_warns_with_its_reason(self):
+        entry = self.entry(
+            state="unknown", stale=True, stale_reason="too old", read_at=self.T0 - 10
+        )
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("too old", rows[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_missing_reading_warns_that_it_never_ran(self):
+        entry = self.entry(state="unknown", stale=True, stale_reason="never ran", read_at=None)
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("never ran", rows[0].detail)
+
+    def test_a_failed_reading_warns_with_the_error(self):
+        entry = self.entry(
+            state="unknown",
+            stale=True,
+            stale_reason="reader failed",
+            read_at=self.T0 - 60,
+            error="boom",
+        )
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("reader failed", rows[0].detail)
+        self.assertIn("boom", rows[0].detail)
+
+    def test_an_unreadable_ledger_is_one_warn_row(self):
+        checks = doctor.run_checks(env(quota_view=ValueError("ledger gone")))
+        rows = [check for check in checks if check.name == "quota"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("ledger gone", rows[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
 
 
 if __name__ == "__main__":

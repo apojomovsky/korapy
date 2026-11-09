@@ -28,11 +28,11 @@ loop deletes (section 7: the loop deletes nothing).
 ## 1. Process model: a timer running a one-shot pass
 
 Decision: no daemon. `korapy drive` runs one pass and exits. A
-`systemd --user` timer wakes it every `drive.period` (default 5
-minutes). The timer unit ships with korapy and is enabled by the
-operator; installing or enabling host units needs a maintainer's
-go-ahead per AGENTS.md, so the implementation ticket files that as a
-separate step.
+`systemd --user` timer wakes it every `drive.period`
+(default in [`configuration.md`](configuration.md)). The timer unit
+ships with korapy and is enabled by the operator; installing or
+enabling host units needs a maintainer's go-ahead per AGENTS.md, so
+the implementation ticket files that as a separate step.
 
 Why not a long-lived daemon:
 
@@ -79,8 +79,39 @@ def eligible(rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]: ..
 `repo`, `number`, `title`, `labels`, `priority`, `state`, `agent`,
 `status`, `external`, and linked pull requests with their check and
 review state as data. `StartRequest` names `repo`, `number` and `kind`
-(`start`, `resume`, `review`, `fix`) and may carry a project-local
-weight used only to order within that project.
+(`start`, `resume`, `review`, `fix`, `research`) and may carry a project-local
+weight used only to order within that project. `research` is a
+research question (see section 5): it claims and launches like
+`start`, but finishes as a Findings comment.
+
+The policy module lives in the project's own ops root, beside
+`korapy.toml`: the registration above loads `blue_policy.py` from
+`/srv/ops/blue_ops`, with no installation and no host service
+environment to edit. A dotted module imports with that root first on
+the import search path, restored before the pass moves on (also on
+failure); when the same module name exists both in the ops root and
+elsewhere, the ops root's copy wins, and the loaded file is recorded
+on the policy. `korapy doctor` verifies every registration's entry
+resolves; the `drive-projects` row fails naming the project, the
+module and the reason when one does not, and names the file each
+resolving entry loaded from when all do. Cached modules from another
+project's root never leak across: each load resolves against its own
+root even when two projects name the same module.
+
+A policy only sees its own project's repositories. The board store is
+shared per host and keyed by tracker repository, so one project's rows
+sit next to another's; before the policy runs, the pass hides every
+row whose tracker repo is not one of the project's own `[[repo]]`
+entries (tracker spelling, through the one `driven_repos` resolver
+the rest of the pass reads), and drops any request naming such a
+repo. Two projects sharing a short entry name keep their own tracker
+repos: the scoping reads each root's own entries, never the
+first-winner pass map. A launch-path check refuses the pass with exit
+4 naming the repository if a foreign row ever reaches a claim, in
+case a future caller bypasses the filter. The review-record lookup
+reads only rows in a driven repository too, so a foreign row prints
+no error line: the pass reports the ignored foreign rows once, per
+project.
 
 The function is pure by contract: no tracker, forge, `gh`, network,
 clock or settings access inside. Korapy supplies everything as
@@ -110,9 +141,12 @@ Why not the alternatives:
 Open question settled here: the design doc's `Project.wants()` sketch
 takes no arguments. It becomes `eligible(rows, *, now)` as above; a
 project with no `eligibility` entry registers no candidates and the
-drive skips it with a logbook line. Loading failures are configuration
-errors (exit 4) naming the project and entry point, reported once per
-pass, and they block only that project.
+drive skips it with a logbook line. An entry that does not import, or
+an answer that is not a list of `StartRequest` rows, skips that
+project for the pass with one error line naming the project, the
+module and the reason; every other project's pass still runs, and the
+pass exits 4. `korapy doctor` reports the import failures in its
+`drive-projects` row.
 
 Ready-made policy: most projects need no policy code. The
 `korapy.policies` module ships `basic(rows, *, now)`, which a
@@ -120,15 +154,84 @@ registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
-`blocked_by` and no `blocked` label), and with no open linked pull
-request, claimed or not: in-flight rows stay requested so the loop
-never withdraws them by omission. Weight is the board priority rank,
+`blocked_by` and no `blocked` label), not already `researched`, and with no open linked pull
+request and no linked pull merged since the claim start (by merge
+time, falling back to the last-update time when the listing carries
+no merge time), claimed or not: in-flight rows stay requested
+so the loop never withdraws them by omission, while a ticket whose
+work landed during its claim stays withdrawn so no new round starts
+on landed work. A pull merged before the claim start reads as
+landed-before-this-round, so a reopened ticket picked up again still
+selects. A research ticket is selected like
+any other, but asks for kind `research` (see section 5). Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
+A project with its own board rules writes a small policy instead. A
+board whose Status column gates the work, for example, keeps a module
+like this in its ops root:
+
+```python
+# <ops root>/lead_policy.py: start tickets whose board Status reads Ready
+from korapy.eligibility import StartRequest
+
+READY = "Ready"
+
+
+def eligible(rows, *, now):
+    return [
+        StartRequest(repo=row.repo, number=row.number, kind="start")
+        for row in rows
+        if row.extra.get("board_status") == READY
+    ]
+```
+
+registered as one line:
+
+```toml
+eligibility = "lead_policy:eligible"
+```
+
+Board columns (`Status`, `Priority`, `Area`, `Pool`, `Blocked by`)
+arrive on each row's `extra` map; labels, state and linked pulls ride
+along as row fields, so the same shape filters on any of them.
+
+The store carries no linked pulls (pull-request rows are never ticket
+rows, and the sync drops them), so the pass lists each fetchable
+ticket's repository once through the tracker (`Tracker.pulls_index`,
+implemented once by each adapter: one paged open-pulls listing per
+repository, plus one paged closed-pulls listing newest first, filed
+by linked ticket; pulls closed without merging are filed nowhere)
+and the rows a policy sees arrive with `pulls` populated: only
+tickets some project wants and the gate could still decide trigger a
+listing (open, unheld or managed-held rows in a repository the pass
+drives; anything else never fetches, and with none to check the
+tracker is never contacted). The closed-pull listing only covers
+pulls updated since the oldest live claim start on the repository,
+stopping at the first older page, so a long pull history costs a
+bounded number of calls; a repository with no live claim lists no
+closed pulls at all, and an unclaimed ticket's merged link stays
+invisible there until something on the repository is claimed again.
+Each row also carries its pull times from that one listing (the merge
+time, falling back to the last-update time when the listing carries
+no merge time) and its claim start from the store, so the policy and
+the gate scope old merges against the same times. `basic`'s own pull
+filter refuses a ticket with an open linked pull or a linked pull
+merged since the claim start, and the shared gate reads the same row
+pulls (section 3), so the two never disagree and no second lookup runs.
+The `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md)) caps the listing calls
+per pass: repositories past the cap leave their tickets unreadable, and
+the gate refuses those starts, failing closed like an unreadable
+listing. `--plan` builds rows with `pulls` empty: it never contacts the
+tracker. Which findings reopen work is the gate's call too: it grades
+the ticket's latest review record against the fix-round threshold, so a
+policy only decides to ask, never whether the asking succeeds
+(section 5).
+
 ## 3. Ordering and fairness; caps, quota and hold; what exit 75 does
 
-Each pass builds one candidate list: every project's requests,
+Each pass builds one candidate list: every project's requests
+(scoped to the repositories that project drives, per section 2),
 annotated with board facts (priority, `tracker_updated_at` for wait
 time, current agent and unit liveness). Global order is:
 
@@ -147,10 +250,23 @@ and re-reads live state before every start, never a cached count.
 
 Per-candidate gate order, cheapest first:
 
-1. Non-open, externally owned (the row's stored `external` field,
-   computed at sync time by `board.is_external`; the loop never
-   re-derives it), or withdrawn by this pass's eligibility: skip with
-   reason.
+1. Non-open (a closed issue reads as merged), a linked pull
+   merged since the ticket's claim start for every kind (checked
+   before external ownership, so a listed row with a merged pull
+   still logs `merged` even when also externally owned; external rows
+   are never listed, so in production they carry no pulls and log
+   `externally owned`), externally owned
+   (the row's stored `external` field, computed at sync time by
+   `board.is_external`; the loop never re-derives it), or withdrawn
+   by this pass's eligibility: skip with reason `merged` for the
+   first two. No new round of any kind starts on a ticket whose work
+   landed during its claim, claimed or not, while a running unit is
+   never stopped by this verdict. A pull merged before the claim
+   start reads as landed-before-this-round, so a reopened ticket
+   picked up again keeps its round; a ticket with no claim withdraws
+   on any listed merged link (a repository with no live claim lists
+   no closed pulls, so the link stays invisible there). A pull closed
+   without merging is not merged: the ticket still needs its round.
 2. Claim routing by request kind against the row's live holder.
    `resume`, `fix`, `review` and stuck restarts are classified here,
    before any claimed check, so the check below never sees them as
@@ -182,14 +298,49 @@ Per-candidate gate order, cheapest first:
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
      worker finishes and the takeover above schedules it.
-3. Hold: `hold.reason` over the ticket and linked PR labels.
+3. Review threshold (unclaimed rows) and linked pulls.
+   The pass reads the ticket's latest review record once per pass
+   from the session dirs and grades it here: an approving verdict
+   (`approve` or `approve-with-findings`) whose findings all sit
+   below the `drive.fix_round_threshold` setting (default in [`configuration.md`](configuration.md))
+   is merge-ready, so a fix, resume, review or start requested on it
+   skips instead of launching. A `block` verdict, or any finding at
+   or above the threshold, opens exactly one fix round through the
+   normal launch path. Severities outside the `high`, `normal`, `low`
+   vocabulary read as above the threshold: the loop never silently
+   merges a finding it cannot grade. A finished reviewer (registry
+   outcome `ok`) with no record for the ticket is a protocol failure,
+   never a finding: the unheld row skips with code `review-missing`
+   (`review missing`) for every kind, so no worker, fix round or
+   re-review starts on it. The pass logs `reviewer finished without
+   a review record` once per pass for the unheld row, with the ticket
+   and the finished reviewer id; a held row skips as `claim` and logs
+   nothing. The skip shows in the drive journal and in the `snapshot`
+   drive section's skipped-by-reason counts, where a coordinator
+   sees it. Only an `ok` outcome counts: any other outcome, or no
+   review map at all, gates as before. Then the fresh-start check: a
+   `start` (including a `fix` or `resume` reclassified as one) on an
+   unclaimed row with an open linked pull request skips, since the
+   pull carries the ticket. The linked pulls come from the row, which
+   the pass populated from one `Tracker.pulls_index` listing per
+   repository; an unreadable read fails closed (skip, record
+   "unreadable"), and so does a repository past the
+   `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md))
+   cap (skip, record "pulls lookup limited").
+   A `fix`, `resume`, or takeover `review` on a claimed row reads the same row pulls:
+   unreadable pulls refuse it with the cause named, and a hold label
+   on a linked pull hold-skips it. `--plan` builds rows with no pulls
+   and skips this check: it never
+   contacts the tracker. The summary line counts the listing calls
+   (`pulls calls`), so a regression is visible at once.
+4. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
    not started, resumed or reviewed by the loop.
-4. Admission (`admission.admit` against live state from
+5. Admission (`admission.admit` against live state from
    `launch.admission_state`): project ceiling and repo cap first, then
    the host total with the floor rule.
-5. Quota gate over the project's chains against the shared ledger. A
+6. Quota gate over the project's chains against the shared ledger. A
    refused role is a skip for that candidate only; another project's
    chains may route around the exhausted provider.
 
@@ -230,7 +381,7 @@ them beyond the prefix.
 Decision: the hash input never carries the raw hostname. The
 claim `agent` value is mirrored to the tracker as a label, so on a
 public tracker it would publish the deployment hostname. The host
-segment comes from the `drive.agent_host` setting, resolved once per
+segment comes from the `drive.agent_host` setting (default in [`configuration.md`](configuration.md)), resolved once per
 pass: a configured display name is used verbatim (with `/` replaced
 by `-`), and the default is a short stable hash of the hostname
 rather than the hostname itself. The id stays opaque and slash-free
@@ -308,10 +459,27 @@ States and who moves them:
   pool, and each reviewer id is minted fresh at start time, so there
   is nothing to compare a row against. No `author` field is added to
   `TicketRow` because scheduling never needs it.
-- Changes requested: the loop schedules a fix round as `resume` when
-  the worker's unit or registry entry is still usable, else a fresh
-  `fix` start on the same ticket and branch. Fix rounds count against
-  the restart budget below.
+- Changes requested: the review record's findings decide. A finding
+  at or above the `drive.fix_round_threshold` setting (default in [`configuration.md`](configuration.md)), or a `block` verdict, schedules a fix round as `resume`
+  when the worker's unit or registry entry is still usable, else a
+  fresh `fix` start on the same ticket and branch. Fix rounds count
+  against the restart budget below.
+- Approved with only lows: the ticket is merge-ready and the loop
+  launches nothing. The lows stay in the review record for the
+  coordinator (or a future merge verb) to file as issues; no fix
+  round churns on approved work, and no fresh worker starts on a
+  ticket whose pull request is already open.
+- Reviewer finished with no record: the ticket is not merge-ready
+  and the loop still launches nothing. A reviewer that exits `ok`
+  without writing its record is a protocol failure, not an approval:
+  the claim is released as usual, but the gate refuses every kind
+  with `review-missing` (section 3), so neither a fresh worker nor
+  a fix round touches the approved work. The ticket stays in that
+  visible state until a coordinator resolves it: record the verdict
+  by hand with `korapy review record`, and the normal threshold
+  path resumes on the next pass. The reviewer prompt says this
+  outright: the review is complete only when `korapy review record`
+  succeeded, and a prose verdict alone is not a review.
 - Merge-ready: the loop does nothing. A maintainer merges. The loop
   never merges, never closes, never assigns.
 
@@ -363,7 +531,11 @@ check that serializes a fix behind a live reviewer, the
 finished-role carry that frees a reviewed row, and the orphan
 presence check all read that
 resolver, never a second copy; keying on the holder id instead would
-match no entry and mistake every finished worker for a crash. The takeover releases the worker
+match no entry and mistake every finished worker for a crash. Session
+directories and review records are keyed by the short `[[repo]]` name
+as well, so `korapy repo rename` leaves them in place (see #479); once
+that issue lands and records resolve by store key, the rename must move
+the session directories with the store keys. The takeover releases the worker
 claim and claims a fresh reviewer id in the same handoff, so there is
 never a window where the row is unclaimed. Worker completion takes
 over before any reviewer start and long before merge; merge-ready rows
@@ -436,6 +608,54 @@ re-check below.
   eligibility says. A failed decision write keeps the claim for a
   later pass.
 
+Research tickets: some tickets are questions, not changes, and finish
+as a written finding with no pull request. A ticket carrying the
+`research` label starts with the research worker prompt (read-only on
+the repository, writes no commits, posts one comment on the ticket
+whose first line starts with `Findings`). Eligibility selects research
+tickets like any other, but asks for kind `research` (`basic` maps the
+label; `researched` rows are never selected, since answering twice is
+not work). The kind claims and launches exactly like `start` and
+counts toward the same caps; the launch runs the `research` role
+prompt, overridable as `prompts.research` like the other roles.
+
+The loop treats a research ticket as done when its Findings comment
+exists. Done detection is one pure function over the ticket's
+comments (`research.findings`): the first comment whose first line
+starts with `Findings`. The first Findings comment on the ticket
+wins across re-runs: comment bodies carry no authorship or timestamp
+to scope the verdict to the current holder's run. The comments are
+the only new GitHub reads the research finish adds: one
+`Tracker.comments` read per finished research ticket, in the pass
+that already lists its pulls. A rate-limited comments read stops the
+pass with exit 3, like any other tracker outage, instead of settling
+blind. Orphan recovery never releases a claimed research row whose
+finished registry entry names the research role behind the current
+holder, whatever its age: the verdict settles through its comments,
+so the claim survives until the settlement reads them. After the
+orphan recovery, the pass settles each such row: with findings, it
+adds `researched` through the label seam and releases the claim (the
+agent and status clears flow through the mirror as usual); without
+findings, it releases bare, so the ticket is startable again instead
+of waiting on a reviewer that never comes. A failed label write keeps
+the claim for a later pass, never released unlabeled; unreadable
+comments keep it too. A row with a live unit keeps its claim whatever
+the comments say.
+
+A settled research ticket never takes a reviewer: the gate refuses a
+`review` requested on a research row, a finished research holder
+never takes over as one, and the research rows skip both linked-pull
+checks (in the gate and in `basic`, which selects research rows with
+unreadable or open pulls), so the finish never waits for a pull
+request. A finding addressed to the maintainer is reported as an
+attention item on the dashboard (a `research` event in the driving
+project's queue, carrying the finding's first line) until
+acknowledged: re-reporting an acked finding does not reopen it. The
+event goes to the settlement's driving project, resolved where the
+project context still exists; when two projects drive one repository,
+the first sorted project wins. A stuck research worker restarts with
+the research prompt, like any other start.
+
 ## 6. Observability: logbook, snapshot and `--plan`
 
 Every pass appends one JSON object per decision to a host-level
@@ -455,7 +675,9 @@ with section errors on failure, per its contract.
 the whole gate order but never syncs and writes nothing: no tracker
 calls, no claims, no outbox rows, no starts, no mirror, no journal. It prints one row per candidate with the
 verdict and the reason in the same words the logbook would use, plus a
-summary (would start N, blocked per gate). Exit 0 on a completed plan,
+summary (would start N, blocked per gate). Each project with a dropped
+row also prints how many foreign rows it ignored (section 2). Exit 0
+on a completed plan,
 4 when the store could not be read or on configuration errors
 (`board.StoreError` already means 4; there is no exit 3 path because
 `--plan` never contacts the tracker). `--plan`
@@ -469,17 +691,18 @@ never takes the drive lock.
   setting roundtrip: an operator creates or deletes one file. A
   `drive.enabled` setting is deliberately not added: two switches would
   disagree, and one fact lives in one place.
-- Per-day start cap: `drive.max_starts_per_day` (default 50) with a
+- Per-day start cap: `drive.max_starts_per_day` (default in [`configuration.md`](configuration.md)) with a
   date-keyed counter in the state dir, incremented only by real starts
   (`--plan` excluded, restarts included). At the cap the pass ends
   with exit 1 and a logbook line; resumes of already-running agents
   are not starts and are unaffected.
 - Never started: external items, non-open tickets, held tickets
   (including unreadable labels, fail closed), tickets or linked PRs
-  carrying the hold label, tickets carrying `needs-decision`, and
-  tickets whose eligibility the project withdrew this pass. The loop
-  checks these on every pass, not only at first claim: a label added
-  mid-flight stops the next resume.
+  carrying the hold label, tickets carrying `needs-decision`,
+  tickets whose eligibility the project withdrew this pass, and
+  tickets whose repository the project does not drive (section 2).
+  The loop checks these on every pass, not only at first claim: a
+  label added mid-flight stops the next resume.
 - No deletion: the loop stops units (via the injected stop seam, which
   has no default) and releases claims. It never removes worktrees,
   branches, sessions, images or caches. Cleanup stays with the hygiene
@@ -514,11 +737,12 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
+| Own repositories: with rows for two repos and two projects, each project's plan lists only its own repo, a foreign row is never claimed, the launch-path refusal exits 4 naming the repo, a foreign row never reaches the review-record lookup (a broken owned record still reports its line), and a project sharing a short name with another keeps its own rows | temp `Store`, temp ops roots, stub policies, threaded `driven` sets, recording review reader |
 | Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
-| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked and open-pull rows stay withdrawn | pure policy call over fixture rows |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |
@@ -529,6 +753,7 @@ is tested through the seam its production code already injects:
 | Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
 | Decision comment and `needs-decision` label through the new seam; a failed write keeps the claim | fake `Tracker` recording `comment`/`add_label` calls, scripted `TrackerError` |
 | Reviewer start carries the pre-takeover worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
+| Finished reviewer (outcome `ok`) with no record on an unheld row: no start, no fix round, `review-missing` skip and one `reviewer finished without a review record` line per pass for the unheld row; a held row skips as `claim` and logs nothing | temp `Store`, finished reviewer triple with outcome `ok`, review reader returning no record, recording launcher |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |
@@ -602,10 +827,11 @@ the modules named.
     the file's reason and starts nothing; cap counts starts not
     resumes or plans and resets on date change; the pause file and
     the day counter live in the state dir, and the cap resolves
-    `drive.max_starts_per_day` through the single settings resolver.
+    `drive.max_starts_per_day` (default in [`configuration.md`](configuration.md))
+    through the single settings resolver.
 11. Timer unit, doctor checks and docs. Criteria: user timer installed
     and enabled by an explicit operator step; the installed unit
-    carries the `drive.period` cadence resolved through the single
-    settings resolver; doctor reports missing
+    carries the `drive.period` cadence (default in [`configuration.md`](configuration.md))
+    resolved through the single settings resolver; doctor reports missing
     timer, bad registration entries and unreadable policy modules;
     README commands row added if a verb ships.

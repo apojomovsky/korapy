@@ -39,7 +39,7 @@ LOCK_NAME = ".lock"
 #: in the same order, plus the names of agents korapy never launches:
 #: `codex` for foreign agents and `human` for coordinators and reviewers.
 RUNTIMES = (*runtimes.NAMES, "codex", "human")
-OUTCOMES = ("ok", "failed", "stopped")
+OUTCOMES = ("ok", "failed", "stopped", "timed-out")
 #: A finished or gone file is deleted after this long.
 RETAIN_S = 24 * 60 * 60
 
@@ -170,6 +170,18 @@ def load_all(path=None):
     return [entry for _, entry in _load_files(agents_dir(path))]
 
 
+def entry(agent_id, *, path=None):
+    """The registry entry for `agent_id`, or None when unknown.
+
+    The one reader the close paths use to learn a run's start: callers
+    that only close never list the whole directory.
+    """
+    found = _read(_file_for(agents_dir(path), agent_id))
+    if found is None or found.get("id") != agent_id:
+        return None
+    return found
+
+
 def pid_alive(pid):
     """Whether ``pid`` exists on this host (EPERM means it does).
 
@@ -267,6 +279,7 @@ def register(
     model=None,
     role=None,
     profile=None,
+    max_time_s=None,
     parent=None,
     pid=None,
     transcript=None,
@@ -283,11 +296,15 @@ def register(
     not ended; after ``done`` it starts a fresh run. A ``ticket`` here is
     explicit; a re-register without one keeps the previous ticket and its
     source, so a hook retry never drops an inferred ticket. ``role`` is
-    the prompt role the agent was launched with (worker, reviewer or
-    triage), or None; a re-register without one keeps the previous role.
+    the prompt role the agent was launched with (worker, reviewer,
+    triage or research), or None; a re-register without one keeps the previous role.
     ``profile`` is the agent profile the launch resolved, or None; like
     the role, a re-register without one keeps the previous profile, so
     snapshot shows the recorded profile while the agent runs.
+    ``max_time_s`` is the wall-clock limit in seconds the unit launched
+    under, or None; a re-register without one keeps the recorded limit,
+    so the close path attributes the timeout from the launch's limit,
+    never from the setting at close time.
     """
     if not agent_id or not agent_id.strip():
         raise RegistryError("agent id must not be empty")
@@ -300,6 +317,10 @@ def register(
             raise RegistryError(f"unknown role {role!r}: want one of {', '.join(prompts.ROLES)}")
     if profile is not None and (not isinstance(profile, str) or not profile):
         raise RegistryError(f"profile must be a non-empty string, not {profile!r}")
+    if max_time_s is not None and (
+        isinstance(max_time_s, bool) or not isinstance(max_time_s, (int, float)) or max_time_s < 1
+    ):
+        raise RegistryError(f"bad max_time_s {max_time_s!r}: want a positive number of seconds")
     ticket = _check_ticket(ticket)
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 1):
         raise RegistryError(f"bad pid {pid!r}: want a positive integer")
@@ -319,6 +340,8 @@ def register(
             role = old.get("role")
         if profile is None and running:
             profile = old.get("profile")
+        if max_time_s is None and running:
+            max_time_s = old.get("max_time_s")
         entry = {
             "id": agent_id,
             "runtime": runtime,
@@ -327,6 +350,7 @@ def register(
             "model": model,
             "role": role,
             "profile": profile,
+            "max_time_s": max_time_s,
             "parent": parent,
             "pid": pid,
             "transcript": transcript,

@@ -21,7 +21,7 @@ from korapy import host_ledger
 from korapy import projects as projects_mod
 from korapy import registry, units
 from korapy.runtimes import omp
-from tests.test_drive import policy_source, stored
+from tests.test_drive import driven_for, policy_source, stored
 from tests.test_reviewrecord import git_in
 from tests.test_syncli import git_ok
 from tests.test_tracker import FakeTracker, reading
@@ -58,6 +58,7 @@ def drive_pass(
     **fields,
 ):
     """`run_pass` with every host read injected: no outside world."""
+    fallback_driven = driven_for(found, store)
     if policy_dir is not None and found:
         entries = []
         for name, wants in found:
@@ -101,6 +102,7 @@ def drive_pass(
     if hub_client is not None:
         values["hub"] = drivehub.HubMode(hub_client, hub_host_id)
     values.update(fields)
+    values.setdefault("driven", fallback_driven)
     return drive.run_pass(**values)
 
 
@@ -1224,6 +1226,12 @@ class AgentHostTest(unittest.TestCase):
         resolved = settings.resolve(host={}, project={}, env={})
         self.assertEqual(resolved["drive.agent_host"], "")
 
+    def test_fix_round_threshold_defaults_to_normal(self):
+        from korapy import settings
+
+        resolved = settings.resolve(host={}, project={}, env={})
+        self.assertEqual(resolved["drive.fix_round_threshold"], "normal")
+
     def run_pass_without_host(self, agent_host):
         from korapy import settings
 
@@ -1232,7 +1240,7 @@ class AgentHostTest(unittest.TestCase):
         def fake_load(*args, **kwargs):
             root = kwargs.get("root", args[0] if args else None)
             if root is None:
-                return {"drive.agent_host": agent_host}
+                return {"drive.agent_host": agent_host, "drive.fix_round_threshold": "normal"}
             return real_load(*args, **kwargs)
 
         store = stored(self.db, [("app", 7, "open")])

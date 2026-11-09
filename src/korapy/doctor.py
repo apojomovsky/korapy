@@ -26,17 +26,25 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 from korapy import (
     accounts,
+    admission,
     boarddoctor,
     deps,
     detect,
     drive,
+    freeze,
+    heavy,
     host_ledger,
     hub,
+    launch,
     paths,
     pressure,
     profiles,
     projects,
     prompts,
+    pushenv,
+    quota,
+    quota_ledger,
+    quotacli,
     registry,
     repodoctor,
     resourcedoctor,
@@ -126,6 +134,14 @@ class Env(NamedTuple):
     reader_errors: Sequence[tuple[str, str, str]]
     registry_rows: Sequence[tuple[Mapping, str]]
     registry_error: str | None = None
+    #: The resolved `agents.max_time` in seconds for the max-time row.
+    #: None means the caller has no reading, and then the report carries
+    #: no max-time row.
+    max_time_s: float | None = None
+    #: The resolved `agents.reviewer_max_time` in seconds for the reviewer
+    #: max-time row. None means it follows `agents.max_time`, and then
+    #: the report carries no reviewer row.
+    reviewer_max_time_s: float | None = None
     deps_error: str | None = None
     #: Roles with invalid prompt overrides, as "role: problem".
     prompts_invalid: Sequence[str] = ()
@@ -175,6 +191,22 @@ class Env(NamedTuple):
     #: The profile readings. None means the caller has no reading, and
     #: then the report carries no profile row.
     profile_state: ProfileState | None = None
+    #: The quota freshness view: the dict `quotacli.snapshot` returns,
+    #: or the exception reading it raised. None means the caller has no
+    #: reading, and then the report carries no quota row.
+    quota_view: Mapping[str, object] | Exception | None = None
+    #: Every resolving eligibility entry as (project, entry, source
+    #: file), gathered once by production. None means the caller has no
+    #: reading, and then the ok row stays generic; a bad entry is
+    #: already a failing row through `project_problems`.
+    project_policies: Sequence[tuple[str, str, str | None]] | None = None
+    #: The freeze reading: the dict `freeze.freeze_view` returns, the
+    #: exception reading it raised, or None. None means the caller has
+    #: no reading, and then the report carries no freeze row.
+    freeze_view: Mapping[str, object] | Exception | None = None
+    #: The `freeze.max_age_s` setting the staleness warning reads
+    #: against, resolved once by production.
+    freeze_max_age_s: int = freeze.DEFAULT_MAX_AGE_S
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -314,26 +346,45 @@ def _check_drive_timer(state: str | None) -> list[Check]:
     ]
 
 
-def _check_drive_projects(problems: Sequence[str] | None) -> list[Check]:
+def _check_drive_projects(
+    problems: Sequence[str] | None,
+    policies: Sequence[tuple[str, str, str | None]] | None = None,
+) -> list[Check]:
     """The registry row: no row without a reading, one fail row joining
-    every bad registration and every unreadable policy entry."""
+    every bad registration and every unreadable policy entry, else one
+    ok row naming the file each resolving entry loaded from."""
     if problems is None:
         return []
-    if not problems:
+    if problems:
+        return [
+            Check(
+                "drive-projects",
+                "fail",
+                "; ".join(problems),
+                "fix the named registration file or policy entry, then run `korapy doctor` again",
+            )
+        ]
+    if policies:
+        joined = "; ".join(
+            f"project {name}: {entry!r} loaded from {source}"
+            if source
+            else f"project {name}: {entry!r} loaded"
+            for name, entry, source in policies
+        )
         return [
             Check(
                 "drive-projects",
                 "ok",
-                "every registration loads and every policy entry resolves",
+                f"every registration loads and every policy entry resolves: {joined}",
                 "",
             )
         ]
     return [
         Check(
             "drive-projects",
-            "fail",
-            "; ".join(problems),
-            "fix the named registration file or policy entry, then run `korapy doctor` again",
+            "ok",
+            "every registration loads and every policy entry resolves",
+            "",
         )
     ]
 
@@ -353,6 +404,62 @@ def _check_readers(errors: Sequence[tuple[str, str, str]]) -> list[Check]:
             )
         )
     return named
+
+
+def check_quota(view: Mapping[str, object] | Exception | None) -> list[Check]:
+    """Per-provider quota freshness rows, pure over a snapshot view.
+
+    None means the caller has no reading: no rows. An exception is
+    one warn row: the pool or ledger could not be read. A fresh
+    provider reads ok with its age; a stale one warns with the reason
+    ("never ran", "reader failed", "too old"), so a dead reader never
+    fails the report: admission already treats it as unknown, and the
+    fix names the refresh that would heal it.
+    """
+    if view is None:
+        return []
+    if isinstance(view, Exception):
+        return [
+            Check(
+                "quota",
+                "warn",
+                f"quota ledger unreadable: {view}",
+                "make the state dir usable, then run `korapy doctor` again",
+            )
+        ]
+    providers = view.get("providers", {}) if isinstance(view, dict) else {}
+    if not isinstance(providers, dict):
+        providers = {}
+    now = view.get("now") if isinstance(view, dict) else None
+    rows = []
+    for name in sorted(providers):
+        info = providers[name] if isinstance(providers[name], dict) else {}
+        state = info.get("state", "unknown")
+        read_at = info.get("read_at")
+        try:
+            age = (
+                quotacli.format_age(now - read_at)
+                if read_at is not None and now is not None
+                else quotacli.format_age(None)
+            )
+        except TypeError:
+            age = quotacli.format_age(None)
+        reason = quotacli.stale_reason(info)
+        if reason is None:
+            rows.append(Check(f"quota:{name}", "ok", f"{state}, read {age}", ""))
+            continue
+        detail = f"{state}, stale: {reason}, read {age}"
+        if reason == quotacli.READER_FAILED and info.get("error") is not None:
+            detail += f": {info['error']}"
+        rows.append(
+            Check(
+                f"quota:{name}",
+                "warn",
+                detail,
+                f"run `korapy quota refresh {name}`, then run `korapy doctor` again",
+            )
+        )
+    return rows
 
 
 def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = None) -> Check:
@@ -382,6 +489,118 @@ def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = Non
         f"{detail}; {unticketed} live agents hold no ticket",
         "the agent should register its ticket (`korapy agent register --repo REPO --number N`)",
     )
+
+
+def _format_span(seconds) -> str:
+    """`seconds` as a short span: "45s", "30m", "4h", "2d". Pure."""
+    try:
+        secs = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "unknown"
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def _longest_run(rows) -> float | None:
+    """The longest finished span in `rows`, or None when none reads.
+
+    Pure: only finished rows with a readable non-negative span count.
+    """
+    longest = None
+    for entry, state in rows or ():
+        if state != registry.FINISHED:
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        start, end = entry.get("started_at"), entry.get("ended_at")
+        if (
+            isinstance(start, bool)
+            or isinstance(end, bool)
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+        ):
+            continue
+        try:
+            run = float(end) - float(start)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if run < 0:
+            continue
+        longest = run if longest is None else max(longest, run)
+    return longest
+
+
+def _max_time_rows(name, limit_s, rows, run_noun) -> list[Check]:
+    """The one wall-clock row for `run_noun` runs: ok when the limit covers
+    the longest, warn when a recent run outran it.
+
+    Pure over the resolved limit and the registry rows. None means the
+    caller has no reading: no row. No finished run with a readable span
+    means nothing to compare: no row either.
+    """
+    if limit_s is None:
+        return []
+    longest = _longest_run(rows)
+    if longest is None:
+        return []
+    if longest <= limit_s:
+        return [
+            Check(
+                name,
+                "ok",
+                f"the {run_noun}wall-clock limit ({_format_span(limit_s)}) covers "
+                f"the longest recent finished {run_noun}run ({_format_span(longest)})",
+                "",
+            )
+        ]
+    return [
+        Check(
+            name,
+            "warn",
+            f"the {run_noun}wall-clock limit ({_format_span(limit_s)}) is shorter than "
+            f"the longest recent finished {run_noun}run ({_format_span(longest)})",
+            f"raise `{name}` in korapy.toml, then run `korapy doctor` again",
+        )
+    ]
+
+
+def check_max_time(limit_s, rows, reviewer_limit_s=None) -> list[Check]:
+    """The wall-clock rows: warn when a limit is shorter than the longest
+    recent finished run from the registry.
+
+    Pure over the resolved limits and the registry rows. Without a
+    reviewer override every finished run reads against `agents.max_time`,
+    one row. With one, worker runs read against `agents.max_time` and
+    reviewer runs (entries with the reviewer role) against
+    `agents.reviewer_max_time`, one row per role that has a finished
+    run, so a reviewer limit that would now kill reviewer runs warns
+    even when the worker limit covers them. Either row warns so the
+    operator raises the limit before the unit starts killing agents
+    that were nearly done.
+    """
+    if reviewer_limit_s is None:
+        return _max_time_rows("agents.max_time", limit_s, rows, "")
+    worker = [
+        (entry, state)
+        for entry, state in (rows or ())
+        if not (isinstance(entry, Mapping) and entry.get("role") == "reviewer")
+    ]
+    reviewing = [
+        (entry, state)
+        for entry, state in (rows or ())
+        if isinstance(entry, Mapping) and entry.get("role") == "reviewer"
+    ]
+    return [
+        *_max_time_rows("agents.max_time", limit_s, worker, ""),
+        *_max_time_rows("agents.reviewer_max_time", reviewer_limit_s, reviewing, "reviewer "),
+    ]
 
 
 def _check_prompts(invalid: Sequence[str], stale_roles: Sequence[str], error: str | None) -> Check:
@@ -471,6 +690,51 @@ def _check_boards(env: Env) -> list[Check]:
             fetch=env.board_fetch,
             open_store=env.board_open_store,
             board_items=env.board_items,
+        )
+    ]
+
+
+def check_freeze(view: Mapping[str, object] | Exception | None, max_age_s: int) -> list[Check]:
+    """The `drive-freeze` row: no row without a reading.
+
+    A standing freeze reads ok with its reason and gate; past
+    `max_age_s` it warns, so a crash-orphaned freeze never blocks
+    starts silently. An unreadable freeze file fails: the loop holds
+    on broken state and the operator must repair it.
+    """
+    if view is None:
+        return []
+    if isinstance(view, Exception):
+        return [
+            Check(
+                "drive-freeze",
+                "fail",
+                f"freeze state unreadable: {view}",
+                "repair or remove the freeze file, then run `korapy doctor` again",
+            )
+        ]
+    reason = view.get("reason") or "no reason recorded"
+    raw_until = view.get("until")
+    until = [str(ref) for ref in raw_until] if isinstance(raw_until, list) else []
+    age = view.get("age_s")
+    detail = f"frozen: {reason}"
+    if until:
+        detail += f" (until {', '.join(until)} merge)"
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        age_text = "age unknown"
+        stale = False
+    else:
+        age_text = f"age {quotacli.format_age(age)}"
+        stale = age > max_age_s
+    detail += f", {age_text}"
+    if not stale:
+        return [Check("drive-freeze", "ok", detail, "")]
+    return [
+        Check(
+            "drive-freeze",
+            "warn",
+            f"{detail}: older than the {max_age_s}s freeze window",
+            "run `korapy freeze end` to resume dispatch",
         )
     ]
 
@@ -766,7 +1030,7 @@ def check_profiles(state: ProfileState, dep_results) -> list[Check]:
     profile, every referenced runtime resolves, an expired override
     fails until reset, and an unselected default over declared profiles
     warns. Unknown runtime, missing binary and expiry fail; a shadowed
-    name or a built-in fallback is a note.
+    name is a note.
     """
     if state.error is not None:
         return [
@@ -792,9 +1056,12 @@ def run_checks(env: Env) -> list[Check]:
         _check_linger(env.user, env.run),
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_drive_timer(env.timer_state),
-        *_check_drive_projects(env.project_problems),
+        *_check_drive_projects(env.project_problems, env.project_policies),
+        *check_freeze(env.freeze_view, env.freeze_max_age_s),
         *_check_readers(env.reader_errors),
+        *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
+        *check_max_time(env.max_time_s, env.registry_rows, env.reviewer_max_time_s),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_repos(env.repo_sites),
@@ -907,6 +1174,33 @@ def check_settings(start: str, env: Mapping[str, str] | None = None) -> str | No
     return _resolved_settings(start, env)[1]
 
 
+def load_freeze_view(resolved: settings.Resolved | None):
+    """The freeze reading, or the exception reading it raised.
+
+    Only production builds it; tests inject the view into `Env`
+    directly. A missing freeze file is None (no row); an unreadable
+    one is the exception the `drive-freeze` row fails on. Reading
+    never lists units or reaches the tracker.
+    """
+    if resolved is None:
+        max_age_s = freeze.DEFAULT_MAX_AGE_S
+    else:
+        try:
+            max_age_s = resolved["freeze.max_age_s"]
+        except KeyError:
+            max_age_s = freeze.DEFAULT_MAX_AGE_S
+    try:
+        path = freeze.freeze_path()
+    except paths.PathError as err:
+        return err
+    try:
+        return freeze.freeze_view(path, now=time.time(), max_age_s=max_age_s)
+    except freeze.FreezeError as err:
+        return err
+    except OSError as err:
+        return err
+
+
 def load_dep_results() -> tuple[list[deps.Result], str | None]:
     """(results, error): the dep probes and their load failure, gathered once."""
     try:
@@ -920,6 +1214,35 @@ def load_dep_results() -> tuple[list[deps.Result], str | None]:
         re.error,
     ) as err:
         return [], str(err)
+
+
+def load_quota_view(resolved: settings.Resolved | None):
+    """The quota freshness view, or the exception reading it raised.
+
+    Only production builds it; tests inject the view into `Env`
+    directly. A missing accounts file is an empty pool, never an
+    error; an unreadable pool or ledger is the exception the one
+    `quota` row warns about. Reading never runs a reader.
+    """
+    if resolved is None:
+        low_pct = quota.DEFAULT_LOW_PCT
+    else:
+        try:
+            low_pct = resolved["quota.low_pct"]
+        except KeyError:
+            low_pct = quota.DEFAULT_LOW_PCT
+    try:
+        pool = accounts.providers()
+    except (paths.PathError, accounts.AccountsError) as err:
+        return err
+    try:
+        ledger = quota_ledger.load()
+    except (paths.PathError, quota_ledger.LedgerError) as err:
+        return err
+    try:
+        return quotacli.snapshot(pool, ledger, time.time(), low_pct=low_pct)
+    except Exception as err:  # noqa: BLE001 - a broken view is report data, never a traceback
+        return err
 
 
 def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
@@ -1059,14 +1382,35 @@ def _default_branch(origin: str, path: str, git) -> tuple[str, str | None]:
     return "missing", None
 
 
-def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.RepoSite:
+def _push_reading(origin: str, push_probe) -> str | None:
+    """The site's push mode from the gathered probe readings, or None.
+
+    `push_probe` is the `(ssh_ok, gh_ok)` pair gathered once per
+    report, or None when the caller has no reading: then the report
+    carries no push row. The one resolver (`pushenv.resolve`) maps the
+    pair and the origin to the row's reading, so the report agrees with
+    every path that pushes; the pair arrives as injected probes, so the
+    seams never run twice.
+    """
+    if push_probe is None or not origin:
+        return None
+    ssh_ok, gh_ok = push_probe
+    return pushenv.resolve(origin, ssh_probe=lambda: ssh_ok, gh_login=lambda: gh_ok).mode
+
+
+def _repo_site(
+    root: str, name: str, *, git, tracker_factory, push_probe=None
+) -> repodoctor.RepoSite:
     """One repo's remote readings: the origin URL plus label presence.
 
     Read-only: one local `git remote get-url` per clone (no network),
     one label listing per tracker repo, and one `git ls-remote
     --symref` for the remote's default branch, all only when a remote
     is set. Every gather failure degrades to an "unknown" reading
-    naming the repo and the cause, never a raise.
+    naming the repo and the cause, never a raise. `push_probe` is the
+    `(ssh_ok, gh_ok)` pair gathered once per report (None for no push
+    row); the same pair feeds every site, so the probe runs once, not
+    per repo.
     """
     try:
         resolved = settings.load(root, repo=name)
@@ -1098,31 +1442,50 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
     origin = (getattr(proc, "stdout", "") or "").strip()
     if not origin:
         return repodoctor.RepoSite(name, None)
+    push = _push_reading(origin, push_probe)
     tracker_repo = resolved["tracker.repo"] or detect.remote_slug(origin)
     if not tracker_repo:
         return repodoctor.RepoSite(
-            name, origin, cause=f"no owner/name in the origin remote of {path}"
+            name, origin, push=push, cause=f"no owner/name in the origin remote of {path}"
         )
     try:
         repo_tracker = tracker_factory(tracker_repo)
     except KeyError:
-        return repodoctor.RepoSite(name, origin, cause=f"no tracker for {tracker_repo}")
+        return repodoctor.RepoSite(name, origin, push=push, cause=f"no tracker for {tracker_repo}")
     except Exception as err:  # noqa: BLE001 - a failed factory is report data
-        return repodoctor.RepoSite(name, origin, cause=str(err))
+        return repodoctor.RepoSite(name, origin, push=push, cause=str(err))
     try:
         missing = repo_tracker.missing_labels(tracker_repo)
     except Exception as err:  # noqa: BLE001 - a failed read is report data
-        return repodoctor.RepoSite(name, origin, cause=str(err))
+        return repodoctor.RepoSite(name, origin, push=push, cause=str(err))
+    try:
+        canonical = repo_tracker.canonical_repo(tracker_repo)
+    except Exception:  # noqa: BLE001 - an unreadable name is no row, never a traceback
+        canonical = None
     branch, branch_cause = _default_branch(origin, path, git)
     if branch_cause is not None:
         return repodoctor.RepoSite(
-            name, origin, labels="missing" if missing else "ok", cause=branch_cause
+            name,
+            origin,
+            push=push,
+            labels="missing" if missing else "ok",
+            cause=branch_cause,
+            tracker_repo=tracker_repo,
+            canonical=canonical,
         )
-    return repodoctor.RepoSite(name, origin, branch=branch, labels="missing" if missing else "ok")
+    return repodoctor.RepoSite(
+        name,
+        origin,
+        push=push,
+        branch=branch,
+        labels="missing" if missing else "ok",
+        tracker_repo=tracker_repo,
+        canonical=canonical,
+    )
 
 
 def load_repo_sites(
-    settings_error: str | None, *, git, tracker_factory
+    settings_error: str | None, *, git, tracker_factory, push_probe=None
 ) -> tuple[repodoctor.RepoSite, ...]:
     """Remote-dependent sites for the live report. Never raises.
 
@@ -1130,7 +1493,9 @@ def load_repo_sites(
     read per clone, one remote default-branch read, one label listing
     per tracker repo. Without settings there are no sites (the settings
     row already carries the failure); a repo whose own gathering fails
-    still gets warn rows naming it and the cause.
+    still gets warn rows naming it and the cause. `push_probe` is the
+    `(ssh_ok, gh_ok)` pair gathered once per report (None for no push
+    row); the same pair feeds every site.
     """
     if settings_error is not None:
         return ()
@@ -1144,7 +1509,10 @@ def load_repo_sites(
         names = settings.repo_names(root)
     except (settings.SettingsError, OSError):
         return ()
-    return tuple(_repo_site(root, name, git=git, tracker_factory=tracker_factory) for name in names)
+    return tuple(
+        _repo_site(root, name, git=git, tracker_factory=tracker_factory, push_probe=push_probe)
+        for name in names
+    )
 
 
 def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
@@ -1213,6 +1581,62 @@ def _read_pressure(reader) -> tuple[float | None, float | None]:
         ncpu = None
     reading = pressure.read(loadavg, meminfo, ncpu)
     return (reading.load_per_cpu, reading.mem_available_pct)
+
+
+def _load_heavy_lane():
+    """(lane, error, path, size, mtime) for the heavy rows, never raising.
+
+    Best effort per aspect like every other reading here: a missing
+    file reads as no lane (the row renders an empty queue), a busy lock
+    reads as no lane (transient, gone by the next run), and only a
+    present-but-corrupt file lands in error with the documented
+    move-aside repair.
+    """
+    try:
+        path = heavy.lane_path()
+    except (paths.PathError, OSError):
+        return None, None, "", None, None
+    size = mtime = None
+    try:
+        probe = os.stat(path)
+        size, mtime = probe.st_size, probe.st_mtime
+    except OSError:
+        pass
+    try:
+        return heavy.read_lane(), None, path, size, mtime
+    except heavy.LaneLocked:
+        return None, None, path, size, mtime
+    except heavy.HeavyError as err:
+        return None, str(err), path, size, mtime
+    except (OSError, paths.PathError, ValueError) as err:
+        return None, f"cannot read the lane file at {path}: {err}", path, size, mtime
+
+
+def _load_heavy_estimates():
+    """The per-key ledger estimates for the stuck-holder row, never raising."""
+    try:
+        rows, _sources, _skipped = heavy.collect_ledger_rows()
+    except (heavy.HeavyError, OSError, paths.PathError):
+        return {}
+    try:
+        return heavy.estimates_for(rows)
+    except heavy.HeavyError:
+        return {}
+
+
+def _load_heavy_wait_factor(resolved):
+    """The configured wait multiplier for the stuck-holder row, never raising."""
+    try:
+        raw = resolved.heavy if resolved is not None else None
+    except AttributeError:
+        return heavy.DEFAULT_WAIT_FACTOR
+    try:
+        cfg = heavy.check_table(raw, "<settings>")
+    except (settings.SettingsError, heavy.HeavyError):
+        return heavy.DEFAULT_WAIT_FACTOR
+    if cfg is None:
+        return heavy.DEFAULT_WAIT_FACTOR
+    return cfg.wait_factor
 
 
 def load_resource_readings(
@@ -1301,7 +1725,11 @@ def load_resource_readings(
         where = "the host config"
     try:
         base = resources.config(resolved)
-        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        try:
+            total_cap = resolved["admission.total_cap"]
+        except KeyError:
+            total_cap = admission.DEFAULT_TOTAL_CAP
+        shares = projects.budget_shares(registered, total_cap=total_cap)
         foreign = (ledger or {}).get("foreign", [])
         if not isinstance(foreign, list):
             foreign = []
@@ -1320,6 +1748,7 @@ def load_resource_readings(
             pressure.DEFAULT_MAX_LOAD_PER_CPU,
             pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
         )
+    heavy_lane, heavy_error, heavy_path, heavy_bytes, heavy_mtime = _load_heavy_lane()
     return resourcedoctor.ResourceReadings(
         host=limits.host if limits is not None else None,
         shares=dict(limits.projects) if limits is not None else {},
@@ -1344,17 +1773,53 @@ def load_resource_readings(
         pressure=pressure_values,
         pressure_caps=pressure_caps,
         foreign_ignored=foreign_ignored,
+        heavy_lane=heavy_lane,
+        heavy_error=heavy_error,
+        heavy_path=heavy_path,
+        heavy_bytes=heavy_bytes,
+        heavy_mtime=heavy_mtime,
+        heavy_now=moment,
+        heavy_estimates=_load_heavy_estimates(),
+        heavy_wait_factor=_load_heavy_wait_factor(resolved),
     )
+
+
+def load_project_report() -> tuple[list[str], list[tuple[str, str, str | None]] | None]:
+    """Registry problems plus every resolving policy entry, in one pass.
+
+    Returns (problems, sources): `sources` holds one (project, entry,
+    source file) per resolving entry, or None when the registry cannot
+    even be listed. Each policy module imports once here, so a policy's
+    top-level code runs once per report, not once per answer. A
+    gathering failure is one problem and no sources, never a
+    traceback. The one loader for the live report; the two readers
+    below are thin views over it.
+    """
+    try:
+        problems, sources = projects.check_and_sources()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
+        return [str(err)], None
+    return problems, list(sources)
 
 
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
-    naming it, never a traceback."""
-    try:
-        return list(projects.check())
-    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
-        return [str(err)]
+    naming it, never a traceback. One view over `load_project_report`,
+    so reading problems never re-imports a policy module."""
+    problems, _ = load_project_report()
+    return problems
+
+
+def load_project_policies() -> list[tuple[str, str, str | None]] | None:
+    """Every resolving eligibility entry for the live report, as
+    (project, entry, source file). Empty when nothing resolves: then
+    the ok row stays generic and any failure already reads through
+    `load_project_problems`. Entries that do not resolve are skipped
+    here and reported there. One view over `load_project_report`, so
+    reading sources never re-imports a policy module."""
+    _, sources = load_project_report()
+    return sources
 
 
 def load_profile_state(resolved, settings_error: str | None) -> ProfileState:
@@ -1487,6 +1952,18 @@ def load_hub_auth(url: str | None) -> HubAuth | None:
     return HubAuth("ok", "this host's hub token is present and owner-only")
 
 
+def _close_quietly(err) -> None:
+    """Close an error response, swallowing a failure to close it.
+
+    The probe reports a failed hub as data; a close that raises must not
+    turn that report into a traceback.
+    """
+    try:
+        err.close()
+    except Exception:  # noqa: BLE001 - closing report data is best effort
+        pass
+
+
 def _typed_version_refusal(err: urllib.error.HTTPError) -> HubProbe | None:
     """A typed version refusal carried on an HTTP error, or None.
 
@@ -1537,14 +2014,21 @@ def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
             status = response.status
             raw = response.read(65536)
     except urllib.error.HTTPError as err:
-        if err.code == 401:
-            return HubProbe(
-                "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
-            )
-        refusal = _typed_version_refusal(err)
-        if refusal is not None:
-            return refusal
-        return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        # HTTPError subclasses tempfile._TemporaryFileWrapper: an unclosed
+        # one warns at collection and leaks the response's file. The typed
+        # refusal reads the body first, then the handle closes either way;
+        # a close that fails is report data too, never a traceback.
+        try:
+            if err.code == 401:
+                return HubProbe(
+                    "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
+                )
+            refusal = _typed_version_refusal(err)
+            if refusal is not None:
+                return refusal
+            return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        finally:
+            _close_quietly(err)
     except Exception as err:  # noqa: BLE001 - a failed probe is report data, never a traceback
         return HubProbe("unreachable", f"the hub at {url} cannot be reached: {err}")
     if status != 200:
@@ -1594,9 +2078,21 @@ def production_env() -> Env:
         except settings.SettingsError as err:
             settings_error = str(err)
             registry_cfg = registry.default_config()
+        try:
+            _, max_time_s = launch.max_time_for(resolved)
+        except launch.LaunchError:
+            max_time_s = None
+        try:
+            _, reviewer_max_time_s = launch.max_time_for(resolved, reviewer=True)
+        except launch.LaunchError:
+            reviewer_max_time_s = None
+        if reviewer_max_time_s == max_time_s:
+            reviewer_max_time_s = None
     else:
         prefix = str(settings.REGISTRY["agents.unit_prefix"].default)
         registry_cfg = registry.default_config()
+        max_time_s = None
+        reviewer_max_time_s = None
     try:
         account_problems = accounts.check()
     except (paths.PathError, accounts.AccountsError) as err:
@@ -1618,13 +2114,25 @@ def production_env() -> Env:
         resolved, list_fn=production_list_fn, run=production_run
     )
     board_sites, board_error = load_board_sites(settings_error)
+    # The push readings, gathered once per report: one SSH probe and one
+    # `gh` login check feed every site, so neither runs per repo. Both
+    # degrade to False on failure (never a traceback); a wrong-False
+    # only pessimizes the row, never blocks the report.
+    push_probe = (pushenv.default_ssh_probe(), pushenv.default_gh_login())
     repo_sites = load_repo_sites(
         settings_error,
         git=production_git,
         tracker_factory=production_tracker_factory,
+        push_probe=push_probe,
     )
-    project_problems = load_project_problems()
+    project_problems, project_policies = load_project_report()
     timer_state = load_timer_state()
+    try:
+        freeze_max_age_s = (
+            resolved["freeze.max_age_s"] if resolved is not None else freeze.DEFAULT_MAX_AGE_S
+        )
+    except KeyError:
+        freeze_max_age_s = freeze.DEFAULT_MAX_AGE_S
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None
     hub_auth = load_hub_auth(hub_url)
@@ -1643,6 +2151,8 @@ def production_env() -> Env:
         reader_errors=load_readers(),
         registry_rows=registry_rows,
         registry_error=registry_error,
+        max_time_s=max_time_s,
+        reviewer_max_time_s=reviewer_max_time_s,
         prompts_invalid=prompts_invalid,
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
@@ -1655,11 +2165,15 @@ def production_env() -> Env:
         board_error=board_error,
         repo_sites=repo_sites,
         project_problems=project_problems,
+        project_policies=project_policies,
         timer_state=timer_state,
+        freeze_view=load_freeze_view(resolved),
+        freeze_max_age_s=freeze_max_age_s,
         hub_url=hub_url or None,
         hub_auth=hub_auth,
         hub_probe=hub_probe,
         profile_state=profile_state,
+        quota_view=load_quota_view(resolved),
     )
 
 

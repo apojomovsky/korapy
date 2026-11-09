@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 
-from korapy import settings
+from korapy import boardstatus, settings
 
 
 def resolve(**kw):
@@ -52,11 +52,22 @@ class ScalarDefaults(unittest.TestCase):
 
     def test_board_scalars_have_small_sane_defaults(self):
         resolved = resolve()
-        for key in ("board.poll_pages", "board.schema_max_age_s", "board.item_max_age_s"):
+        for key in (
+            "board.poll_pages",
+            "board.schema_max_age_s",
+            "board.item_max_age_s",
+            "board.add_per_pass",
+        ):
             with self.subTest(key=key):
                 value = resolved[key]
                 self.assertIsInstance(value, int)
                 self.assertGreater(value, 0)
+
+    def test_board_adopt_cap_defaults_to_twenty(self):
+        self.assertEqual(resolve()["board.add_per_pass"], 20)
+
+    def test_board_status_cap_defaults_to_twenty(self):
+        self.assertEqual(resolve()["board.status_per_pass"], 20)
 
     def test_no_board_table_resolves_to_no_board(self):
         self.assertIsNone(resolve().board)
@@ -126,6 +137,34 @@ class DocumentedTable(unittest.TestCase):
         self.assertEqual(board.status_field, "")
         self.assertEqual(board.status_column, "")
         self.assertEqual(board.priority_map, {})
+
+    def test_status_option_ids_default_to_empty(self):
+        board = resolve(
+            project=project({"project_owner": "example", "project_number": 3}), repo="app"
+        ).board
+        self.assertEqual(board.status_available, "")
+        self.assertEqual(board.status_claimed, "")
+        self.assertEqual(board.status_review, "")
+        self.assertEqual(board.status_done, "")
+
+    def test_status_option_ids_load_through_resolve(self):
+        table = documented_board(
+            status_available="opt-a",
+            status_claimed="opt-c",
+            status_review="opt-r",
+            status_done="opt-d",
+        )
+        board = resolve(project=project(table), repo="app").board
+        self.assertEqual(board.status_available, "opt-a")
+        self.assertEqual(board.status_claimed, "opt-c")
+        self.assertEqual(board.status_review, "opt-r")
+        self.assertEqual(board.status_done, "opt-d")
+
+    def test_status_option_ids_without_a_status_column_are_an_error(self):
+        table = documented_board(status_done="opt-d")
+        del table["status_column"]
+        with self.assertRaisesRegex(settings.SettingsError, "app.*status.*status_column"):
+            resolve(project=project(table), repo="app")
 
     def test_a_board_table_loads_whatever_the_variant(self):
         resolved = resolve(project=project(documented_board(), variant="labels"), repo="app")
@@ -271,10 +310,22 @@ class KeyLinkage(unittest.TestCase):
     def test_columns_are_a_subset_of_keys(self):
         self.assertLessEqual(set(settings._BOARD_COLUMNS), set(settings._BOARD_KEYS))
 
-    def test_keys_are_address_columns_and_map(self):
+    def test_status_ids_are_a_subset_of_keys(self):
+        self.assertLessEqual(set(settings._BOARD_STATUS_IDS), set(settings._BOARD_KEYS))
+
+    def test_status_ids_are_the_status_step_attributes(self):
+        self.assertEqual(
+            tuple(settings._BOARD_STATUS_IDS),
+            tuple(attr for _, attr in boardstatus.STATUS_ID_ATTRS),
+        )
+
+    def test_keys_are_address_columns_status_ids_and_map(self):
         self.assertEqual(
             set(settings._BOARD_KEYS),
-            set(settings._BOARD_ADDRESS) | set(settings._BOARD_COLUMNS) | {"priority_map"},
+            set(settings._BOARD_ADDRESS)
+            | set(settings._BOARD_COLUMNS)
+            | {"priority_map"}
+            | set(settings._BOARD_STATUS_IDS),
         )
 
     def test_board_config_fields_match_keys(self):

@@ -495,6 +495,25 @@ class ResyncAdoptionTest(StoreCase):
     def test_the_reserved_namespaces_agree_with_the_loop(self):
         self.assertIn(drive.MANAGED_PREFIX, sync.RESERVED_AGENT_PREFIXES)
 
+    def test_the_pulls_budget_default_agrees_with_the_loop(self):
+        self.assertEqual(sync.DEFAULT_PULLS_MAX_CALLS, drive.DEFAULT_PULLS_MAX_CALLS)
+
+
+class UnreadableListingStore:
+    """A store whose repo listing and rows cannot be read."""
+
+    def __init__(self, problem):
+        self.problem = problem
+
+    def repos(self):
+        raise self.problem
+
+    def items(self, *args, **kwargs):
+        raise self.problem
+
+    def drift_flags(self):
+        raise self.problem
+
 
 class SyncAllTest(StoreCase):
     OTHER = "acme/api"
@@ -517,18 +536,23 @@ class SyncAllTest(StoreCase):
     def test_healthy_repos_sync_with_no_lines(self):
         self.stored(1, tracker_updated_at=T0 - 100)
         self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors, refused = drive.sync_all(
-            self.store,
-            self.factory(
-                {
-                    REPO: [reading(number=1, updated_at=T0)],
-                    self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
-                }
-            ),
-            operators=["alice"],
-            now=T0,
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(
+                self.store,
+                self.factory(
+                    {
+                        REPO: [reading(number=1, updated_at=T0)],
+                        self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
+                    }
+                ),
+                operators=["alice"],
+                now=T0,
+            )
         )
-        self.assertEqual((seen, errors, store_errors, refused), (2, [], [], []))
+        self.assertEqual(
+            (seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written),
+            (2, [], [], [], [], [], (), ()),
+        )
         self.assertEqual(self.store.get_cursor(REPO, sync.CURSOR_NAME), tracker.format_cursor(T0))
         self.assertEqual(
             self.store.get_cursor(self.OTHER, sync.CURSOR_NAME), tracker.format_cursor(T0)
@@ -538,20 +562,23 @@ class SyncAllTest(StoreCase):
         self.stored(1, tracker_updated_at=T0 - 100)
         self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
         self.corrupt(REPO, 1)
-        seen, errors, store_errors, refused = drive.sync_all(
-            self.store,
-            self.factory(
-                {
-                    REPO: [reading(number=1, updated_at=T0)],
-                    self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
-                }
-            ),
-            operators=["alice"],
-            now=T0,
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(
+                self.store,
+                self.factory(
+                    {
+                        REPO: [reading(number=1, updated_at=T0)],
+                        self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
+                    }
+                ),
+                operators=["alice"],
+                now=T0,
+            )
         )
         self.assertEqual(seen, 1)
         self.assertEqual(errors, [])
         self.assertEqual(refused, [])
+        self.assertEqual(adopt_errors, [])
         self.assertEqual(len(store_errors), 1)
         self.assertIn(f"{REPO}#1", store_errors[0])
         self.assertEqual(
@@ -561,18 +588,20 @@ class SyncAllTest(StoreCase):
 
     def test_unknown_repo_is_a_tracker_line_not_a_store_line(self):
         self.stored(1, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors, refused = drive.sync_all(
-            self.store, self.factory({}), operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(self.store, self.factory({}), operators=["alice"], now=T0)
         )
         self.assertEqual(seen, 0)
         self.assertEqual(len(errors), 1)
         self.assertIn(REPO, errors[0])
         self.assertEqual(store_errors, [])
         self.assertEqual(refused, [])
+        self.assertEqual(adopt_errors, [])
 
     def test_no_factory_syncs_nothing(self):
         self.assertEqual(
-            drive.sync_all(self.store, None, operators=["alice"], now=T0), (0, [], [], [])
+            drive.sync_all(self.store, None, operators=["alice"], now=T0),
+            (0, [], [], [], [], [], (), ()),
         )
 
     def test_rejected_feed_is_refused_not_an_error(self):
@@ -581,14 +610,36 @@ class SyncAllTest(StoreCase):
                 raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
 
         self.stored(1, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors, refused = drive.sync_all(
-            self.store, lambda repo: RejectingTracker(), operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(self.store, lambda repo: RejectingTracker(), operators=["alice"], now=T0)
         )
         self.assertEqual(seen, 0)
         self.assertEqual(errors, [])
         self.assertEqual(len(refused), 1)
         self.assertIn("tracker rejected", refused[0])
         self.assertEqual(store_errors, [])
+        self.assertEqual(adopt_errors, [])
+
+    def test_unreadable_repo_listing_is_one_store_line(self):
+        for problem in (
+            board.StoreError("test listing unreadable"),
+            sqlite3.OperationalError("test listing unreadable"),
+        ):
+            with self.subTest(problem=type(problem).__name__):
+                store = UnreadableListingStore(problem)
+                self.assertEqual(
+                    drive.sync_all(store, self.factory({}), operators=["alice"], now=T0),
+                    (
+                        0,
+                        [],
+                        [f"store repo listing unreadable: {problem}"],
+                        [],
+                        [],
+                        [],
+                        (),
+                        (),
+                    ),
+                )
 
     def test_rejected_board_schema_is_refused_not_an_error(self):
         class RejectingBoardTracker(FakeTracker):
@@ -601,14 +652,17 @@ class SyncAllTest(StoreCase):
                 return [], None
 
         self.stored(1, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors, refused = drive.sync_all(
-            self.store, lambda repo: RejectingBoardTracker(), operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(
+                self.store, lambda repo: RejectingBoardTracker(), operators=["alice"], now=T0
+            )
         )
         self.assertEqual(seen, 0)
         self.assertEqual(errors, [])
         self.assertEqual(len(refused), 1)
         self.assertIn("tracker rejected", refused[0])
         self.assertEqual(store_errors, [])
+        self.assertEqual(adopt_errors, [])
 
 
 class StoreErrorKindTest(StoreCase):

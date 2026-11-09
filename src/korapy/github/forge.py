@@ -14,6 +14,7 @@ import json
 import re
 
 from korapy import forge, paths
+from korapy.github import gh
 
 #: One page of the PR list; the maximum the endpoint serves.
 PER_PAGE = 100
@@ -37,11 +38,7 @@ def _shape(text):
 
 def _merged(payload):
     """Whether a PR object (single or list item) is merged."""
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("merged") is True:
-        return True
-    return bool(payload.get("merged_at"))
+    return gh.is_merged_pull(payload)
 
 
 def _pr_state(payload):
@@ -82,6 +79,31 @@ def _checks_state(payload, number):
     raise _shape(f"PR {number} has an unusable checks state {raw!r}")
 
 
+def _pending_checks(payload, label):
+    """How many check runs on the head SHA are still running.
+
+    A run counts while its `status` is anything but `completed`
+    (`queued` or `in_progress`): strictly newer or older provider
+    words still read as running, never as done. Anything but a list
+    of objects with a string `status` is an unusable answer
+    (``ForgeError``), never a zero guess: a missing count would
+    report a live wait as settled.
+    """
+    if not isinstance(payload, dict):
+        raise _shape(f"check runs on {label} are not an object")
+    runs = payload.get("check_runs")
+    if not isinstance(runs, list):
+        raise _shape(f"check runs on {label} are not a list")
+    pending = 0
+    for run in runs:
+        status = run.get("status") if isinstance(run, dict) else None
+        if not isinstance(status, str):
+            raise _shape(f"check run on {label} has no status")
+        if status != "completed":
+            pending += 1
+    return pending
+
+
 def _merge_sha(payload, number, state):
     """The merge commit SHA once merged, else ``None``.
 
@@ -91,6 +113,24 @@ def _merge_sha(payload, number, state):
     if state != forge.MERGED:
         return None
     return _sha(payload.get("merge_commit_sha"), f"PR {number} merge sha")
+
+
+def _merge_parent_shas(payload, number):
+    """The parent SHAs of a merge-commit response, else ``ForgeError``.
+
+    Anything but a dict holding a list of ``{"sha": ...}`` dicts with
+    full SHAs is an unusable answer, never a guess.
+    """
+    if not isinstance(payload, dict):
+        raise _shape(f"PR {number} merge commit is not an object")
+    parents = payload.get("parents")
+    if not isinstance(parents, list):
+        raise _shape(f"PR {number} merge commit has no parent list")
+    shas = []
+    for parent in parents:
+        sha = parent.get("sha") if isinstance(parent, dict) else None
+        shas.append(_sha(sha, f"PR {number} merge parent"))
+    return shas
 
 
 def _parse_pull(payload, number):
@@ -316,17 +356,44 @@ class GithubForge:
             raise forge.ForgeError(f"unusable answer for PR {number}: {err}") from err
         return _parse_pull(payload, number)
 
+    def pending_checks(self, repo: str, sha: str) -> int:
+        """How many check runs on ``sha`` are still running.
+
+        A separate, optional read: the merge verb calls it only to
+        decorate a pending checks row, never to change the verdict. A
+        run counts while its ``status`` is anything but ``completed``.
+        The read takes one page of up to 100 runs; a head with more
+        runs reports a lower bound, never a guess beyond the page.
+        """
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        try:
+            head = _sha(sha, "head sha")
+        except forge.ForgeError:
+            raise
+        try:
+            payload = json.loads(
+                self._get(f"repos/{repo}/commits/{head}/check-runs?per_page={PER_PAGE}")
+            )
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable check runs on {head}: {err}") from err
+        return _pending_checks(payload, head)
+
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-        """Squash-merge PR ``number`` pinned to ``head_sha``.
+        """Merge PR ``number`` pinned to ``head_sha`` with ``method``.
 
         The pin travels in the merge call itself, so the provider
         merges exactly the approved head or nothing. The fresh
         post-merge read must report ``merged`` with the reported merge
         SHA tied to that head; anything else fails closed because the
-        merge happened but is unverified. A PR that is not open at the
-        pinned head is ``ForgeRefused``, never merged.
+        merge happened but is unverified. For a merge commit the merge
+        commit's parents must include the pinned head: a merge that
+        kept other commits is unverified, never returned. A PR that is
+        not open at the pinned head is ``ForgeRefused``, never merged.
         """
-        if method != "squash":
+        if method not in ("squash", "merge"):
             raise forge.ForgeError(f"unsupported merge method {method!r}")
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
@@ -344,7 +411,7 @@ class GithubForge:
                     "PUT",
                     f"repos/{repo}/pulls/{number}/merge",
                     "-f",
-                    "merge_method=squash",
+                    f"merge_method={method}",
                     "-f",
                     f"sha={head_sha}",
                 ]
@@ -363,7 +430,29 @@ class GithubForge:
         verified = self.pull_request(repo, number)
         if verified.state != forge.MERGED or verified.merge_sha != reported:
             raise forge.ForgeError(f"PR {number} merge unverified: want {reported}")
+        if method == "merge":
+            self._check_merge_parents(repo, number, reported, head_sha)
         return reported
+
+    def _check_merge_parents(self, repo: str, number: int, reported: str, head_sha: str) -> None:
+        """Require the merge commit's parents to include the pinned head.
+
+        A squash reads no commit (its post-merge tie is the merged
+        state plus the reported SHA); a merge commit proves the
+        provider kept the approved head by parenting it. Anything else
+        is unverified (``ForgeError``), never a refusal: the merge
+        happened but is unproven.
+        """
+        try:
+            payload = json.loads(self._get(f"repos/{repo}/commits/{reported}"))
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable merge commit answer for PR {number}: {err}") from err
+        if head_sha not in _merge_parent_shas(payload, number):
+            raise forge.ForgeError(
+                f"PR {number} merge unverified: {head_sha} is no parent of {reported}"
+            )
 
     def pr_index(self, repo: str) -> dict[str, str]:
         """``{head branch: state}`` for every PR ever opened on ``repo``.

@@ -69,18 +69,37 @@ class FakeRun:
 class FakeTracker:
     """An in-memory tracker double. Tests preload items and program failures."""
 
-    def __init__(self, items=(), *, labels=(), refused=(), ensure_error=None, labels_error=None):
+    def __init__(
+        self,
+        items=(),
+        *,
+        labels=(),
+        refused=(),
+        ensure_error=None,
+        labels_error=None,
+        canonical=None,
+        canonical_error=None,
+    ):
         self.by_key = {(item.repo, item.number): item for item in items}
         self.changes_error = None
         self.item_errors = {}
         self.items_break_after = None
         self.write_errors = {}
         self.comment_errors = {}
+        self.comments_errors = {}
+        self.comment_bodies = {}
+        self.posted_comments = {}
         self.label_errors = {}
+        self.remove_errors = {}
         self.repo_labels = {repo: set(names) for repo, names in labels}
         self.refused = set(refused)
         self.ensure_error = ensure_error
         self.labels_error = labels_error
+        self.canonical = dict(canonical or {})
+        self.canonical_error = canonical_error
+        self.index = {}
+        self.index_errors = {}
+        self.index_truncated = set()
         self.calls = []
 
     def add(self, item):
@@ -121,6 +140,20 @@ class FakeTracker:
                 raise tracker.TrackerError(f"page error at index {index}")
             yield item
 
+    def pulls_index(self, repo, max_calls, *, merged_since=None):
+        """Programmed per-repo open- and merged-pulls index: {issue: [TrackerItem]}.
+
+        The cutoff is accepted and ignored: the program states the
+        index outright, so every test sees exactly what it filed.
+        """
+        self.calls.append(("pulls_index", repo, max_calls))
+        if repo in self.index_errors:
+            raise tracker.TrackerError(self.index_errors[repo])
+        by_issue = {number: list(found) for number, found in self.index.get(repo, {}).items()}
+        if repo in self.index_truncated:
+            return tracker.PullsIndex(by_issue, 1, False)
+        return tracker.PullsIndex(by_issue, 1, True)
+
     def write(self, repo, number, field, value):
         """Record one korapy-owned field write; programmed errors raise."""
         self.calls.append(("write", repo, number, field, value))
@@ -132,12 +165,39 @@ class FakeTracker:
         self.calls.append(("comment", repo, number, body))
         if (repo, number) in self.comment_errors:
             raise self.comment_errors[(repo, number)]
+        self.posted_comments.setdefault((repo, number), []).append(body)
+
+    def comments(self, repo, number):
+        """Comment bodies, oldest first, as a tuple; programmed errors raise.
+
+        A ticket with programmed `comment_bodies` reads those (the
+        research tests preload them); otherwise the bodies posted
+        through `comment` read back (the decision tests post their
+        decision line, then list to prove idempotency).
+        """
+        self.calls.append(("comments", repo, number))
+        if (repo, number) in self.comments_errors:
+            raise self.comments_errors[(repo, number)]
+        if (repo, number) in self.comment_bodies:
+            return tuple(self.comment_bodies[(repo, number)])
+        return tuple(self.posted_comments.get((repo, number), ()))
 
     def add_label(self, repo, number, label):
         """Record one decision label; programmed errors raise."""
         self.calls.append(("add_label", repo, number, label))
         if (repo, number) in self.label_errors:
             raise self.label_errors[(repo, number)]
+
+    def remove_label(self, repo, number, label):
+        """Record one decision label removal; programmed errors raise.
+
+        Removing a label the item does not carry is a no-op, the way
+        the adapter reads a 404 answer.
+        """
+        self.calls.append(("remove_label", repo, number, label))
+        if (repo, number) in self.remove_errors:
+            raise self.remove_errors[(repo, number)]
+        self.repo_labels.setdefault(repo, set()).discard(label)
 
     def missing_labels(self, repo):
         """Names of the bootstrap labels absent on ``repo``; a programmed error raises."""
@@ -146,6 +206,16 @@ class FakeTracker:
             raise self.labels_error
         have = self.repo_labels.get(repo, set())
         return tuple(label.name for label in tracker.BOOTSTRAP_LABELS if label.name not in have)
+
+    def canonical_repo(self, repo):
+        """The tracker's canonical name for ``repo``; a programmed error raises."""
+        self.calls.append(("canonical_repo", repo))
+        if self.canonical_error is not None:
+            raise self.canonical_error
+        try:
+            return self.canonical[repo]
+        except KeyError:
+            raise tracker.TrackerError(f"unknown repo {repo}") from None
 
     def ensure_labels(self, repo):
         """Idempotent in-memory bootstrap: create, keep, or refuse."""
@@ -233,6 +303,14 @@ class ItemTest(unittest.TestCase):
         found = self.adapter.item("acme/app", 9)
         self.assertTrue(found.from_fork)
         self.assertTrue(board.is_external(found.author, ["alice"], found.from_fork))
+
+    def test_a_closed_pull_request_in_the_feed_reads_closed(self):
+        payload = item_payload(9, state="closed")
+        payload["pull_request"] = {"url": "https://example.com/pulls/9"}
+        self.gh.add("repos/acme/app/issues/9", payload)
+        self.gh.add("repos/acme/app/pulls/9", pull_payload(9, fork=False))
+        found = self.adapter.item("acme/app", 9)
+        self.assertEqual((found.kind, found.state), ("pr", "closed"))
 
     def test_pull_payload_is_cached_per_tracker(self):
         payload = item_payload(9)
@@ -461,6 +539,8 @@ class BootstrapLabelsTest(unittest.TestCase):
                 "needs-triage",
                 "needs-decision",
                 "hold",
+                "research",
+                "researched",
                 "priority:urgent",
                 "priority:high",
                 "priority:normal",
@@ -726,6 +806,19 @@ class DecisionRecordTest(unittest.TestCase):
         with self.assertRaises(tracker.TrackerError):
             fake.comment("acme/app", 7, "body")
 
+    def test_comments_lists_posted_bodies_oldest_first(self):
+        fake = FakeTracker()
+        fake.comment("acme/app", 7, "first")
+        fake.comment("acme/app", 7, "second")
+        self.assertEqual(fake.comments("acme/app", 7), ("first", "second"))
+        self.assertIn(("comments", "acme/app", 7), fake.calls)
+
+    def test_scripted_comments_error_raises(self):
+        fake = FakeTracker()
+        fake.comments_errors[("acme/app", 7)] = tracker.TrackerError("down")
+        with self.assertRaises(tracker.TrackerError):
+            fake.comments("acme/app", 7)
+
     def test_scripted_label_error_raises(self):
         fake = FakeTracker()
         fake.label_errors[("acme/app", 7)] = tracker.TrackerError("down")
@@ -755,6 +848,43 @@ class DecisionAdapterTest(unittest.TestCase):
         self.assertIn("POST", posted)
         self.assertIn("repos/acme/app/issues/7/comments", posted)
         self.assertIn("body=Which shape should this take?", posted)
+
+    def comments_adapter(self, run):
+        return ghtracker.GithubTracker(run)
+
+    def test_comments_lists_bodies(self):
+        run = FakeRun().add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"body": "first"}, {"body": "second"}],
+        )
+        self.assertEqual(self.comments_adapter(run).comments("acme/app", 7), ("first", "second"))
+
+    def test_comments_pages_until_a_short_page(self):
+        run = FakeRun()
+        run.add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"body": f"n{i}"} for i in range(100)],
+        )
+        run.add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=2",
+            [{"body": "last"}],
+        )
+        found = self.comments_adapter(run).comments("acme/app", 7)
+        self.assertEqual(len(found), 101)
+        self.assertEqual(found[-1], "last")
+
+    def test_comments_malformed_body_is_an_error(self):
+        run = FakeRun().add(
+            "repos/acme/app/issues/7/comments?per_page=100&page=1",
+            [{"nobody": "here"}],
+        )
+        with self.assertRaises(tracker.TrackerError):
+            self.comments_adapter(run).comments("acme/app", 7)
+
+    def test_comments_failure_is_a_tracker_error(self):
+        run = FakeRun().fail("repos/acme/app/issues/7/comments?per_page=100&page=1")
+        with self.assertRaises(tracker.TrackerError):
+            self.comments_adapter(run).comments("acme/app", 7)
 
     def test_add_label_posts_needs_decision(self):
         self.adapter.add_label("acme/app", 7, "needs-decision")
@@ -794,6 +924,254 @@ class DecisionAdapterTest(unittest.TestCase):
             self.adapter.add_label("acme/app", 7, "needs-decision")
         self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
         self.assertEqual(ctx.exception.exit_code, 3)
+
+
+def pr_payload(number, body, fork=False, **over):
+    """One pulls-endpoint payload; override any field."""
+    payload = item_payload(number, body=body, **over)
+    payload.pop("pull_request", None)
+    payload["head"] = {"ref": f"topic-{number}", "repo": {"fork": fork}}
+    return payload
+
+
+class PullsIndexTest(unittest.TestCase):
+    """One open- plus recent-closed-pulls listing per repo, by ticket.
+
+    Fakes only. The open pull requests always list fully; the closed
+    pull requests list newest first only when `merged_since` is given,
+    stopping at the first page older than the cutoff, so a long pull
+    history costs a bounded number of calls.
+    """
+
+    OPEN = "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    CLOSED = "repos/acme/app/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+
+    def setUp(self):
+        self.gh = FakeRun()
+        self.adapter = ghtracker.GithubTracker(self.gh)
+
+    def listing(self, pulls, state="open", page=1):
+        base = self.OPEN if state == "open" else self.CLOSED
+        self.gh.add(base if page == 1 else base + f"&page={page}", pulls)
+
+    def numbers(self, found, number):
+        return sorted(item.number for item in found.by_issue.get(number, ()))
+
+    def test_an_open_pr_closing_the_ticket_is_indexed(self):
+        self.listing([pr_payload(9, "Fixes things.\n\nCloses #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "open")],
+        )
+        self.assertEqual(found.calls, 1)
+        self.assertTrue(found.complete)
+
+    def test_unrelated_and_other_ticket_prs_are_not_indexed(self):
+        self.listing(
+            [
+                pr_payload(9, "No ticket here"),
+                pr_payload(10, "Closes #8"),
+            ]
+        )
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertNotIn(7, found.by_issue)
+        self.assertEqual(self.numbers(found, 8), [10])
+
+    def test_a_refs_pr_links_too(self):
+        self.listing([pr_payload(9, "Partial win.\n\nRefs #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+
+    def test_a_close_keyword_in_the_title_links(self):
+        self.listing([pr_payload(9, "unrelated body", title="Fixes #7 on retry")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+
+    def test_a_bare_title_mention_links_nothing(self):
+        self.listing([pr_payload(9, "unrelated body", title="Follow-up for #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertNotIn(7, found.by_issue)
+
+    def test_a_close_keyword_in_a_fence_links_nothing(self):
+        self.listing([pr_payload(9, "```\nCloses #7\n```")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertNotIn(7, found.by_issue)
+
+    def test_a_cross_repo_close_does_not_link_this_repo(self):
+        self.listing([pr_payload(9, "Closes other/repo#7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertNotIn(7, found.by_issue)
+
+    def test_a_qualified_close_of_this_repo_links(self):
+        self.listing([pr_payload(9, "Closes acme/app#7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+
+    def test_a_closed_payload_in_the_open_listing_is_skipped(self):
+        self.listing(
+            [
+                pr_payload(9, "Closes #7"),
+                pr_payload(10, "Closes #7", state="closed"),
+            ]
+        )
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+
+    def test_the_index_costs_no_per_pr_call(self):
+        self.listing([pr_payload(9, "Closes #7"), pr_payload(10, "Closes #8")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+        self.assertEqual(self.numbers(found, 8), [10])
+        self.assertEqual(self.gh.paths(), [self.OPEN])
+
+    def test_a_listing_failure_is_a_tracker_error(self):
+        self.gh.fail(self.OPEN)
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_open_pages_combine(self):
+        first = [pr_payload(n, f"Closes #{700 + n}") for n in range(100, 200)]
+        self.gh.routes[self.OPEN] = json.dumps(first)
+        self.gh.routes[self.OPEN + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertEqual(self.numbers(found, 7), [9])
+        self.assertEqual(self.numbers(found, 806), [106])
+        self.assertEqual(found.calls, 2)
+        self.assertTrue(found.complete)
+
+    def test_an_exhausted_budget_stops_with_an_incomplete_index(self):
+        first = [pr_payload(n, f"Closes #{700 + n}") for n in range(100, 200)]
+        self.gh.routes[self.OPEN] = json.dumps(first)
+        self.gh.routes[self.OPEN + "&page=2"] = json.dumps([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 1)
+        self.assertEqual(found.calls, 1)
+        self.assertFalse(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN])
+
+    def test_no_live_claim_lists_no_closed_pull(self):
+        self.listing([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN])
+
+    def test_a_merged_pr_is_indexed_as_merged(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO1)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED])
+
+    def test_the_merge_time_rides_the_indexed_pull(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO1)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        (item,) = found.by_issue[7]
+        self.assertEqual(item.merged_at, float(T1))
+        self.assertEqual(item.updated_at, float(T0))
+
+    def test_an_unmerged_pull_carries_no_merge_time(self):
+        self.listing([pr_payload(9, "Closes #7")])
+        found = self.adapter.pulls_index("acme/app", 10)
+        (item,) = found.by_issue[7]
+        self.assertEqual(item.merged_at, 0.0)
+
+    def test_a_bad_merge_time_is_a_tracker_error(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at="soon")],
+            state="closed",
+        )
+        with self.assertRaises(tracker.TrackerError):
+            self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+
+    def test_a_merged_flag_pr_is_indexed_as_merged(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged=True)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found.by_issue[7]],
+            [(9, "pr", "merged")],
+        )
+
+    def test_a_closed_unmerged_pr_is_not_indexed(self):
+        self.listing([], state="open")
+        self.listing([pr_payload(9, "Closes #7", state="closed")], state="closed")
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertNotIn(7, found.by_issue)
+        self.assertTrue(found.complete)
+
+    def test_a_closed_pull_older_than_the_cutoff_is_not_indexed(self):
+        self.listing([], state="open")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO0)],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T1))
+        self.assertNotIn(7, found.by_issue)
+        self.assertTrue(found.complete)
+
+    def test_a_full_but_old_closed_page_stops_paging(self):
+        self.listing([], state="open")
+        history = [
+            pr_payload(n, f"Closes #{700 + n}", state="closed", merged_at=ISO0)
+            for n in range(100, 200)
+        ]
+        self.listing(history, state="closed")
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T1))
+        self.assertEqual(found.by_issue, {})
+        self.assertEqual(found.calls, 2)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED])
+
+    def test_closed_pages_stay_oldest_first(self):
+        self.listing([], state="open")
+        self.listing(
+            [
+                pr_payload(11, "Closes #7", state="closed", updated_at=ISO1, merged_at=ISO1),
+                pr_payload(10, "Closes #7", state="closed", merged_at=ISO0),
+            ],
+            state="closed",
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [item.number for item in found.by_issue[7]],
+            [10, 11],
+        )
+
+    def test_a_recent_closed_page_continues(self):
+        self.listing([], state="open")
+        recent = [
+            pr_payload(n, "Closes #7", state="closed", updated_at=ISO1, merged_at=ISO1)
+            for n in range(200, 100, -1)
+        ]
+        self.listing(recent, state="closed")
+        self.listing(
+            [pr_payload(9, "Closes #7", state="closed", merged_at=ISO0)],
+            state="closed",
+            page=2,
+        )
+        found = self.adapter.pulls_index("acme/app", 10, merged_since=float(T0))
+        self.assertEqual(
+            [item.number for item in found.by_issue[7]],
+            [9] + list(range(101, 201)),
+        )
+        self.assertEqual(found.calls, 3)
+        self.assertTrue(found.complete)
+        self.assertEqual(self.gh.paths(), [self.OPEN, self.CLOSED, self.CLOSED + "&page=2"])
 
 
 if __name__ == "__main__":

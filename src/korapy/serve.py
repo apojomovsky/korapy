@@ -48,7 +48,21 @@ OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
 SNAPSHOT_TTL_S_DEFAULT = 2
 
 settings.register("serve.bind", str, "127.0.0.1", "address to bind (default 127.0.0.1, loopback)")
-settings.register("serve.port", int, 0, "port to bind (default 0, an ephemeral port)")
+
+#: The fixed default dashboard port: unprivileged, with no IANA
+#: assignment, and clear of the common dev defaults (3000, 5000,
+#: 8000, 8080), so one bookmarked address works on a fresh host.
+#: The single source for the `serve.port` default and the `--port`
+#: help text below: an agreement test pins them to this constant.
+SERVE_PORT_DEFAULT = 8420
+
+settings.register(
+    "serve.port",
+    int,
+    SERVE_PORT_DEFAULT,
+    "port to bind (default 8420, a fixed unprivileged port with no common clash; "
+    "0 picks a free port for a second or throwaway instance)",
+)
 settings.register(
     "serve.origins",
     list,
@@ -177,6 +191,42 @@ def check_origins(origins) -> str | None:
         if not isinstance(origin, str) or not origin or "*" in origin:
             return f"serve origin {origin!r} is not an exact match (no wildcards)"
     return None
+
+
+def startup_lines(
+    host: str | bytes | bytearray,
+    port: int,
+    *,
+    token_required: bool = False,
+    token_path: str = "",
+) -> list[str]:
+    """Stdout lines announcing a bound server: the dashboard address.
+
+    A concrete bind prints a clickable URL for the real bound port
+    (an ephemeral `--port 0` included: the caller passes what the
+    socket bound, never the requested 0). A wildcard bind (`0.0.0.0`
+    or `::`) has no address a client can open, so it prints the bind
+    and names the address the client should use instead. When a token
+    is required the last line names the token file (never its
+    content) and says the page asks for it once.
+    """
+    if isinstance(host, (bytes, bytearray)):
+        host = bytes(host).decode("ascii", "replace")
+    text = str(host or "")
+    if text in ("0.0.0.0", "::"):
+        lines = [
+            f"korapy serve: listening on {text}:{port}; "
+            f"open http://<this host's name or LAN address>:{port}/ in a browser",
+        ]
+    else:
+        shown = f"[{text}]" if ":" in text else text
+        lines = [f"korapy serve: dashboard at http://{shown}:{port}/"]
+    if token_required:
+        lines.append(
+            f"korapy serve: a token is required; it lives in {token_path}, "
+            "and the page asks for it once",
+        )
+    return lines
 
 
 def read_token(path: str) -> str | None:
@@ -445,19 +495,26 @@ def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
 
 
 def _board_row(
-    item: board.Item, fresh: bool, claim: board.Claim | None, slim: bool = False
+    item: board.Item,
+    fresh: bool,
+    claim: board.Claim | None,
+    slim: bool = False,
+    drift: bool = False,
 ) -> dict:
-    """One board row: the stored item, its freshness, and its holder.
+    """One board row: the stored item, its freshness, its holder, its drift.
 
     Slim rows (`body=0`) drop exactly `body` and `extra`: the list
     view never renders them and stops paying their bytes on every
     poll, while every other key stays identical to the full row.
+    `drift` marks the cards the board step recorded as out of step
+    with their issues, the same verdicts the doctor counts.
     """
     row = asdict(item)
     if slim:
         row.pop("body", None)
         row.pop("extra", None)
     row["fresh"] = fresh
+    row["drift"] = drift
     if claim is None:
         row["claim"] = None
     else:
@@ -804,6 +861,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             with opener() as store:
                 listed = store.items(repo=repo, state=state, label=label)
+                flagged = {
+                    (flagged_repo, flagged_number)
+                    for flagged_repo, flagged_number, _since in store.drift_flags()
+                }
                 rows = []
                 for got in listed:
                     item, fresh = store.item(got.repo, got.number, now=now, max_age=max_age)
@@ -811,7 +872,11 @@ class _Handler(BaseHTTPRequestHandler):
                         continue
                     rows.append(
                         _board_row(
-                            item, fresh, store.claim_of(item.repo, item.number), slim=not full
+                            item,
+                            fresh,
+                            store.claim_of(item.repo, item.number),
+                            slim=not full,
+                            drift=(item.repo, item.number) in flagged,
                         )
                     )
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
@@ -824,6 +889,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "now": now,
                 "board": rows[offset : offset + limit],
                 "total": len(rows),
+                "drift": sum(1 for row in rows if row["drift"]),
                 "limit": limit,
                 "offset": offset,
             },
@@ -1350,8 +1416,10 @@ def make_server(
 
     `build` returns the snapshot document (`collect` by default, the
     same readers the `snapshot` verb uses). Health reports the host the
-    built document names. `bind` defaults to loopback and `port` to an
-    ephemeral one; the bound address reads as `server.server_address`.
+    built document names. `bind` defaults to loopback and `port` 0
+    binds an ephemeral one (the `serve.port` setting defaults to the
+    fixed `SERVE_PORT_DEFAULT` instead); the bound address reads as
+    `server.server_address`.
     `board_open` opens the board store per board request (`board.open_store`
     by default); `projects_fn` lists the registered projects
     (`projects.load_all` by default); `tail_fn` renders tail output
@@ -1421,6 +1489,28 @@ def collect() -> dict:
     return snapshot.build(**snapshot.collect_kwargs())
 
 
+def fixture_build(path: str) -> Callable[[], dict]:
+    """A snapshot builder reading a saved document from `path`.
+
+    Fixture mode: the snapshot-derived routes answer the file instead
+    of the live host, so the page can be developed, tested and
+    screenshotted without a running fleet. Board, tail, events and
+    journal still read the live host. A missing, corrupt or non-object
+    file raises `ServeError`, so a bad fixture fails closed at startup
+    (exit 4) instead of serving half a page.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except OSError as exc:
+        raise ServeError(f"cannot read snapshot fixture {path}: {exc}") from exc
+    except ValueError as exc:
+        raise ServeError(f"snapshot fixture {path} is not JSON: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise ServeError(f"snapshot fixture {path} is not a JSON object")
+    return lambda: doc
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the `serve` verb."""
     from korapy import paths
@@ -1471,8 +1561,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except OSError as err:
         _err(f"cannot read state dir {state_dir}: {err}")
         return UNREACHABLE
+    if args.snapshot_file is not None:
+        try:
+            build = fixture_build(args.snapshot_file)
+        except ServeError as err:
+            _err(str(err))
+            return USAGE
+    else:
+        build = collect
     try:
         server = make_server(
+            build=build,
             bind=bind,
             port=port,
             allowed_origins=tuple(origins),
@@ -1484,12 +1583,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
     except OSError as err:
         if err.errno == errno.EADDRINUSE:
-            _err(f"serve bind {bind}:{port} is already in use")
+            _err(
+                f"serve bind {bind}:{port} is already in use; "
+                "use --port N for another port or --port 0 for a free one"
+            )
             return RACE
         _err(f"cannot bind serve to {bind}:{port}: {err.strerror or err}")
         return USAGE
     host, bound, *_ = server.server_address
-    print(f"listening on {host}:{bound}")
+    for line in startup_lines(host, bound, token_required=remote, token_path=token_path):
+        print(line)
 
     def _stop(signum: int, frame: object) -> None:
         raise SystemExit(0)
@@ -1515,7 +1618,10 @@ def add_parser(sub) -> None:
         "--port",
         type=int,
         default=None,
-        help="port to bind (default serve.port, 0 for an ephemeral port)",
+        help=(
+            f"port to bind (default serve.port, {SERVE_PORT_DEFAULT}; "
+            "0 picks a free port for a second or throwaway instance)"
+        ),
     )
     p.add_argument(
         "--allow-remote",
@@ -1532,5 +1638,11 @@ def add_parser(sub) -> None:
         "--new-token",
         action="store_true",
         help="mint the API token file, then serve",
+    )
+    p.add_argument(
+        "--snapshot-file",
+        default=None,
+        metavar="PATH",
+        help="serve a saved snapshot document instead of the live host (screenshot and dev use)",
     )
     p.set_defaults(func=cmd_serve)

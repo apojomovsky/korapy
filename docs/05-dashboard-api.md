@@ -35,13 +35,26 @@ touched by a read (section 6).
 ## 1. What the API serves, and what it does not
 
 The single source of truth is the `korapy snapshot --json` document
-(schema version 2 today): `schema_version`, `fleet_header` (host, now,
+(schema version 4 today): `schema_version`, `fleet_header` (host, now,
+`tz_offset_s` and `now_iso` carrying the machine's local offset,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
-runtime, role, profile, model, state, started_at, last_seen, note),
+runtime, role, profile, model, state, the panel facts `derived`,
+`idle_s` and `doing`, started_at, last_seen, note),
 `quota` (per
-provider state, windows, read_at, stale, mark, reader, error),
+provider state, windows, read_at, stale, mark, reader, error, plus the
+honest-panel facts `source`, `read_failed` and `error_trimmed`),
 `capacity` (total_cap, repo_cap, live, by_project, pending), `disk`
-(per path totals or per path error). `GET /v1/snapshot` returns that
+(per path totals or per path error), `resources` (charged and measured
+use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
+`mem_total_mb` and `mem_available_mb` the dashboard gauges divide by),
+`attention` (needs-decision questions, ready-to-merge rows, answered
+research findings and the
+coordinator-handled count from the event queue, `unknown` when the
+queue has no reading) and `plan` (the next starts with their named
+waits, identical waits collapsed with a count and the ticket list,
+and the next-pass countdown, `unknown` when the drive journal has no
+reading).
+`GET /v1/snapshot` returns that
 document unchanged, built by the same `snapshot.build` with the same
 injected views, so the CLI and the API can never disagree.
 
@@ -55,7 +68,12 @@ the snapshot only summarizes:
 - `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=&body=`: board store rows
   oldest first, each with its confidence (`confirmed`, `pending`,
   `dirty`), `fetched_at`, claim holder (agent, host, epoch,
-  claimed_at) when held, and queued agent/status overlays. Listing
+  claimed_at) when held, a `drift` flag per row, and queued
+  agent/status overlays. The `drift` flag marks the cards the board
+  step recorded as out of step with their issues, the same verdicts
+  `korapy doctor` counts in its `board-drift` rows; the reply carries
+  their count as `drift` beside `total` (over the filtered rows,
+  before paging), so the board view shows the doctor's number. Listing
   goes through `Store.items` (which takes no `max_age` and reports no
   freshness); freshness is computed in exactly one place in the serve
   layer by calling `Store.item(repo, number, now=..., max_age=...)`
@@ -159,11 +177,19 @@ inotify, so a poll is the mechanism); between polls it sends comment
 heartbeats so idle connections stay visibly alive. A consumer that
 never opens the stream loses nothing: polling covers every fact.
 
-Discovery: the server binds an ephemeral port by default (`--port 0`)
-and prints one line, `listening on 127.0.0.1:PORT`, as the machine
-contract. `--port N` pins a port for dashboards with a fixed config.
-No port number is reserved by this design: claiming one needs a host
-registry that does not exist yet.
+Discovery: the server binds the fixed default port 8420
+(`serve.port`, one constant in `serve.py`), so the dashboard address
+is bookmarkable: `http://127.0.0.1:8420/`. Startup prints one line,
+`korapy serve: dashboard at URL`, as the machine contract, with the
+real bound port (an ephemeral `--port 0` still prints the port the
+socket bound). `--port N` overrides `serve.port` for one run;
+`--port 0` keeps meaning "pick a free port" and is the way to run a
+second instance or a throwaway one. A wildcard bind prints the bind
+and names the client address instead of a URL. Port 8420 is
+unprivileged, carries no IANA assignment, and sits clear of the
+common dev defaults (3000, 5000, 8000, 8080); it is documented, not
+registered, and a held port stays exit 2 with the `--port` fix in
+the message.
 
 ## 3. Security
 
@@ -390,7 +416,7 @@ matters: each ticket builds on the previous one's tests.
   pass; `korapy snapshot --json` output unchanged; `make check`
   green.
 - S2: settings, bind rules, and the verb. Register `serve.bind`
-  (default `127.0.0.1`), `serve.port` (default `0`), `serve origins`
+  (default `127.0.0.1`), `serve.port` (default `8420`), `serve origins`
   (default empty), `serve.snapshot_ttl_s`, `serve.tail_max`,
   `serve.max_streams`; add
   `paths.api_token_path`; wire `korapy serve [--bind] [--port]

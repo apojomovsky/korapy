@@ -4,8 +4,9 @@ Runs the incremental feed for the ops root's repositories (each
 ``[[repo]]`` entry; ``tracker.repo`` when set, else the clone's
 origin), with ``--resync`` for a full rebuild and ``--audit N`` for
 the rolling re-read of the N rows verified least recently. Exit codes:
-0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
-configuration error. A read the tracker answers with a validation
+0 synced, 1 nothing changed, 2 a rename or a drive pass holds the
+drive lock, 3 tracker unreachable, 4 usage or configuration error.
+A read the tracker answers with a validation
 rejection is refused, not unreachable: its line is reported and the
 repo keeps its cursor, and a pass whose only failures are refused
 reads exits 1. Corrupt stored rows are usage errors: a sync that
@@ -26,12 +27,12 @@ import subprocess
 import sys
 import time
 
-from korapy import board, settings, sync
+from korapy import board, paths, settings, sync
 from korapy import tracker as iface
 from korapy.gitenv import clean_env
 from korapy.github import forge as ghforge
 
-OK, NOTHING, UNREACHABLE, USAGE = 0, 1, 3, 4
+OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
 
 def _err(text, err):
@@ -87,18 +88,37 @@ def _tracker_repo(root, name, resolved, git):
     return repo, None
 
 
-def repo_operators(root, names, git):
+def repo_operators(root, names, git, *, project=None, host=None, env=None):
     """`{name: (tracker_repo, operators)}` for each named ``[[repo]]`` entry.
 
     The single resolver for per-repo operators: sync, mirror and the
     dispatch pass all build their tracker-repo mapping from it, so the
     three agree on which authors are internal. Returns (entries, None);
-    on a configuration error returns (None, problem).
+    on a configuration error returns (None, problem). When `project` is
+    given it is the pre-read project table (see `settings.read_project`,
+    with `host` the pre-read host table): every entry resolves from
+    that single parse instead of reading the file once per entry, so
+    one pass never mixes entries from a concurrent edit. `env` selects
+    the environment for both layers, defaulting as in `settings.load`.
     """
+    if project is not None and env is None:
+        env = os.environ
     entries = {}
     for name in names:
         try:
-            resolved = settings.load(root=root, repo=name)
+            if project is None:
+                resolved = settings.load(root=root, repo=name, env=env)
+            else:
+                resolved = settings.resolve(
+                    host=host if host is not None else {},
+                    project=project,
+                    repo=name,
+                    env=env,
+                    host_name=os.path.join(paths.config_dir(env), settings.HOST_CONFIG_NAME),
+                    project_name=os.path.join(root, settings.PROJECT_FILE)
+                    if root
+                    else settings.PROJECT_FILE,
+                )
         except settings.SettingsError as problem:
             return None, str(problem)
         tracker_repo, problem = _tracker_repo(root, name, resolved, git)
@@ -109,6 +129,42 @@ def repo_operators(root, names, git):
             _operators(resolved["tracker.operators"], tracker_repo),
         )
     return entries, None
+
+
+def root_short_map(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The one shared single-root projection of `repo_operators`: both
+    the dispatch pass (`drive.production_repo_map`, across registered
+    roots) and the fail-soft `short_to_tracker` below build from here,
+    so the two builders cannot drift. A configuration problem raises
+    `settings.SettingsError`, so strict callers refuse instead of
+    joining against a guess.
+    """
+    names = settings.repo_names(root)
+    entries, problem = repo_operators(root, names, git)
+    if problem is not None or entries is None:
+        raise settings.SettingsError(problem or f"{root}: cannot read the [[repo]] entries")
+    return {name: tracker for name, (tracker, _ops) in entries.items()}
+
+
+def short_to_tracker(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The single-root projection of the shared `repo_operators` map:
+    the review-record callers (record, show, takeoff, merge) resolve
+    their ticket repo through it, so one map feeds every spelling
+    decision. No root reads as no entries; a configuration problem
+    reads as no entries too, so short names (the on-disk truth every
+    writer uses) keep resolving: only a tracker spelling the map
+    cannot translate fails, loudly, at the caller.
+    """
+    if not root:
+        return {}
+    try:
+        return root_short_map(root, git)
+    except settings.SettingsError:
+        return {}
 
 
 def _has_board_reader(tracker) -> bool:
@@ -127,7 +183,11 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
     budget or the board refused): the step records a board-outage line,
     keeps the old cursor, and the pass continues on store data. A row
     the poll cannot apply is already a line in the board result, not a
-    raise. Anything else (a programming error, any other store failure)
+    raise. A complete poll also adopts the tracker's missing issues
+    through the same reader; failed adds ride along as adopt lines
+    without failing the sync. The same step also syncs the Status
+    column every pass, at most `board.status_per_pass` writes per repo.
+    Anything else (a programming error, any other store failure)
     propagates.
     """
     try:
@@ -164,6 +224,8 @@ def sync_root(
     err,
     push=False,
     tracker_factory=None,
+    lock=None,
+    lock_path=None,
 ) -> int:
     """Sync each named repo entry (or every entry) and report. All seams
     injected; exit codes follow the module docstring.
@@ -172,8 +234,61 @@ def sync_root(
     one factory from the entry's resolved settings (labels or board);
     when omitted the single ``tracker`` serves every repo. Board repos
     run the feed step then the board step; a board-variant repo whose
-    tracker has no board reader is exit 4 naming the repo.
+    tracker has no board reader is exit 4 naming the repo. ``lock`` is
+    the drive-lock seam (``drive.drive_lock``, taking ``lock_path``
+    from the one resolver ``drive.lock_path``), required: the whole
+    pass runs under it, so a sync of the old name cannot land rows
+    under the old key while a rename migrates them; a held lock
+    refuses with exit 2 naming the holder, and a missing lock fails
+    closed with exit 4 instead of syncing unguarded.
     """
+    if lock is None:
+        _err("cannot sync without the drive lock: refusing unguarded", err)
+        return USAGE
+    from korapy import drive
+
+    try:
+        with lock(lock_path):
+            return _sync_body(
+                root,
+                names,
+                resync=resync,
+                audit=audit,
+                as_json=as_json,
+                tracker=tracker,
+                store=store,
+                git=git,
+                now=now,
+                out=out,
+                err=err,
+                push=push,
+                tracker_factory=tracker_factory,
+            )
+    except drive.LockHeld as held:
+        _err(str(held), err)
+        return RACE
+    except drive.LockError as problem:
+        _err(str(problem), err)
+        return USAGE
+
+
+def _sync_body(
+    root,
+    names,
+    *,
+    resync,
+    audit,
+    as_json,
+    tracker,
+    store,
+    git,
+    now,
+    out,
+    err,
+    push=False,
+    tracker_factory=None,
+) -> int:
+    """The resolve, sync and mirror behind `sync_root`: run unlocked."""
     try:
         wanted = settings.repo_names(root)
     except settings.SettingsError as problem:
@@ -253,6 +368,8 @@ def sync_root(
         board_errors = list(board_result.errors) if board_result is not None else []
         board_refused = list(board_result.refused) if board_result is not None else []
         board_store_errors = list(board_result.store_errors) if board_result is not None else []
+        board_adopt_errors = list(board_result.adopt_errors) if board_result is not None else []
+        board_status_errors = list(board_result.status_errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
             "seen": result.items_seen + board_seen,
@@ -261,6 +378,8 @@ def sync_root(
             "refused": list(result.refused) + board_refused,
             "store_errors": list(result.store_errors) + board_store_errors,
             "conflicts": list(result.conflicts),
+            "adopt_errors": list(board_adopt_errors),
+            "status_errors": list(board_status_errors),
         }
         if board_result is not None:
             results[name]["board_seen"] = board_seen
@@ -277,6 +396,10 @@ def sync_root(
         for line in result.store_errors:
             _err(line, err)
         for line in board_store_errors:
+            _err(line, err)
+        for line in board_adopt_errors:
+            _err(line, err)
+        for line in board_status_errors:
             _err(line, err)
         for line in result.conflicts:
             _err(f"claim conflict: {line} (korapy wins)", err)
@@ -340,7 +463,7 @@ def sync_root(
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    from korapy import trackers
+    from korapy import drive, trackers
 
     root = settings.find_root(os.getcwd())
     if root is None:
@@ -381,6 +504,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             err=sys.stderr,
             push=args.push,
             tracker_factory=by_repo.__getitem__,
+            lock=drive.drive_lock,
+            lock_path=drive.lock_path(),
         )
 
 

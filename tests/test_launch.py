@@ -18,6 +18,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -225,7 +226,140 @@ class TargetTest(OpsCase):
 
     def test_the_runtime_limit_matches_the_runtime_default(self):
         self.assertEqual(runtimes.DEFAULT_MAX_TIME, "3h")
-        self.assertEqual(launch.RUNTIME_MAX_S, 3 * 3600)
+        self.assertEqual(launch.max_time_for(self.target("lib").resolved), ("3h", 3 * 3600))
+
+
+class MaxTimeTest(OpsCase):
+    """Ticket 682: `agents.max_time` and `agents.reviewer_max_time`."""
+
+    def start(self, number=5, role=None, **kwargs):
+        return launch.launch(
+            self.target("lib"),
+            number,
+            "do the thing",
+            title="feat: add the thing",
+            role=role,
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            **kwargs,
+        )
+
+    def set_max_time(self, text):
+        path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        content = content.replace("[agents]\ncap = 2", "[agents]\ncap = 2\n" + text)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    def entry(self, unit):
+        found = [item for item in registry.load_all() if item["id"] == unit]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_the_default_limit_is_todays_constant(self):
+        self.assertEqual(settings.REGISTRY["agents.max_time"].default, runtimes.DEFAULT_MAX_TIME)
+        self.assertEqual(
+            settings.REGISTRY["agents.reviewer_max_time"].default, runtimes.DEFAULT_MAX_TIME
+        )
+        self.assertEqual(launch.max_time_for(self.target("lib").resolved), ("3h", 3 * 3600))
+
+    def test_the_launch_records_its_limit_on_the_registry_entry(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 4 * 3600)
+
+    def test_a_reviewer_launch_records_the_reviewer_limit(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        unit, _ = self.start(number=6, role="reviewer")
+        self.assertEqual(self.entry(unit)["max_time_s"], 30 * 60)
+
+    def retime(self, old, new):
+        path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(path, encoding="utf-8") as handle:
+            content = handle.read()
+        self.assertIn(old, content)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(content.replace(old, new))
+
+    def test_close_previous_uses_the_launch_limit_after_the_setting_is_raised(self):
+        self.set_max_time('max_time = "30m"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 30 * 60)
+        self.system.finish(unit)
+        self.retime('max_time = "30m"', 'max_time = "4h"')
+        closed = launch._close_previous(
+            self.target("lib"), 5, self.system.list_fn, now_fn=lambda: time.time() + 31 * 60
+        )
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "timed-out")
+
+    def test_close_previous_uses_the_launch_limit_after_the_setting_is_lowered(self):
+        self.set_max_time('max_time = "4h"')
+        unit, _ = self.start()
+        self.assertEqual(self.entry(unit)["max_time_s"], 4 * 3600)
+        self.system.finish(unit)
+        self.retime('max_time = "4h"', 'max_time = "30m"')
+        closed = launch._close_previous(
+            self.target("lib"), 5, self.system.list_fn, now_fn=lambda: time.time() + 3600
+        )
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "ok")
+
+    def test_the_reviewer_limit_defaults_to_the_worker_limit(self):
+        self.set_max_time('max_time = "4h"')
+        resolved = self.target("lib").resolved
+        self.assertEqual(launch.max_time_for(resolved), ("4h", 4 * 3600))
+        self.assertEqual(launch.max_time_for(resolved, reviewer=True), ("4h", 4 * 3600))
+
+    def test_the_reviewer_override_wins_for_reviewers_only(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        resolved = self.target("lib").resolved
+        self.assertEqual(launch.max_time_for(resolved), ("4h", 4 * 3600))
+        self.assertEqual(launch.max_time_for(resolved, reviewer=True), ("30m", 30 * 60))
+
+    def test_a_bad_duration_is_refused(self):
+        self.set_max_time('max_time = "soon"')
+        with self.assertRaises(settings.SettingsError):
+            self.target("lib")
+
+    def test_the_default_limit_reaches_the_runtime_and_the_unit(self):
+        self.start()
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--max-time") + 1], "3h")
+        self.assertIn("--property=RuntimeMaxSec=10800", argv)
+
+    def test_the_custom_limit_reaches_the_runtime_and_the_unit(self):
+        self.set_max_time('max_time = "4h"')
+        self.start()
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--max-time") + 1], "4h")
+        self.assertIn("--property=RuntimeMaxSec=14400", argv)
+
+    def test_a_reviewer_launch_uses_the_reviewer_limit(self):
+        self.set_max_time('max_time = "4h"\nreviewer_max_time = "30m"')
+        self.start(number=6, role="reviewer")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--max-time") + 1], "30m")
+        self.assertIn("--property=RuntimeMaxSec=1800", argv)
+
+    def test_close_previous_marks_a_fresh_dead_unit_ok(self):
+        unit, _ = self.start()
+        self.system.finish(unit)
+        closed = launch._close_previous(self.target("lib"), 5, self.system.list_fn)
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "ok")
+
+    def test_close_previous_marks_a_limit_old_dead_unit_timed_out(self):
+        unit, _ = self.start()
+        self.system.finish(unit)
+        closed = launch._close_previous(
+            self.target("lib"), 5, self.system.list_fn, now_fn=lambda: time.time() + 4 * 3600
+        )
+        self.assertEqual(closed, [unit])
+        self.assertEqual(self.entry(unit)["outcome"], "timed-out")
 
 
 class AdmitTest(OpsCase):
@@ -319,15 +453,16 @@ class BudgetWiringTest(OpsCase):
             handle.write(text)
 
     def register_web(self, share="weight = 1\n"):
+        self.register_project("web", "korapy-agent-", os.path.realpath(self.root), share=share)
+
+    def register_project(self, name, prefix, root, ceiling=None, share="weight = 1\n"):
         directory = os.path.join(os.environ["KORAPY_CONFIG"], "projects.d")
         os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "web.toml"), "w", encoding="utf-8") as handle:
-            handle.write(
-                'name = "web"\nunit_prefix = "korapy-agent-"\nroot = "'
-                + os.path.realpath(self.root)
-                + '"\n\n[resources]\n'
-                + share
-            )
+        text = f'name = "{name}"\nunit_prefix = "{prefix}"\nroot = "{root}"\n'
+        if ceiling is not None:
+            text += f"ceiling = {ceiling}\n"
+        with open(os.path.join(directory, f"{name}.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text + "\n[resources]\n" + share)
 
     def admit(self, number=5, **kwargs):
         kwargs.setdefault("list_fn", self.system.list_fn)
@@ -365,6 +500,41 @@ class BudgetWiringTest(OpsCase):
         self.assertEqual(self.system.started, [])
         self.assertFalse(os.path.exists(self.session("lib", 5)))
         self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_ceiling_zero_project_reserves_no_budget(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 3000\nmemory_mb = 8000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.register_web()
+        self.register_project(
+            "shadow", "korapy-shadow-", os.path.join(self.tmp, "shadow-ops"), ceiling=0
+        )
+        decided = self.admit()
+        assert decided.share is not None
+        self.assertEqual(
+            (decided.share.cpu_m, decided.share.memory_mb, decided.share.pids),
+            (3000, 8000, 4096),
+        )
+
+    def test_a_ceiling_raised_from_0_to_1_re_splits_on_the_next_launch(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 3000\nmemory_mb = 8000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.register_web()
+        shadow_root = os.path.join(self.tmp, "shadow-ops")
+        self.register_project("shadow", "korapy-shadow-", shadow_root, ceiling=0)
+        paused = self.admit()
+        assert paused.share is not None
+        self.assertEqual(paused.share.cpu_m, 3000)
+        self.register_project("shadow", "korapy-shadow-", shadow_root, ceiling=1)
+        resumed = self.admit()
+        assert resumed.share is not None
+        self.assertEqual(
+            (resumed.share.cpu_m, resumed.share.memory_mb, resumed.share.pids),
+            (1500, 4000, 2048),
+        )
 
     def test_disk_pressure_wins_over_the_budget(self):
         self.host_config(
@@ -1129,6 +1299,81 @@ class LaunchTest(OpsCase):
             ["korapy-agent-lib-5"],
         )
         self.assertEqual(self.system.units["korapy-agent-my-repo-5"], "active")
+
+
+class PushEnvTest(OpsCase):
+    """The push path a launch gets: SSH, the HTTPS fallback, or a refusal.
+
+    The clone's origin reads as an SSH GitHub address through a git seam
+    that answers only that read and runs the real git for everything else,
+    so worktree creation still fetches the local origin. Fakes only.
+    """
+
+    SSH_ORIGIN = "git@github.com:acme/lib.git"
+
+    def ssh_git(self):
+        from korapy import worktrees
+
+        def git(args, cwd):
+            if list(args) == ["remote", "get-url", "origin"]:
+                return subprocess.CompletedProcess(["git", *args], 0, self.SSH_ORIGIN + "\n", "")
+            return worktrees.git(args, cwd)
+
+        return git
+
+    def start(self, number=5, role=None, **kwargs):
+        kwargs.setdefault("ssh_probe", lambda: False)
+        kwargs.setdefault("gh_login", lambda: True)
+        return launch.launch(
+            self.target("lib"),
+            number,
+            "do the thing",
+            title="feat: add the thing",
+            role=role,
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            git=self.ssh_git(),
+            **kwargs,
+        )
+
+    def setenv(self, argv):
+        found = {}
+        for item in argv:
+            if item.startswith("--setenv="):
+                key, _, value = item[len("--setenv=") :].partition("=")
+                found[key] = value
+        return found
+
+    def test_the_fallback_env_reaches_the_unit(self):
+        unit, _ = self.start()
+        env = self.setenv(self.system.started[-1])
+        self.assertEqual(env["KORAPY_AGENT_ID"], unit)
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "url.https://github.com/.insteadOf")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "git@github.com:")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_the_reviewer_launch_gets_the_same_env(self):
+        with mock.patch.object(runtimes, "get", return_value=FakeAdapter()):
+            _, _ = self.start(number=6, role="reviewer")
+        env = self.setenv(self.system.started[-1])
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_a_healthy_agent_gets_no_push_env(self):
+        self.start(ssh_probe=lambda: True)
+        env = self.setenv(self.system.started[-1])
+        self.assertNotIn("GIT_CONFIG_COUNT", env)
+
+    def test_neither_path_refuses_before_anything_starts(self):
+        with self.assertRaises(launch.LaunchError) as ctx:
+            self.start(gh_login=lambda: False)
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("agent", str(ctx.exception))
+        self.assertIn("gh auth login", str(ctx.exception))
+        self.assertEqual(self.system.started, [])
 
 
 class MuseSessionTest(OpsCase):
@@ -2652,6 +2897,325 @@ runtime = "muse"
         self.assertEqual(recorded.runtime, "muse")
         self.assertEqual(recorded.layer, 1)
 
+    def append_toml(self, text):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            before = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(before + text)
+
+    def test_launch_applies_muse_profile_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "low")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+
+    def test_launch_applies_omp_profile_options(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "options.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"auto_approve": False})
+        self.assertNotIn("--auto-approve", self.system.started[-1])
+
+    def test_runtime_config_beats_muse_profile_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            "parallel_tool_calls = false\n"
+        )
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"reasoning_effort": "medium"}, handle)
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        self.assertEqual(config["reasoning_effort"], "medium")
+        self.assertIs(config["parallel_tool_calls"], False)
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
+        self.assertNotIn("--parallel-tool-calls", argv)
+
+    def test_runtime_config_beats_omp_profile_options(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"auto_approve": True}, handle)
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("--auto-approve", self.system.started[-1])
+
+    def test_resume_without_flags_reuses_the_recorded_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", tracker=FakeTracker([])
+        )
+        self.assertEqual((code, err), (0, ""))
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+
+    def test_resume_with_runtime_rebuilds_the_session_config(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        leaf = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(leaf, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        with open(os.path.join(leaf, "options.json"), "w", encoding="utf-8") as handle:
+            json.dump({"auto_approve": False}, handle)
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--runtime",
+            "omp",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse(os.path.exists(os.path.join(leaf, "options.json")))
+        self.assertIn("--auto-approve", self.system.started[-1])
+
+    def test_resume_with_profile_and_model_keeps_the_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "effort",
+            "--model",
+            "provider-a/model-1",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "low")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--model") + 1], "model-1")
+
+    def test_resume_onto_an_option_less_profile_sheds_the_old_keys(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.plain]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "plain",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertNotIn("reasoning_effort", json.load(handle))
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "high")
+
+    def test_resume_onto_another_runtime_without_its_handle_is_exit_4(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n'
+            "[profiles.quiet.options]\n"
+            "auto_approve = false\n"
+            '[profiles.fast]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, _, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no muse session to resume", err)
+
+    def test_resume_with_profile_applies_the_new_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.calm]\nruntime = "muse"\n'
+            "[profiles.calm.options]\n"
+            'reasoning_effort = "medium"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "calm",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "medium")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
+
     def test_resume_without_flags_reuses_the_recorded_profile_after_expiry(self):
         toml_path = os.path.join(self.root, settings.PROJECT_FILE)
         with open(toml_path, encoding="utf-8") as handle:
@@ -2830,6 +3394,154 @@ runtime = "muse"
             "m",
         )
         self.assertEqual((code, err), (0, ""))
+
+    def test_launch_refining_an_omp_profile_to_muse_is_exit_4(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            "--runtime",
+            "muse",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("auto_approve", err)
+        self.assertIn("muse", err)
+
+    def test_launch_refining_a_muse_profile_to_omp_is_exit_4(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime",
+            "omp",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("reasoning_effort", err)
+        self.assertIn("omp", err)
+
+    def test_a_refused_flagged_resume_leaves_the_session_untouched(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n'
+            "[profiles.quiet.options]\n"
+            "auto_approve = false\n"
+            '[profiles.fast]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+
+        def snapshot():
+            found = {}
+            for name in ("overlay.yml", "options.json", "muse.json", "profile", "runtime"):
+                path = os.path.join(session, name)
+                try:
+                    with open(path, "rb") as handle:
+                        found[name] = handle.read()
+                except FileNotFoundError:
+                    found[name] = None
+            return found
+
+        before = snapshot()
+        code, _, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no muse session to resume", err)
+        self.assertEqual(snapshot(), before)
+        code, _, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", tracker=FakeTracker([])
+        )
+        self.assertEqual((code, err), (0, ""))
+
+    def test_flag_resume_reapplies_the_recorded_runtime_config(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.calm]\nruntime = "muse"\n'
+            "[profiles.calm.options]\n"
+            'reasoning_effort = "high"\n'
+        )
+        self.write_tracker_repo()
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"reasoning_effort": "medium"}, handle)
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "calm",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "medium")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
 
 
 class NoSliceStopgap(unittest.TestCase):

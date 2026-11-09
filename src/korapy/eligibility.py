@@ -14,9 +14,15 @@ world is a configuration error in that project, never a new seam.
 
 The entry is either a dotted ``module:function`` name or a
 ``path/to/policy.py:function`` file path. Korapy's callers pass the
-project's registered ops root as `base`, so a relative file path
+project's registered ops root as `base`: a relative file path
 resolves against that root rather than the process working directory,
-and the same entry loads from a shell and under a unit.
+and a dotted module imports with that root first on the import search
+path, so a policy file sitting beside `korapy.toml` needs no
+installation and the same entry loads from a shell and under a unit.
+The previous search path is restored before returning, also on
+failure. When the same module name exists both in the ops root and
+elsewhere, the ops root's copy wins; `LoadedPolicy.source` records
+which file was loaded.
 A project without the entry registers no candidates; loading failures
 are configuration errors (exit 4) naming the project and the entry,
 blocking only that project.
@@ -31,10 +37,13 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from korapy import board
+from korapy import accounts, board
 
 #: The request kinds a policy may return (section 2 of `04-dispatch-loop.md`).
-KINDS = ("start", "resume", "review", "fix")
+#: `research` starts a research ticket with the research worker prompt;
+#: it claims and launches like `start` but finishes as a Findings
+#: comment, never a pull request.
+KINDS = ("start", "resume", "review", "fix", "research")
 
 
 class EligibilityError(ValueError):
@@ -45,12 +54,21 @@ class EligibilityError(ValueError):
 
 @dataclass(frozen=True)
 class LinkedPull:
-    """One pull request linked to a ticket, as plain data."""
+    """One pull request linked to a ticket, as plain data.
+
+    `updated_at` is the tracker's last-update time for the pull, as
+    epoch seconds. `merged_at` is when the pull merged, else 0.0; the
+    gate scopes a merged pull against the merge time, falling back to
+    `updated_at` only when the listing carries no merge time. Both
+    default to zero for rows built without a tracker read.
+    """
 
     number: int
     state: str = ""
     checks: str = ""
     review: str = ""
+    updated_at: float = 0.0
+    merged_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -59,7 +77,14 @@ class TicketRow:
 
     `extra` carries the board concepts (priority, area, pool, blocked-by
     refs and the like); it defaults to None and reads as {} so label-only
-    rows are unchanged.
+    rows are unchanged. `pulls` carries the ticket's linked pull requests
+    from the tracker (None when that read failed, so readers fail closed);
+    it defaults to () for rows built without a tracker read, such as plans.
+    `pulls_error` carries the first error that read reported for the
+    ticket, so skips can name the cause; it defaults to empty.
+    `claimed_at` is the current claim's start time as epoch seconds,
+    None when the ticket is unclaimed or the pass did not read claims;
+    the merged-pull check scopes old merges against it.
     """
 
     repo: str
@@ -71,7 +96,9 @@ class TicketRow:
     agent: str = ""
     status: str = ""
     external: bool = False
-    pulls: tuple = ()
+    pulls: tuple | None = ()
+    pulls_error: str = ""
+    claimed_at: float | None = None
     extra: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -80,6 +107,39 @@ class TicketRow:
             object.__setattr__(self, "extra", dict(extra))
         else:
             object.__setattr__(self, "extra", {})
+
+
+def merged_pull(row: TicketRow):
+    """The row's first in-scope merged linked pull, else None. Pure.
+
+    A pull merged since the ticket's current claim start means the
+    work landed during this round, so no new round starts on it,
+    whatever else the row says; a ticket with no claim withdraws the
+    same way. A pull merged before the claim start reads as
+    landed-before-this-round (a reopened ticket picked up again), so
+    it does not withdraw; a merge at exactly the claim start, or
+    with no readable time, withdraws, failing closed without an
+    ordering proof. The scope reads the merge time (`merged_at`),
+    falling back to the last-update time (`updated_at`) only when
+    the listing carries no merge time, so a comment on a long-merged
+    pull never re-arms the withdrawal. The first in-scope merge is
+    named, so the reason stays stable. A pull closed without merging
+    is not merged: the ticket still needs its round. Unreadable pulls
+    (None) read as no merged pull; readers refuse those rows on their
+    own check.
+    """
+    claimed_at = getattr(row, "claimed_at", None)
+    for pull in row.pulls or ():
+        if getattr(pull, "state", "") != "merged":
+            continue
+        if claimed_at is None:
+            return pull
+        merged_at = getattr(pull, "merged_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at <= 0:
+            merged_at = getattr(pull, "updated_at", 0.0)
+        if not isinstance(merged_at, (int, float)) or merged_at >= claimed_at:
+            return pull
+    return None
 
 
 @dataclass(frozen=True)
@@ -97,13 +157,25 @@ class StartRequest:
     weight: float = 0.0
 
 
-def row_from_item(item: board.Item) -> TicketRow:
-    """The policy view of one board store item. Pure."""
-    # pulls stays empty here: no provider-neutral link joins a store row
-    # to its pull requests, so only policies and tests set it. A linked
-    # pull the store cannot serve fails the drive hold gate closed.
-    # Board concepts ride along in extra, copied on read so no two rows
-    # share one dict; a missing value reads as carrying nothing.
+def row_from_item(
+    item: board.Item,
+    *,
+    pulls: tuple | None = (),
+    pulls_error: str = "",
+    claimed_at: float | None = None,
+) -> TicketRow:
+    """The policy view of one board store item. Pure.
+
+    `pulls` is the ticket's linked pull requests from the tracker (None
+    when that read failed, so readers fail closed); the store carries
+    no pull rows, so callers pass what the pass read. `pulls_error` is
+    the first error that read reported for the ticket, so skips can name
+    the cause. `claimed_at` is the current claim's start time, passed
+    beside the item because the store keeps claims outside the item;
+    None reads as unclaimed. Board concepts ride along in extra, copied
+    on read so no two rows share one dict; a missing value reads as
+    carrying nothing.
+    """
     return TicketRow(
         repo=item.repo,
         number=item.number,
@@ -114,18 +186,172 @@ def row_from_item(item: board.Item) -> TicketRow:
         agent=item.agent,
         status=item.status,
         external=item.external,
-        pulls=(),
+        pulls=pulls,
+        pulls_error=pulls_error,
+        claimed_at=claimed_at,
         extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
 
-def rows_from_items(items: Sequence[board.Item]) -> list[TicketRow]:
-    """The policy view of every given item, in the given order. Pure."""
-    return [row_from_item(item) for item in items]
+def rows_from_items(
+    items: Sequence[board.Item],
+    *,
+    pulls_by_key: Mapping[tuple[str, int], tuple | None] | None = None,
+    pulls_errors: Mapping[tuple[str, int], str] | None = None,
+    claims_by_key: Mapping[tuple[str, int], float | None] | None = None,
+) -> list[TicketRow]:
+    """The policy view of every given item, in the given order. Pure.
+
+    `pulls_by_key` maps (repo, number) to the linked pulls the pass
+    read through the tracker (None marks an unreadable ticket); a
+    ticket missing from the map reads as carrying no pulls. With no
+    map every row reads empty, which is what plans build: they never
+    contact the tracker. `pulls_errors` maps (repo, number) to the
+    first error that read reported, so skips can name the cause; a
+    ticket missing from it reads as reporting none. `claims_by_key`
+    maps (repo, number) to the current claim's start time; a ticket
+    missing from it reads as unclaimed.
+    """
+    rows = []
+    for item in items:
+        pulls: tuple | None = ()
+        pulls_error = ""
+        claimed_at: float | None = None
+        if pulls_by_key is not None:
+            pulls = pulls_by_key.get((item.repo, item.number), ())
+        if pulls_errors is not None:
+            pulls_error = pulls_errors.get((item.repo, item.number), "")
+        if claims_by_key is not None:
+            claimed_at = claims_by_key.get((item.repo, item.number))
+        rows.append(
+            row_from_item(item, pulls=pulls, pulls_error=pulls_error, claimed_at=claimed_at)
+        )
+    return rows
 
 
-def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[..., Any]:
-    """The callable an entry names, dotted or file path. Never called here."""
+def _module_files(module: Any) -> list[str]:
+    """The files a cached module loaded from: its file plus package dirs."""
+    files = []
+    file = getattr(module, "__file__", None)
+    if isinstance(file, str) and file:
+        files.append(file)
+    try:
+        locations = list(getattr(module, "__path__", None) or [])
+    except TypeError:
+        locations = []
+    files.extend(entry for entry in locations if isinstance(entry, str) and entry)
+    return files
+
+
+def _under_root(path: str, root: str) -> bool:
+    """Whether `path` is the root itself or something inside it."""
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
+def _root_provides(root: str, name: str) -> bool:
+    """Whether the ops root holds the top-level package or module `name`.
+
+    A bare directory counts: a namespace package (no `__init__.py`)
+    is still a copy the root provides, so it evicts a cached copy
+    like a regular one instead of silently keeping it.
+    """
+    package = os.path.join(root, *name.split("."))
+    return (
+        os.path.isfile(package + ".py")
+        or os.path.isfile(os.path.join(package, "__init__.py"))
+        or os.path.isdir(package)
+    )
+
+
+def _import_dotted(head: str, *, entry: str, project: str, base: str | None = None) -> Any:
+    """The module `head` names, with the ops root first when `base` is given.
+
+    The import runs through the shared import-path helper accounts uses
+    for readers, so prepending and restoring happen in exactly one
+    place. Prepending (never appending) keeps an ops-root copy winning
+    over an installed copy of the same name. The module cache does not
+    consult that path, so with an ops root the cached entries for the
+    module (and an ancestor package the root provides) whose files live
+    elsewhere are set aside before importing and put back afterwards:
+    one project's policy cannot leak into the next project's load, and
+    a name imported earlier still resolves to the ops root's copy.
+    When the root provides the name but the import still resolves
+    elsewhere (a regular package always beats the root's namespace
+    copy, whatever the path order), that is a configuration error
+    naming the project and the entry, never a quiet wrong policy.
+    """
+    dirs = [base] if base else []
+    with accounts.with_reader_path(dirs):
+        if not base:
+            try:
+                return importlib.import_module(head)
+            except Exception as err:
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} does not import: {err}"
+                ) from None
+        root = os.path.realpath(base)
+        saved: dict[str, Any] = {}
+        stashed = [
+            head,
+            *[".".join(head.split(".")[:depth]) for depth in range(1, len(head.split(".")))],
+        ]
+        for key in [name for name in stashed if name in sys.modules]:
+            if key != head and not _root_provides(root, key):
+                continue
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        for key in [
+            name for name in list(sys.modules) if name.startswith(head + ".") and name not in saved
+        ]:
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        before = set(sys.modules)
+        try:
+            module = importlib.import_module(head)
+            loaded = _module_files(module)
+            if _root_provides(root, head) and (
+                not loaded or all(not _under_root(found, root) for found in loaded)
+            ):
+                shown = loaded[0] if loaded else "an unknown file"
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} loaded from {shown} "
+                    f"instead of the ops root {root}"
+                )
+            return module
+        except EligibilityError:
+            raise
+        except Exception as err:
+            raise EligibilityError(
+                f"project {project}: eligibility {entry!r} does not import: {err}"
+            ) from None
+        finally:
+            for key in [
+                name
+                for name in list(sys.modules)
+                if (name == head or name.startswith(head + ".") or head.startswith(name + "."))
+                and name not in before
+                and name not in saved
+            ]:
+                sys.modules.pop(key, None)
+            sys.modules.update(saved)
+
+
+def _resolve(
+    entry: str, *, project: str, base: str | None = None
+) -> tuple[Callable[..., Any], str | None]:
+    """The callable an entry names plus the file its module loaded from.
+
+    Dotted or file path; never called here. `source` is the module
+    file (None when the module reports none), so a shadowed name shows
+    which copy won.
+    """
     head, sep, attrs = entry.partition(":")
     if not sep or not head or not attrs:
         raise EligibilityError(
@@ -133,14 +359,12 @@ def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[.
             "module:function or path/to/policy.py:function"
         )
     if "/" in head or os.sep in head or head.endswith(".py"):
-        target: Any = _load_file(head, entry=entry, project=project, base=base)
+        module, source = _load_file(head, entry=entry, project=project, base=base)
+        target: Any = module
     else:
-        try:
-            target = importlib.import_module(head)
-        except Exception as err:
-            raise EligibilityError(
-                f"project {project}: eligibility {entry!r} does not import: {err}"
-            ) from None
+        module = _import_dotted(head, entry=entry, project=project, base=base)
+        source = getattr(module, "__file__", None)
+        target = module
     for attr in attrs.split("."):
         try:
             target = getattr(target, attr)
@@ -150,14 +374,15 @@ def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[.
             ) from None
     if not callable(target):
         raise EligibilityError(f"project {project}: eligibility {entry!r} is not callable")
-    return target
+    return target, source
 
 
-def _load_file(path: str, *, entry: str, project: str, base: str | None = None) -> Any:
-    """The module at `path`, imported under a name derived from the path.
+def _load_file(path: str, *, entry: str, project: str, base: str | None = None) -> tuple[Any, str]:
+    """The module at `path` plus the absolute file it loaded from.
 
     A relative `path` resolves against `base`, the project's registered
     ops root; without a base it stays relative to the working directory.
+    The module imports under a name derived from the path.
     """
     if base is not None and not os.path.isabs(path):
         path = os.path.join(base, path)
@@ -175,7 +400,7 @@ def _load_file(path: str, *, entry: str, project: str, base: str | None = None) 
         raise EligibilityError(
             f"project {project}: eligibility {entry!r} does not import: {err}"
         ) from None
-    return module
+    return module, os.path.abspath(path)
 
 
 @dataclass(frozen=True)
@@ -185,11 +410,14 @@ class LoadedPolicy:
     `eligible(rows, *, now)` is the pure call: it runs the entry over
     the rows and returns the validated requests heaviest first. A bad
     answer is an EligibilityError naming the project and the entry.
+    `source` is the file the entry's module loaded from (None when the
+    module reports none), so a shadowed name shows which copy won.
     """
 
     project: str
     entry: str
     func: Callable[..., Any] = field(compare=False)
+    source: str | None = None
 
     def eligible(self, rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]:
         try:
@@ -249,13 +477,16 @@ def load_policy(entry: str, *, project: str, base: str | None = None) -> LoadedP
     calls the entry function; the module's own top-level code runs on
     import, which is the in-process trust boundary for policy code.
 
-    `base` is the project's registered ops root, against which a
-    relative file path resolves. Raises EligibilityError (exit 4)
-    naming the project and the entry.
+    `base` is the project's registered ops root: a relative file path
+    resolves against it, and a dotted module imports with it first on
+    the import search path (restored before returning, also on
+    failure), so the ops root's copy wins over an installed one.
+    `source` on the returned policy records which file the module
+    loaded from. Raises EligibilityError (exit 4) naming the project
+    and the entry.
     """
-    return LoadedPolicy(
-        project=project, entry=entry, func=_resolve(entry, project=project, base=base)
-    )
+    func, source = _resolve(entry, project=project, base=base)
+    return LoadedPolicy(project=project, entry=entry, func=func, source=source)
 
 
 def check_entry(entry: str, *, project: str, base: str | None = None) -> str | None:
@@ -283,14 +514,41 @@ class Outcome(NamedTuple):
     skipped: str | None
 
 
-def for_project(project: Any, items: Sequence[board.Item], *, now: float) -> Outcome:
+def no_entry_line(project_name: str) -> str:
+    """The logbook line for a project without an eligibility entry.
+
+    Both `for_project` and the drive pass render this line, so the
+    text lives here, in exactly one place.
+    """
+    return f"project {project_name} has no eligibility entry: skipped"
+
+
+def for_project(
+    project: Any,
+    items: Sequence[board.Item],
+    *,
+    now: float,
+    pulls_by_key: Mapping[tuple[str, int], tuple | None] | None = None,
+    pulls_errors: Mapping[tuple[str, int], str] | None = None,
+) -> Outcome:
     """One project's ordered requests over these store items.
 
-    Raises EligibilityError (exit 4, naming the project and the entry)
-    when the entry does not load or the answer is invalid. Blocks only
-    this project: the caller moves on to the next one.
+    `pulls_by_key` maps (repo, number) to the linked pulls the pass
+    read through the tracker, so the policy and the gate read the
+    same row pulls; with none every row reads empty. `pulls_errors`
+    maps (repo, number) to the first error that read reported, so the
+    rows carry the cause with them. Raises EligibilityError (exit 4,
+    naming the project and the entry) when the entry does not load or
+    the answer is invalid. Blocks only this project: the caller moves
+    on to the next one.
     """
     if not project.eligibility:
-        return Outcome([], f"project {project.name} has no eligibility entry: skipped")
+        return Outcome([], no_entry_line(project.name))
     policy = load_policy(project.eligibility, project=project.name, base=project.root)
-    return Outcome(policy.eligible(rows_from_items(items), now=now), None)
+    return Outcome(
+        policy.eligible(
+            rows_from_items(items, pulls_by_key=pulls_by_key, pulls_errors=pulls_errors),
+            now=now,
+        ),
+        None,
+    )

@@ -933,7 +933,10 @@ class Pressure:
     """Host pressure: load per CPU, available memory percent, saturation.
 
     Unknown readings are None, never a refusal: measurement informs the
-    snapshot while admission prices from the static role tags.
+    snapshot while admission prices from the static role tags. The host
+    facts (`ncpu`, `load_1min`, `mem_total_mb`, `mem_available_mb`) are
+    the denominators the dashboard gauges share with these ratios, so a
+    gauge and its reserved share always read from one reading.
     """
 
     load_per_cpu: float | None = None
@@ -941,6 +944,10 @@ class Pressure:
     saturated: bool = False
     cpu_some_avg10: float | None = None
     memory_some_avg10: float | None = None
+    ncpu: int | None = None
+    load_1min: float | None = None
+    mem_total_mb: float | None = None
+    mem_available_mb: float | None = None
 
 
 @dataclass(frozen=True)
@@ -966,8 +973,13 @@ def _first_float(text):
         return None
 
 
-def _meminfo_pct(text):
-    """MemAvailable over MemTotal as a percent, or None when missing."""
+def _meminfo_kb(text):
+    """`(total_kb, available_kb)` from meminfo text, or None when missing.
+
+    The one parser for the host memory facts: the percent and the
+    absolute megabytes both divide from this reading, so the pressure
+    line and the dashboard gauge can never disagree on garbage.
+    """
     if not isinstance(text, str):
         return None
     fields = {}
@@ -979,9 +991,31 @@ def _meminfo_pct(text):
         available = float(fields["MemAvailable"][0])
     except (KeyError, ValueError, IndexError):
         return None
-    if total <= 0:
+    if total <= 0 or available < 0:
         return None
+    return (total, available)
+
+
+def _meminfo_pct(text):
+    """MemAvailable over MemTotal as a percent, or None when missing."""
+    absolute = _meminfo_kb(text)
+    if absolute is None:
+        return None
+    total, available = absolute
     return round(available / total * 100, 1)
+
+
+def _meminfo_mb(text):
+    """`(total_mb, available_mb)` from meminfo text, or None when missing.
+
+    The one reader for the absolute host memory the dashboard memory
+    gauge divides by; both it and the percent read one parser.
+    """
+    absolute = _meminfo_kb(text)
+    if absolute is None:
+        return None
+    total, available = absolute
+    return (round(total / 1024, 1), round(available / 1024, 1))
 
 
 def _some_avg10(text):
@@ -1014,11 +1048,14 @@ def parse_pressure(
     saturation rule stays testable without settings.
     """
     load = _first_float(loadavg_text)
-    per_cpu = None
-    if load is not None and isinstance(cpu_count, int) and not isinstance(cpu_count, bool):
-        if cpu_count > 0:
-            per_cpu = round(load / cpu_count, 2)
+    ncpu = (
+        cpu_count
+        if isinstance(cpu_count, int) and not isinstance(cpu_count, bool) and cpu_count > 0
+        else None
+    )
+    per_cpu = round(load / ncpu, 2) if load is not None and ncpu is not None else None
     pct = _meminfo_pct(meminfo_text)
+    absolute = _meminfo_mb(meminfo_text)
     saturated = (per_cpu is not None and per_cpu > max_load_per_cpu) or (
         pct is not None and pct < min_mem_available_pct
     )
@@ -1028,6 +1065,10 @@ def parse_pressure(
         saturated=saturated,
         cpu_some_avg10=_some_avg10(cpu_stall),
         memory_some_avg10=_some_avg10(memory_stall),
+        ncpu=ncpu,
+        load_1min=round(load, 2) if load is not None else None,
+        mem_total_mb=absolute[0] if absolute is not None else None,
+        mem_available_mb=absolute[1] if absolute is not None else None,
     )
 
 
@@ -1155,12 +1196,19 @@ def pressure_dict(value):
         saturated = value.get("saturated", False)
         if not isinstance(saturated, bool):
             raise LimitsError(f"saturated must be a boolean, not {saturated!r}")
+        ncpu = value.get("ncpu")
+        if ncpu is not None and (isinstance(ncpu, bool) or not isinstance(ncpu, int) or ncpu <= 0):
+            raise LimitsError(f"ncpu must be a positive integer or null, not {ncpu!r}")
         item = Pressure(
             load_per_cpu=_optional_number(value.get("load_per_cpu"), "load_per_cpu"),
             mem_available_pct=_optional_number(value.get("mem_available_pct"), "mem_available_pct"),
             saturated=saturated,
             cpu_some_avg10=_optional_number(value.get("cpu_some_avg10"), "cpu_some_avg10"),
             memory_some_avg10=_optional_number(value.get("memory_some_avg10"), "memory_some_avg10"),
+            ncpu=ncpu,
+            load_1min=_optional_number(value.get("load_1min"), "load_1min"),
+            mem_total_mb=_optional_number(value.get("mem_total_mb"), "mem_total_mb"),
+            mem_available_mb=_optional_number(value.get("mem_available_mb"), "mem_available_mb"),
         )
     else:
         raise LimitsError(f"pressure must be a Pressure or a mapping, not {value!r}")
@@ -1172,6 +1220,10 @@ def pressure_dict(value):
         "saturated": item.saturated,
         "cpu_some_avg10": item.cpu_some_avg10,
         "memory_some_avg10": item.memory_some_avg10,
+        "ncpu": item.ncpu,
+        "load_1min": item.load_1min,
+        "mem_total_mb": item.mem_total_mb,
+        "mem_available_mb": item.mem_available_mb,
     }
 
 

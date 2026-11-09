@@ -17,6 +17,11 @@
 | [`12-web-dashboard.md`](12-web-dashboard.md) | design for the web dashboard: a read-only browser UI over `korapy serve` and the hub, the stack choice, token handling on arbitrary devices, and the tickets to build it |
 | [`13-agent-ergonomics.md`](13-agent-ergonomics.md) | agent ergonomics: wait, events, the review-report reader, merge, and the gate |
 | [`14-heavy-lane.md`](14-heavy-lane.md) | the heavy lane: weighted slots, learned costs and pressure-aware admission for bursty work |
+| [`15-project-hygiene.md`](15-project-hygiene.md) | project-declared hygiene rules: dev images, build caches, scratch and old sessions for gc and disk |
+| [`16-tracker-repo-resolver.md`](16-tracker-repo-resolver.md) | one tracker-repo resolver for `[[repo]]` entries: the shared helper, the doctors' delegation, and the tickets to build them |
+| [`17-loop-review-record.md`](17-loop-review-record.md) | reviewers that end with prose and no record: prompt-first checklist plus one loop resume |
+| [`18-area-locks.md`](18-area-locks.md) | area locks for the dispatch loop: no two agents in overlapping areas |
+| [`guide.md`](guide.md) | the operator's guide: running korapy on one host and driving a fleet with it |
 | [`adr/`](adr/) | decision records |
 
 `00-design.md` and `02-accounts-quota.md` are designs: how the system works and what each slice builds. `01-onboarding.md` records decisions (the R1 to R7 requirements and what each one settled) alongside the flow they shape. New decision records go in `adr/`.

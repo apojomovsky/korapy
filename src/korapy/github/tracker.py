@@ -10,8 +10,14 @@ import json
 import re
 
 from korapy import tracker as iface
-from korapy.github.gh import is_rate_limited, retry_after_s
-from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
+from korapy.github import forge as ghforge
+from korapy.github.gh import (
+    body_linked_issue_refs,
+    is_merged_pull,
+    is_rate_limited,
+    retry_after_s,
+)
+from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX, RESEARCHED
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
@@ -24,6 +30,8 @@ _BOOTSTRAP_COLORS = {
     "needs-triage": "fbca04",
     "needs-decision": "d93f0b",
     "hold": "5319e7",
+    "research": "1d76db",
+    "researched": "0e8a16",
     "priority:urgent": "b60205",
     "priority:high": "d93f0b",
     "priority:normal": "fbca04",
@@ -42,6 +50,10 @@ _REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
 #: already-exists shape is matched first by its own callers, so it
 #: never reaches the rejection mapping.
 _HTTP_422_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
+#: A label removal for a label the item does not carry, in the
+#: provider's shape. Removing an absent label is already the wanted
+#: state, so it succeeds and a retry converges.
+_HTTP_404_RE = re.compile(r"\(HTTP 404\)", re.IGNORECASE)
 _ALREADY_EXISTS_PHRASE_RE = re.compile(r"already[_-]?exists", re.IGNORECASE)
 
 #: Korapy-owned fields live on the tracker as labels. One label per field
@@ -114,6 +126,24 @@ def _parse_updated(text):
         return iface.parse_cursor(text)
     except iface.TrackerError:
         raise _fail(f"bad updated_at {text!r}") from None
+
+
+def _parse_merged_at(payload):
+    """Epoch seconds of the merge for a pulls-endpoint object, else 0.0.
+
+    A missing or null ``merged_at`` reads as never merged; anything
+    else short of a timestamp is a ``TrackerError``, never a guess.
+    Issues-endpoint objects carry no ``merged_at`` and read as 0.0.
+    """
+    text = payload.get("merged_at")
+    if text is None:
+        return 0.0
+    if not isinstance(text, str):
+        raise _fail(f"bad merged_at {text!r}")
+    try:
+        return iface.parse_cursor(text)
+    except iface.TrackerError:
+        raise _fail(f"bad merged_at {text!r}") from None
 
 
 def _parse_names(entries, field):
@@ -191,18 +221,28 @@ class GithubTracker:
             self._forks[key] = True if fork is None else bool(fork)
         return self._forks[key]
 
-    def _parse(self, repo, payload) -> iface.TrackerItem:
-        """One issues-endpoint object as a ``TrackerItem``.
+    def _parse(self, repo, payload, *, forks=True) -> iface.TrackerItem:
+        """One issues- or pulls-endpoint object as a ``TrackerItem``.
 
         Anything short of the full shape is a ``TrackerError``, never a
         guess; a PR whose fork info cannot be read is ``from_fork``.
+        Pulls-endpoint objects carry ``head`` instead of the issues
+        endpoint's ``pull_request`` marker, which is how they read as
+        ``kind="pr"``. A closed pull request the endpoint reports as
+        merged reads as ``"merged"``; the issues feed never carries the
+        merged encoding, so its items keep reading ``"closed"``. The
+        merge time rides along as ``merged_at`` (0.0 when the payload
+        carries none), so the scope reads the merge, not the last
+        activity. With ``forks`` False the fork lookup is skipped
+        (the item reads as not from a fork): the pulls index needs no
+        fork info and must not spend a call per pull request on it.
         """
         if not isinstance(payload, dict):
             raise _fail(f"item is not an object: {payload!r}")
         number = payload.get("number")
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise _fail(f"bad number {number!r}")
-        kind = "pr" if "pull_request" in payload else "issue"
+        kind = "pr" if ("pull_request" in payload or "head" in payload) else "issue"
         title = payload.get("title")
         if not isinstance(title, str):
             raise _fail(f"bad title {title!r}")
@@ -214,6 +254,8 @@ class GithubTracker:
         state = payload.get("state")
         if state not in ("open", "closed"):
             raise _fail(f"bad state {state!r}")
+        if state == "closed" and is_merged_pull(payload):
+            state = "merged"
         user = payload.get("user")
         if user is None:
             author = ""
@@ -227,6 +269,7 @@ class GithubTracker:
         if not isinstance(url, str):
             raise _fail(f"bad url {url!r}")
         updated_at = _parse_updated(payload.get("updated_at"))
+        merged_at = _parse_merged_at(payload)
         return iface.TrackerItem(
             repo=repo,
             number=number,
@@ -240,7 +283,10 @@ class GithubTracker:
             assignees=assignees,
             url=url,
             updated_at=updated_at,
-            from_fork=self._from_fork(repo, number) if kind == "pr" else False,
+            merged_at=merged_at,
+            from_fork=(self._from_fork(repo, number) if forks else False)
+            if kind == "pr"
+            else False,
             agent=field_value_of(labels, "agent"),
             status=field_value_of(labels, "status"),
             # The REST feed carries no board concepts: an empty reading
@@ -322,6 +368,93 @@ class GithubTracker:
         for entry in self._feed(repo, None):
             yield self._parse(repo, entry)
 
+    def pulls_index(
+        self, repo: str, max_calls: int, *, merged_since: float | None = None
+    ) -> iface.PullsIndex:
+        """The open and recently merged pull requests on ``repo``, by ticket.
+
+        Lists the repo's open pull requests oldest first, one paged
+        listing shared by every ticket, and files each under the
+        tickets its title or body links through
+        ``body_linked_issue_refs`` (close keywords and ``Refs`` lines,
+        outside fenced code; same-repo links only). Then, only when
+        ``merged_since`` is not None, pages the closed pull requests
+        newest first and files each merged one updated since
+        ``merged_since`` the same way, stopping at the first page
+        older than the cutoff: older merges predate every live claim,
+        so the scope could never fire on them. ``merged_since`` None
+        lists no closed pull requests: with no live claim behind the
+        tickets only open pulls can still change a verdict, and the
+        repo costs no extra call. A pull request closed without
+        merging is filed nowhere: its ticket still needs its round, so
+        readers see it exactly as they saw no pull at all. Pages until
+        a short page ends the list, like the feed, or ``max_calls``
+        pages run out (then the index is partial and ``complete`` is
+        False). A missing or malformed page is a ``TrackerError``,
+        never a partial list. The parse skips the per-pull fork
+        lookup: the index needs no fork info, and one extra call per
+        pull request is what the per-ticket lookup cost before.
+        """
+        by_issue: dict[int, list] = {}
+        closed_by_issue: dict[int, list] = {}
+        calls = 0
+        budget = max(1, max_calls)
+
+        def file(item, into: dict[int, list]) -> None:
+            """One open or merged pull under its linked tickets."""
+            text = f"{item.title}\n{item.body}"
+            for linked_repo, linked_number in body_linked_issue_refs(text, repo):
+                if linked_repo == repo:
+                    into.setdefault(int(linked_number), []).append(item)
+
+        def page_path(state: str, direction: str, page: int) -> str:
+            base = (
+                f"repos/{repo}/pulls?state={state}&sort=updated"
+                f"&direction={direction}&per_page={PER_PAGE}"
+            )
+            return base if page == 1 else f"{base}&page={page}"
+
+        def finish(complete: bool) -> iface.PullsIndex:
+            """The index with the closed pages folded oldest first."""
+            for number, pulls in closed_by_issue.items():
+                by_issue.setdefault(number, []).extend(reversed(pulls))
+            return iface.PullsIndex(by_issue, calls, complete)
+
+        page = 1
+        while True:
+            entries = self._page(page_path("open", "asc", page))
+            calls += 1
+            for entry in entries:
+                item = self._parse(repo, entry, forks=False)
+                if item.state == "closed":
+                    continue
+                file(item, by_issue)
+            if len(entries) < PER_PAGE:
+                break
+            if calls >= budget:
+                return finish(False)
+            page += 1
+        if merged_since is None:
+            return finish(True)
+        cutoff = merged_since
+        page = 1
+        while True:
+            entries = self._page(page_path("closed", "desc", page))
+            calls += 1
+            older = True
+            for entry in entries:
+                item = self._parse(repo, entry, forks=False)
+                if item.updated_at >= cutoff:
+                    older = False
+                    if item.state != "merged":
+                        continue
+                    file(item, closed_by_issue)
+            if older or len(entries) < PER_PAGE:
+                return finish(True)
+            if calls >= budget:
+                return finish(False)
+            page += 1
+
     def _write_error(self, err: Exception) -> iface.TrackerError:
         """One failed tracker call as the tracker's error. Rate-limit text
         maps to ``TrackerRateLimited`` through the shared classifier, so
@@ -363,16 +496,49 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
 
-    def add_label(self, repo: str, number: int, label: str) -> None:
-        """Add the one decision label through the issues-labels endpoint.
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, oldest first, through the API.
 
-        Only ``NEEDS_DECISION`` is accepted; there is no general label
-        write, so any other name is refused with ``ValueError`` and no
-        ``gh`` call runs. A failed call raises ``TrackerError`` through
-        ``_write_error``.
+        Pages until a short page ends the list, like the feed. Anything
+        short of a list of ``body`` strings is a ``TrackerError``, never
+        a partial list: a truncated list would read a posted decision
+        line as absent and post it twice, or miss the Findings comment
+        the research finish looks for.
         """
-        if label != NEEDS_DECISION:
-            raise ValueError(f"refusing to add non-decision label {label!r}")
+        found: list[str] = []
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._get(
+                        f"repos/{repo}/issues/{number}/comments?per_page={PER_PAGE}&page={page}"
+                    )
+                )
+            except iface.TrackerError:
+                raise
+            except Exception as err:
+                raise _fail(f"comments of {repo}#{number} are not JSON: {err}") from err
+            if not isinstance(payload, list):
+                raise _fail(f"comments of {repo}#{number} are not a list")
+            for entry in payload:
+                body = entry.get("body") if isinstance(entry, dict) else None
+                if not isinstance(body, str):
+                    raise _fail(f"bad comment entry {entry!r} on {repo}#{number}")
+                found.append(body)
+            if len(payload) < PER_PAGE:
+                return tuple(found)
+            page += 1
+
+    def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add one loop-owned label through the issues-labels endpoint.
+
+        Only ``NEEDS_DECISION`` and ``RESEARCHED`` are accepted; there
+        is no general label write, so any other name is refused with
+        ``ValueError`` and no ``gh`` call runs. A failed call raises
+        ``TrackerError`` through ``_write_error``.
+        """
+        if label not in (NEEDS_DECISION, RESEARCHED):
+            raise ValueError(f"refusing to add non-loop label {label!r}")
         try:
             self._run(
                 [
@@ -385,6 +551,31 @@ class GithubTracker:
                 ]
             )
         except Exception as err:
+            raise self._write_error(err) from err
+
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """Remove the one decision label through the issues-labels endpoint.
+
+        Only ``NEEDS_DECISION`` is accepted; there is no general label
+        write, so any other name is refused with ``ValueError`` and no
+        ``gh`` call runs. A removal for a label the item does not carry
+        answers 404 and reads as done; anything else fails closed
+        through ``_write_error``.
+        """
+        if label != NEEDS_DECISION:
+            raise ValueError(f"refusing to remove non-decision label {label!r}")
+        try:
+            self._run(
+                [
+                    "api",
+                    "--method",
+                    "DELETE",
+                    f"repos/{repo}/issues/{number}/labels/{label}",
+                ]
+            )
+        except Exception as err:
+            if _HTTP_404_RE.search(str(err)) is not None:
+                return
             raise self._write_error(err) from err
 
     def _list_label_names(self, repo: str) -> set[str]:
@@ -438,6 +629,25 @@ class GithubTracker:
         """
         have = self._list_label_names(repo)
         return tuple(label.name for label in iface.BOOTSTRAP_LABELS if label.name not in have)
+
+    def canonical_repo(self, repo: str) -> str:
+        """The tracker's canonical `owner/name` for ``repo``.
+
+        One repository read: after a rename the provider redirects the
+        old name and answers the new `full_name`. Anything short of an
+        `owner/name` shape fails closed; a failed call fails through
+        `_write_error`, like every other REST read.
+        """
+        try:
+            payload = json.loads(self._get(f"repos/{repo}"))
+        except iface.TrackerError:
+            raise
+        except Exception as err:
+            raise _fail(f"canonical repo {repo} is not JSON: {err}") from err
+        name = payload.get("full_name") if isinstance(payload, dict) else None
+        if not isinstance(name, str) or not ghforge.is_repo_name(name):
+            raise _fail(f"bad canonical name {name!r} for {repo}")
+        return name
 
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """Create the missing bootstrap labels on ``repo``, leave the rest alone.

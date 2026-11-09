@@ -4,8 +4,8 @@ Offline: profiles are plain data checked against the account pool and each
 runtime adapter's options schema. No files, no subprocesses, no network.
 """
 
+import types
 import unittest
-from types import MappingProxyType
 from unittest import mock
 
 from korapy import models, profiles, runtimes, settings
@@ -221,16 +221,16 @@ class NoSilentFallback(unittest.TestCase):
             profiles.lookup({}, "default")
         self.assertIn("default", str(ctx.exception))
 
-    def test_a_declared_default_reads_through_any_mapping(self):
-        parsed = profiles.validate({"default": raw_profile("muse")}, ["provider-a"])
-        view = MappingProxyType(dict(parsed))
-        found = profiles.declared_default(view)
-        self.assertIsNotNone(found)
-        assert found is not None
-        self.assertEqual(found.runtime, "muse")
-
-
 class BuiltinDefault(unittest.TestCase):
+    def test_a_non_dict_mapping_still_finds_the_declared_default(self):
+        parsed = profiles.validate({"default": raw_profile("omp")}, ["provider-a"])
+        found = profiles.declared_default(types.MappingProxyType(dict(parsed)))
+        self.assertEqual(found, parsed["default"])
+
+    def test_a_non_dict_mapping_without_a_default_finds_nothing(self):
+        parsed = profiles.validate({"slim": raw_profile("omp")}, ["provider-a"])
+        self.assertIsNone(profiles.declared_default(types.MappingProxyType(dict(parsed))))
+
     def test_the_builtin_default_keeps_the_shipped_default_runtime(self):
         self.assertEqual(profiles.DEFAULT_PROFILE_NAME, "default")
         self.assertEqual(profiles.BUILTIN_DEFAULT.name, "default")

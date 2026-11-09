@@ -22,7 +22,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from korapy import host_ledger, pressure, prompts, resources, units
+from korapy import heavy, host_ledger, pressure, prompts, resources, units
 
 #: The pressure files the doctor probes. An unreadable one reads as
 #: unknown: admission continues on charged tags and the pressure row warns.
@@ -85,6 +85,18 @@ class ResourceReadings(NamedTuple):
     pressure: tuple[float | None, float | None] | None = None
     pressure_caps: tuple[float, float] = _DEFAULT_PRESSURE_CAPS
     foreign_ignored: tuple = ()
+    #: The heavy lane file as read for the report. None with no error
+    #: reads as an empty lane (a missing file is not a failure); a
+    #: present-but-corrupt file lands in `heavy_error` instead and the
+    #: lane row fails with the documented move-aside repair.
+    heavy_lane: Mapping[str, object] | None = None
+    heavy_error: str | None = None
+    heavy_path: str = ""
+    heavy_bytes: int | None = None
+    heavy_mtime: float | None = None
+    heavy_now: float = 0.0
+    heavy_estimates: Mapping[str, object] | None = None
+    heavy_wait_factor: float = heavy.DEFAULT_WAIT_FACTOR
 
 
 class ResourceRow(NamedTuple):
@@ -111,7 +123,11 @@ def check(state: ResourceReadings | None) -> list[ResourceRow]:
         _check_marker(state),
         _check_pressure(state),
         _check_foreign(state),
+        _check_heavy(state),
     ]
+    stuck = _check_heavy_stuck(state)
+    if stuck is not None:
+        rows.append(stuck)
     slices = _check_slices(state)
     if slices is not None:
         rows.append(slices)
@@ -380,6 +396,85 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
     return ResourceRow("resources-foreign", "ok", "no foreign claims", "")
 
 
+def _heavy_lane_of(state: ResourceReadings) -> Mapping[str, object]:
+    """The lane for the heavy rows: the read file, else an empty lane."""
+    lane = state.heavy_lane
+    if isinstance(lane, Mapping):
+        return lane
+    return {"holders": [], "waiters": [], "costs": {}, "recent": []}
+
+
+def _check_heavy(state: ResourceReadings) -> ResourceRow:
+    """The heavy lane file: corrupt fails, the queue reads as counts.
+
+    A present-but-corrupt file refuses with the documented repair (move
+    it aside, never delete it; the next join recreates an empty lane).
+    A missing file reads as an empty lane, never a failure. Bypassed
+    runs count in the detail but never block: the bypass is visible,
+    not prevented.
+    """
+    path = state.heavy_path or "lane.json"
+    if state.heavy_error is not None:
+        size = state.heavy_bytes if isinstance(state.heavy_bytes, int) else "?"
+        return ResourceRow(
+            "heavy",
+            "fail",
+            heavy.corrupt_lane_detail(size, state.heavy_mtime),
+            f"move {path} aside to {path}.corrupt-<UTC timestamp>"
+            " in the same directory (archived, never deleted),"
+            " then run `korapy doctor` again",
+        )
+    lane = _heavy_lane_of(state)
+    holders = lane.get("holders")
+    waiters = lane.get("waiters")
+    recent = lane.get("recent")
+    counts = heavy.count_outcomes(recent)
+    bypassed = counts.get("bypassed", 0)
+    n_holders = len(holders) if isinstance(holders, list) else 0
+    n_waiters = len(waiters) if isinstance(waiters, list) else 0
+    detail = f"heavy: {n_holders} holder(s), {n_waiters} waiter(s)" + (
+        f", {bypassed} bypassed" if bypassed else ""
+    )
+    return ResourceRow("heavy", "ok", detail, "")
+
+
+def _check_heavy_stuck(state: ResourceReadings) -> ResourceRow | None:
+    """Waiters past their deadline and holders past the scaled typical.
+
+    A waiter past its stored deadline would have left with 75, so the
+    row belongs to a dead process or a wedged wait; a holder past wait
+    factor times its duration p90 outruns what the ledger learned. Both
+    only warn: the next admit pass reaps the dead weight, and pressure
+    never touches a holder. A corrupt lane reports nothing here: the
+    `heavy` row already fails. Unknown estimates never accuse.
+    """
+    if state.heavy_error is not None:
+        return None
+    lane = _heavy_lane_of(state)
+    stuck_waiters = heavy.stuck_waiters(lane, state.heavy_now)
+    stuck_holders = heavy.stuck_holders(
+        lane, state.heavy_estimates or {}, state.heavy_now, state.heavy_wait_factor
+    )
+    if not stuck_waiters and not stuck_holders:
+        return ResourceRow("heavy-stuck", "ok", "heavy: no stuck waiters or holders", "")
+    parts = []
+    for waiter in stuck_waiters:
+        wid = waiter.get("id", "?") if isinstance(waiter, Mapping) else "?"
+        parts.append(f"waiter {str(wid)[:8]} past its wait deadline")
+    for holder, elapsed, p90 in stuck_holders:
+        hid = holder.get("id", "?") if isinstance(holder, Mapping) else "?"
+        parts.append(
+            f"holder {str(hid)[:8]} running {elapsed:.0f}s"
+            f" past {state.heavy_wait_factor:.1f}x{p90:.0f}s typical"
+        )
+    return ResourceRow(
+        "heavy-stuck",
+        "warn",
+        "heavy: stuck lane rows: " + "; ".join(parts),
+        "check the stuck processes, then run `korapy doctor` again",
+    )
+
+
 def parse_show(text: str) -> dict:
     """The `KEY=value` lines of one slice dump, last wins."""
     props = {}
@@ -524,7 +619,12 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
     next launch creates it. A slice the manager never created
     (exit 0 with every limit unset, no fragment, inactive) reads as missing.
     A cleared budget applies nothing: stale limits stay until the operator
-    stops the slice by hand.
+    stops the slice by hand. A zero share applies nothing either, and no
+    launch ever reconciles it, so its fix names only the hand stop.
+    Mixed drift names the project a launch still reconciles and sends
+    the zero-share slice to a hand stop. When no drifted slice names
+    a project a launch reconciles, the fix keeps the generic launch
+    advice and still names the hand stop for the zero-share slice.
     """
     if state.host is None or state.limits_error is not None:
         return None
@@ -552,13 +652,20 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
             "",
         )
     expected = {units.HOST_SLICE: state.host}
+    zero_shares: set[str] = set()
+    owners: dict[str, str] = {}
     for name in sorted(state.shares):
         try:
             slice_name = units.project_slice(name)
         except units.UnitsError:
             continue
-        expected[slice_name] = resources.share_cap(limits, name, state.now)
+        share = resources.share_cap(limits, name, state.now)
+        expected[slice_name] = share
+        owners[slice_name] = name
+        if share is not None and share.cpu_m == 0 and share.memory_mb == 0:
+            zero_shares.add(slice_name)
     drifts: list[str] = []
+    drifted: list[str] = []
     matched = 0
     missing = 0
     for name in sorted(expected):
@@ -567,14 +674,45 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
             missing += 1
             continue
         matched += 1
-        drifts.extend(f"slice {name}: {drift}" for drift in slice_drift(expected[name], props))
+        found = slice_drift(expected[name], props)
+        if found:
+            drifted.append(name)
+        drifts.extend(f"slice {name}: {drift}" for drift in found)
     if drifts:
+        if drifted and all(name in zero_shares for name in drifted):
+            return ResourceRow(
+                "resources-slices",
+                "warn",
+                "; ".join(drifts) + "; no launch reconciles it",
+                "stop the slice by hand (a zero-share project applies nothing:"
+                " its launches are always refused)",
+            )
+        fix = (
+            "launch an agent of that project, then run `korapy doctor` again"
+            " (a cleared budget applies nothing: stop the slice by hand)"
+        )
+        if any(name in zero_shares for name in drifted):
+            runnable = sorted(
+                {owners[name] for name in drifted if name in owners and name not in zero_shares}
+            )
+            if runnable:
+                fix = (
+                    f"launch an agent of {', '.join(runnable)},"
+                    " then run `korapy doctor` again"
+                    " (a cleared budget applies nothing: stop the slice by hand;"
+                    " the zero-share slice needs a hand stop)"
+                )
+            else:
+                fix = (
+                    "launch an agent of that project, then run `korapy doctor` again"
+                    " (a cleared budget applies nothing: stop the slice by hand;"
+                    " the zero-share slice needs a hand stop)"
+                )
         return ResourceRow(
             "resources-slices",
             "warn",
             "; ".join(drifts) + "; limits reconcile on the next launch of that project",
-            "launch an agent of that project, then run `korapy doctor` again"
-            " (a cleared budget applies nothing: stop the slice by hand)",
+            fix,
         )
     if matched == 1:
         detail = "1 resource slice matches its budget"

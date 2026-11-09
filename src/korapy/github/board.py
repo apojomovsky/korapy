@@ -113,6 +113,18 @@ _CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 #: ``_want_kind`` below.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})
 
+#: The field-value shapes korapy reads. Every other value kind (date,
+#: number, iteration, label, user, milestone, pull request, repository,
+#: reviewer) arrives without a selected field fragment and is skipped,
+#: never validated. Both read paths and the write scan key on this one
+#: set, so the skip contract cannot fork.
+_READ_TYPENAMES = frozenset(
+    {
+        "ProjectV2ItemFieldTextValue",
+        "ProjectV2ItemFieldSingleSelectValue",
+    }
+)
+
 
 def _want_kind(concept) -> str:
     """``"single_select"`` or ``"text"`` for one board concept."""
@@ -143,6 +155,37 @@ _REF_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9_.-]+#
 
 def _fail(text) -> iface.TrackerError:
     return iface.TrackerError(f"unusable board answer: {text}")
+
+
+def _checked_text(entry, what) -> str:
+    """Stripped text of a text value node, ``""`` for null, else ``TrackerError``.
+
+    The one text-shape check for both value readers: the poll path and
+    the write scan pass their own label, so the messages name the
+    concept or the field each path knows.
+    """
+    text = entry["text"]
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        raise _fail(f"bad board value for {what}: {text!r}")
+    return text.strip()
+
+
+def _checked_option(entry, what):
+    """``(optionId, name)`` of a single-select value node, else ``TrackerError``.
+
+    The one option-shape check for both value readers, like
+    ``_checked_text``: a non-string id or name is malformed, never an
+    absent value the caller would silently keep or overwrite.
+    """
+    oid = entry.get("optionId")
+    if not isinstance(oid, str) or not oid:
+        raise _fail(f"bad board value for {what}: {oid!r}")
+    name = entry.get("name")
+    if not isinstance(name, str):
+        raise _fail(f"bad board value for {what}: {name!r}")
+    return oid, name
 
 
 def parse_blocked_by(text):
@@ -177,6 +220,16 @@ class BoardReader:
         self._run = run
         self._pacer = pacer
         self._issues = GithubTracker(run)
+
+    def _graphql_body(self, query, **variables):
+        """One paced two-alias read as its tolerant ``data`` payload.
+
+        The owner queries ask one login as both halves; the losing half's
+        ``NOT_FOUND`` noise rides beside the winning half's data, which
+        ``gh.graphql`` refuses to return, so this goes through the one
+        two-alias helper instead. Rate limits map like any other read.
+        """
+        return _two_alias_data(query, variables, self._run, self._pacer)
 
     def _graphql(self, query, **variables):
         """One paced GraphQL call as its ``data`` payload, else ``TrackerError``.
@@ -253,9 +306,9 @@ class BoardReader:
         after = None
         while True:
             if after is None:
-                payload = self._graphql(_TITLES, login=login)
+                payload = self._graphql_body(_TITLES, login=login)
             else:
-                payload = self._graphql(_TITLES, login=login, after=after)
+                payload = self._graphql_body(_TITLES, login=login, after=after)
             entries, info = _titles_entries(payload)
             boards.extend(
                 iface.OwnerBoard(number=number, title=title) for _, number, title in entries
@@ -271,7 +324,7 @@ class BoardReader:
             if not isinstance(payload, dict):
                 raise _fail("schema is not an object")
             return payload.get("node")
-        payload = self._graphql(
+        payload = self._graphql_body(
             _SCHEMA_BY_NUMBER,
             owner=self._board.project_owner,
             number=self._board.project_number,
@@ -428,8 +481,9 @@ class BoardReader:
         """``(texts, selects)`` for one board node's field values, strict.
 
         Shared by the poll path and the targeted single-item read: every
-        entry is validated through ``_read_value``, so anything short of
-        the value shape fails closed on both paths.
+        entry is validated through ``_read_value``. Entries of a kind
+        korapy does not read are skipped; anything short of the value
+        shape of a kind it does read fails closed on both paths.
         """
         values = node.get("fieldValues")
         entries = values.get("nodes") if isinstance(values, dict) else None
@@ -483,12 +537,17 @@ class BoardReader:
     def _read_value(self, by_field, entry):
         """One field-value node as ``(concept, kind, value)``.
 
-        ``(None, None, None)`` for a field no concept maps; an unset
-        single-select reads as absent. A value of the wrong kind for a
-        mapped concept is a ``TrackerError``.
+        ``(None, None, None)`` for a value of a kind korapy does not
+        read and for a field no concept maps; an unset single-select
+        reads as absent. A value of the wrong kind for a mapped
+        concept, or a malformed value of a kind korapy does read, is
+        a ``TrackerError``.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
@@ -499,23 +558,13 @@ class BoardReader:
         if _want_kind(concept) == "text":
             if "text" not in entry:
                 raise _fail(f"board value for {concept} is not text")
-            text = entry["text"]
-            if text is None:
-                text = ""
-            if not isinstance(text, str):
-                raise _fail(f"bad board value for {concept}: {text!r}")
-            return concept, "text", text.strip()
+            return concept, "text", _checked_text(entry, concept)
         oid = entry.get("optionId")
         if oid is None:
             if "text" in entry:
                 raise _fail(f"board value for {concept} is not a select")
             return None, None, None
-        if not isinstance(oid, str) or not oid:
-            raise _fail(f"bad board value for {concept}: {oid!r}")
-        name = entry.get("name")
-        if not isinstance(name, str):
-            raise _fail(f"bad board value for {concept}: {name!r}")
-        return concept, "select", (oid, name)
+        return concept, "select", _checked_option(entry, concept)
 
     def _concepts(self, selects, texts, milestone):
         """Board values plus the milestone as the reading's ``extra``.
@@ -557,17 +606,26 @@ _CLEAR_TEXT = """mutation BoardClearField($project: ID!, $item: ID!, $field: ID!
   }
 }"""
 
+_WRITE_SELECT = """mutation BoardWriteSelect($project: ID!, $item: ID!, $field: ID!, $option: ID!) {
+  updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) {
+    projectV2Item { id }
+  }
+}"""
+
 
 class BoardTracker(BoardReader):
-    """Korapy-owned writes as board text-field mutations, over the same seam.
+    """Korapy-owned writes as board mutations, over the same seam.
 
-    Only ``agent`` and ``status`` are writable, each through the one
-    configured text field for the concept; any other field is refused with
-    ``ValueError``. A write whose concept the config never mapped raises
-    ``UnknownOption`` (the mirror drops it); a write whose field is missing
-    from the live board raises ``TrackerError`` instead, so the rows stay
-    queued for the next pass. A write that changes nothing sends no
-    mutation. Reads stay with ``BoardReader`` and the board sync step.
+    ``agent`` and ``status`` are writable through their configured text
+    fields; any other field is refused with ``ValueError``. The Status
+    column is writable through ``write_option``, which sets one live
+    option id; it shares the schema fetch and the per-item scan with
+    the text writes. A write whose concept the config never mapped
+    raises ``UnknownOption`` (the mirror drops it); a write whose field
+    is missing from the live board raises ``TrackerError`` instead, so
+    the rows stay queued for the next pass. A write that changes
+    nothing sends no mutation. Reads stay with ``BoardReader`` and the
+    board sync step.
 
     One adapter instance covers one mirror pass: the schema is fetched once
     and each item's node id is resolved once and reused across that item's
@@ -633,14 +691,48 @@ class BoardTracker(BoardReader):
             self._graphql(_CLEAR_TEXT, project=project_id, item=item_id, field=field_id)
         texts[field_id] = value
 
+    def write_option(self, repo: str, number: int, option_id: str) -> None:
+        """Set the Status column to one live option id for ``repo#number``.
+
+        Resolves the configured Status column to its live field id,
+        locates the board item behind ``repo#number``, and sends one
+        select mutation. An already-matching card sends nothing. An
+        option id the live field does not offer is a ``TrackerError``,
+        like a missing field; an unmapped Status column is an
+        ``UnknownOption``. Rate-limit answers raise
+        ``TrackerRateLimited`` through the shared classifier.
+        """
+        if not isinstance(option_id, str) or not option_id:
+            raise iface.TrackerError(f"bad board option for 'board_status': {option_id!r}")
+        name = self._board.status_column
+        if not name:
+            raise iface.UnknownOption("board maps no field for 'board_status'")
+        project_id, by_name = self._cached_schema()
+        node = by_name.get(name)
+        if node is None:
+            raise iface.TrackerError(f"board field {name!r} for board_status is missing")
+        field = self._parse_field("board_status", name, node)
+        if option_id not in field.options:
+            raise iface.TrackerError(f"board option {option_id!r} is not on field {name!r}")
+        item_id, texts, selects = self._locate(project_id, repo, number)
+        if field.id in texts:
+            raise _fail("board value for a select field is text")
+        if selects.get(field.id) == option_id:
+            return
+        self._graphql(
+            _WRITE_SELECT, project=project_id, item=item_id, field=field.id, option=option_id
+        )
+        selects[field.id] = option_id
+
     def _locate(self, project_id, repo, number):
         """``(item node id, texts, selects)`` for one issue.
 
         Resolved once per item and cached on the instance, so a second
         field on the same item reuses the one scan. ``texts`` maps a field
-        id to its stripped text; ``selects`` holds the field ids with a
-        select value, so the write refuses a select behind a text field
-        id. An unset field is in neither: it reads as ``""``.
+        id to its stripped text; ``selects`` maps a field id holding a
+        select value to its option id, so the text write refuses a select
+        behind a text field id and the option write skips an already-set
+        option. An unset field is in neither: it reads as ``""``.
         """
         key = (repo, number)
         hit = self._located.get(key)
@@ -702,39 +794,172 @@ class BoardTracker(BoardReader):
         if not isinstance(entries, list):
             raise _fail("board field values are not a list")
         texts: dict = {}
-        selects = set()
+        selects: dict = {}
         for entry in entries:
-            fid, text = self._locate_value(entry)
-            if text is None:
-                selects.add(fid)
-            else:
+            fid, text, oid = self._locate_value(entry)
+            if fid is None:
+                continue
+            if oid is not None:
+                selects[fid] = oid
+            elif text is not None:
                 texts[fid] = text
         if got_repo != repo or got_number != number:
             return None
         return item_id, texts, selects
 
     def _locate_value(self, entry):
-        """``(field id, stripped text or None)`` for one field-value node.
+        """``(field id, stripped text or None, option id or None)`` for one node.
 
-        A select value reads as ``None``; an unset value reads as ``""``.
-        Anything short of the value shape is a ``TrackerError``.
+        A set select value reads as its option id; an unset value reads
+        as ``(fid, None, None)``; a value of a kind korapy does not read
+        is ``(None, None, None)`` and the caller skips it. Anything short
+        of the value shape of a kind korapy does read is a
+        ``TrackerError``: both shapes go through the shared
+        ``_checked_text`` and ``_checked_option`` checks, so the scan
+        fails exactly where the poll path fails.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
             raise _fail(f"bad board value field {field!r}")
+        if typename == "ProjectV2ItemFieldTextValue":
+            if "text" not in entry:
+                raise _fail(f"board value for {fid} is not text")
+            return fid, _checked_text(entry, fid), None
+        if typename == "ProjectV2ItemFieldSingleSelectValue":
+            if entry.get("optionId") is None:
+                if "text" in entry:
+                    raise _fail(f"board value for {fid} is not a select")
+                return fid, None, None
+            oid, _ = _checked_option(entry, fid)
+            return fid, None, oid
         if "text" in entry:
-            text = entry["text"]
-            if text is None:
-                return fid, ""
-            if not isinstance(text, str):
-                raise _fail(f"bad board value text {text!r}")
-            return fid, text.strip()
+            return fid, _checked_text(entry, fid), None
         if entry.get("optionId") is not None:
-            return fid, None
-        return fid, ""
+            oid, _ = _checked_option(entry, fid)
+            return fid, None, oid
+        return fid, None, None
+
+    def adopt_missing(self, project_id, repo, present, *, limit, now):
+        """Add the repo's missing open and recently closed issues, up to ``limit``.
+
+        ``present`` holds the ``(repo, number)`` already on the board,
+        from the step's own poll; candidates come from the tracker
+        listing with pull requests and long-closed issues filtered out.
+        The adds run through the one shared adder setup uses. A listing
+        that falls over raises ``TrackerError`` instead of adopting on
+        partial knowledge; a rate limit halts the run with the rest left
+        for the next pass. A non-positive limit adopts nothing and
+        lists nothing.
+        """
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("board adopt needs a project id")
+        if limit is not None and limit <= 0:
+            return iface.BoardAdopt((), (), (), None)
+        candidates = [
+            ((repo, number), node_id, f"{repo}#{number}")
+            for node_id, number in self._adoptable_issue_refs(repo, now)
+        ]
+        return add_missing_issues(
+            self._run,
+            self._pacer,
+            project_id=project_id,
+            present=set(present),
+            candidates=candidates,
+            limit=limit,
+        )
+
+    def _adoptable_issue_refs(self, repo, now):
+        """``(node id, number)`` for the repo's open and recently closed issues.
+
+        Pull requests are never board items this tracker creates, and
+        closed issues older than ``ADOPT_RECENT_DAYS`` stay history for
+        people to add by hand. The page-walk is the shared listing
+        helper below; an unexpected state fails the whole adopt, since
+        the pass must prove membership before it adds.
+        """
+        for entry in _list_issue_entries(self._run, self._pacer, repo, "all"):
+            if "pull_request" in entry:
+                continue
+            state = entry.get("state")
+            if state not in ("open", "closed"):
+                raise _fail(f"bad issue state {state!r} on {repo}")
+            node_id, number = _issue_ref(entry, repo)
+            if state == "closed" and not _recently_closed(entry.get("closed_at"), now):
+                continue
+            yield node_id, number
+
+
+#: How long a closed issue still counts as adoptable: older closed
+#: issues stay history for people to add by hand.
+ADOPT_RECENT_DAYS = 3
+
+
+def _list_issue_entries(run, pacer, repo, state):
+    """Each raw entry of the tracker's paged issue listing, in order.
+
+    The one page-walk every issue-listing reader shares: ``state`` is
+    the listing's own ``state`` parameter. A listing that falls over
+    raises ``TrackerError`` instead of yielding partial knowledge, and
+    a rate-limit answer raises ``TrackerRateLimited``; a malformed
+    page fails closed, never as a partial entry set. Callers classify
+    each entry's own state themselves: the pass adopt fails a page
+    carrying an unexpected state (it must prove membership before it
+    adds), while the open-only listing skips anything but open (it
+    asked for open only).
+    """
+    base = f"repos/{repo}/issues?state={state}&per_page=100"
+    page = 1
+    while True:
+        path = base if page == 1 else f"{base}&page={page}"
+        try:
+            payload = json.loads(gh.paced_run(["api", path], run=run, pacer=pacer))
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if gh.is_rate_limited(text):
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+        if not isinstance(payload, list):
+            raise _fail(f"issues of {repo} are not a list")
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise _fail(f"bad issue {entry!r} on {repo}")
+            yield entry
+        if len(payload) < 100:
+            return
+        page += 1
+
+
+def _issue_ref(entry, repo):
+    """``(node id, number)`` for one listing entry, else ``TrackerError``."""
+    number = entry.get("number")
+    node_id = entry.get("node_id")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise _fail(f"bad issue {entry!r} on {repo}")
+    if not isinstance(node_id, str) or not node_id:
+        raise _fail(f"bad issue {entry!r} on {repo}")
+    return node_id, number
+
+
+def _recently_closed(closed_at, now) -> bool:
+    """Whether a closed issue is still adoptable: closed within the window.
+
+    A missing or malformed closed time fails closed, never as adoptable.
+    """
+    if not isinstance(closed_at, str) or not closed_at:
+        raise _fail(f"bad closed time {closed_at!r}")
+    try:
+        closed = iface.parse_cursor(closed_at)
+    except iface.TrackerError:
+        raise _fail(f"bad closed time {closed_at!r}") from None
+    return now - closed <= ADOPT_RECENT_DAYS * 86400
 
 
 #: The owner lookup: one query asking for the login as both halves, so
@@ -783,8 +1008,8 @@ _BY_ID = (
 
 #: The title search: one query asking for the login as both halves, the
 #: way ``_BY_NUMBER`` does. Exactly one half resolves; the other answers
-#: null (with the expected NOT_FOUND noise, which passes the body
-#: classifier). The caller picks the set half from the body.
+#: null (with the expected NOT_FOUND noise, which the one two-alias
+#: helper tolerates). The caller picks the set half from the body.
 _TITLES = """query ProvisionBoardTitles($login: String!, $after: String) {
   user(login: $login) {
     projectsV2(first: 100, after: $after) {
@@ -897,7 +1122,7 @@ _OPTIONS_APPEND = """mutation ProvisionOptionsAppend($field: ID!, $options: [Pro
 #: Everything one populate step needs from a project: the item ids with
 #: the content behind each item. Draft items carry no content and read
 #: as skipped, never as failures.
-_ITEMS = """query ProvisionBoardItems($project: ID!, $after: String) {
+_PROVISION_ITEMS = """query ProvisionBoardItems($project: ID!, $after: String) {
   node(id: $project) {
     ... on ProjectV2 {
       items(first: 100, after: $after) {
@@ -1116,19 +1341,102 @@ class _BoardForbidden(iface.TrackerError):
     """
 
 
+def _two_alias_data(query, variables, run, pacer):
+    """The ``data`` of a two-alias owner query, tolerating the losing half.
+
+    One paced read through the raw ``run`` seam (``gh.graphql_args``):
+    ``gh api graphql`` exits non-zero on any GraphQL ``errors`` entry even
+    beside partial ``data``, which ``gh.graphql`` refuses to return, so the
+    queries that ask one login as both halves read the body here instead.
+    A ``NOT_FOUND`` entry whose path is exactly the half that resolved to
+    null is the expected noise and is tolerated; a rate-limit entry (or
+    rate-limit wording) starts the shared cooldown and raises
+    ``TrackerRateLimited``; any other entry raises ``TrackerError``. A body
+    whose data resolves nothing is returned as-is: the caller decides a
+    missing board from the data, with its own message.
+    """
+    active = pacer if pacer is not None else gh._pacer()
+    try:
+        active.acquire(cost=gh.GRAPHQL_CALL_COST)
+        out = run(gh.graphql_args(query, variables), paced=True)
+    except gh.GhError as err:
+        text = str(err) or repr(err)
+        if err.kind == "unavailable" or gh.is_rate_limited(text):
+            active.cooldown(gh.retry_after_s(text))
+            raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+        body = _response_body(err)
+        if body is None:
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+    except Exception as err:
+        raise iface.TrackerError(f"board unreachable: {err}") from err
+    else:
+        try:
+            body = json.loads(out)
+        except ValueError:
+            raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
+    if not isinstance(body, dict):
+        raise iface.TrackerError(f"unusable board answer: {body!r}")
+    _check_two_alias_errors(body.get("errors"), body.get("data"), active)
+    data = body.get("data")
+    if data is None or isinstance(data, dict):
+        return data
+    raise iface.TrackerError(f"unusable board answer: {body!r}")
+
+
+def _check_two_alias_errors(errors, data, pacer) -> None:
+    """Raise for error entries besides the losing half's ``NOT_FOUND``.
+
+    The one classifier for two-alias answers, so the schema read, the
+    title list and the provision lookup decide the same way: a rate-limit
+    entry cools the shared bucket down and raises ``TrackerRateLimited``;
+    a ``NOT_FOUND`` on exactly the half that resolved to null passes; and
+    anything else fails closed with ``TrackerError``. No errors passes,
+    and the caller decides a missing board from the data.
+    """
+    if not errors:
+        return
+    if _errors_rate_limited(errors):
+        text = json.dumps(errors)
+        pacer.cooldown(gh.retry_after_s(text))
+        raise iface.TrackerRateLimited(text, gh.retry_after_s(text))
+    if not isinstance(errors, list):
+        raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+    for entry in errors:
+        if _tolerated_half_error(entry, data):
+            continue
+        raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+
+
+def _tolerated_half_error(entry, data) -> bool:
+    """Whether one error entry is the losing half's expected ``NOT_FOUND``.
+
+    Only a ``NOT_FOUND`` whose path is exactly one owner half, and that
+    half resolved to null: a ``NOT_FOUND`` anywhere else (or beside a
+    resolved half) fails closed like any other error entry.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "NOT_FOUND":
+        return False
+    path = entry.get("path")
+    if path not in (["user"], ["organization"]):
+        return False
+    half = path[0]
+    return not isinstance(data, dict) or data.get(half) is None
+
+
 def _check_body_errors(body, pacer) -> None:
     """Raise for the error entries a GraphQL body carries beside its data.
 
-    The one classifier every provision read and mutation runs its failed
-    response through, so the error contract holds on all paths: a
-    RATE_LIMITED entry raises ``TrackerRateLimited``, a FORBIDDEN entry
-    raises ``_BoardForbidden``, and any other entry besides the expected
-    NOT_FOUND noise (the losing half of the owner lookup) raises
-    ``TrackerError`` instead of resolving to a missing board or a
-    refusal. A transient conflict entry therefore fails closed here;
-    only the populate operation retries those. A body with no errors, or
-    only NOT_FOUND entries, passes: the caller decides those from the
-    data.
+    The one classifier every single-alias provision read and mutation runs
+    its failed response through, so the error contract holds on all
+    paths: a RATE_LIMITED entry raises ``TrackerRateLimited``, a
+    FORBIDDEN entry raises ``_BoardForbidden``, and any other entry
+    besides NOT_FOUND entries (a read for a node that is not there)
+    raises ``TrackerError`` instead of resolving to a missing board or a
+    refusal. Two-alias owner queries never reach this classifier; they go
+    through ``_check_two_alias_errors`` instead. A transient conflict
+    entry therefore fails closed here; only the populate operation
+    retries those. A body with no errors, or only NOT_FOUND entries,
+    passes: the caller decides those from the data.
     """
     errors = body.get("errors") if isinstance(body, dict) else None
     if not errors:
@@ -1143,6 +1451,112 @@ def _check_body_errors(body, pacer) -> None:
     if all(isinstance(entry, dict) and entry.get("type") == "NOT_FOUND" for entry in errors):
         return
     raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+
+
+def _mutate(run, pacer, query, **variables):
+    """One paced GraphQL mutation as its ``data`` payload.
+
+    The one mutation path every board write goes through, so setup and
+    the pass pace through the same shared bucket: rate-limit text maps
+    to ``TrackerRateLimited`` through the shared classifier, and a
+    response body surviving on the error is decided by the one body
+    classifier; anything else fails closed, like the board reads and
+    writes.
+    """
+    active = pacer if pacer is not None else gh._pacer()
+    try:
+        return gh.graphql(query, run=run, pacer=pacer, **variables)
+    except gh.GhError as err:
+        text = str(err) or repr(err)
+        if err.kind == "unavailable" or gh.is_rate_limited(text):
+            raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+        body = _response_body(err)
+        if body is not None:
+            _check_body_errors(body, active)
+        raise iface.TrackerError(f"board unreachable: {text}") from err
+    except Exception as err:
+        raise iface.TrackerError(f"board unreachable: {err}") from err
+
+
+def _add_item(run, pacer, project_id, content_id):
+    """One issue added to the board: its item id, or ``_ItemRefused``.
+
+    The one issue add every adopter shares: a temporary move conflict
+    (the first adds after a link or create) retries bounded and never
+    refuses a transient; a permission answer and an exhausted conflict
+    refuse with a fix line instead.
+    """
+    attempts = 0
+    while True:
+        try:
+            payload = _mutate(run, pacer, _ADD_ITEM, projectId=project_id, contentId=content_id)
+        except iface.TrackerRateLimited:
+            raise
+        except _BoardForbidden as err:
+            raise _ItemRefused(
+                "the account may not add items to it; add it on the board by hand, then re-run"
+            ) from err
+        except iface.TrackerError as err:
+            text = str(err)
+            if "(HTTP 403)" in text:
+                raise _ItemRefused(
+                    "the account may not add items to it; add it on the board by hand, then re-run"
+                ) from err
+            if _transient_add_failure(text) and attempts + 1 < _ADD_ATTEMPTS:
+                attempts += 1
+                continue
+            raise _ItemRefused(f"{text}; re-run to retry") from err
+        node = payload.get("addProjectV2ItemById") if isinstance(payload, dict) else None
+        item = node.get("item") if isinstance(node, dict) else None
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not item_id:
+            raise _fail(f"unusable board add answer: {payload!r}")
+        return item_id
+
+
+def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=None):
+    """Add each missing candidate to the board: the one shared adder.
+
+    ``present`` holds the keys already on the board (opaque to this
+    function: node ids for setup, ``(repo, number)`` for the pass) and
+    ``candidates`` are ``(key, content id, name)`` in listing order.
+    A repeated key is attempted once, so a page-boundary duplicate
+    cannot add twice or burn the cap twice. ``limit`` caps the
+    attempted adds (a refused add still consumes the budget, so a
+    failing run cannot retry the whole backlog in one pass); the rest
+    carries to the next pass. Every add goes through
+    the one issue-add path above, paced through the shared bucket; a
+    rate limit halts the run with ``stopped`` set, and a failed add is
+    one ``refused`` line naming the issue, retried on the next pass.
+    A malformed add answer fails closed.
+    """
+    added: list = []
+    kept: list = []
+    refused: list = []
+    remaining = limit
+    seen: set = set()
+    for key, content_id, name in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
+        if key in present:
+            kept.append(name)
+            continue
+        if remaining is not None and remaining <= 0:
+            break
+        try:
+            _add_item(run, pacer, project_id, content_id)
+        except iface.TrackerRateLimited as err:
+            return iface.BoardAdopt(
+                tuple(added), tuple(kept), tuple(refused), (str(err), err.retry_after)
+            )
+        except _ItemRefused as err:
+            refused.append(f"could not add {name} to the board: {err}")
+        else:
+            added.append(name)
+        if remaining is not None:
+            remaining -= 1
+    return iface.BoardAdopt(tuple(added), tuple(kept), tuple(refused), None)
 
 
 class GithubBoardProvisioner:
@@ -1169,23 +1583,9 @@ class GithubBoardProvisioner:
     def _mutate(self, query, **variables):
         """One paced GraphQL mutation as its ``data`` payload.
 
-        Rate-limit text maps to ``TrackerRateLimited`` through the shared
-        classifier, and a response body surviving on the error is decided
-        by the one body classifier; anything else fails closed, like the
-        board reads and writes.
+        The shared module path above, bound to this provisioner's seam.
         """
-        try:
-            return gh.graphql(query, run=self._run, pacer=self._pacer, **variables)
-        except gh.GhError as err:
-            text = str(err) or repr(err)
-            if err.kind == "unavailable" or gh.is_rate_limited(text):
-                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-            body = _response_body(err)
-            if body is not None:
-                _check_body_errors(body, self._active_pacer())
-            raise iface.TrackerError(f"board unreachable: {text}") from err
-        except Exception as err:
-            raise iface.TrackerError(f"board unreachable: {err}") from err
+        return _mutate(self._run, self._pacer, query, **variables)
 
     def _read(self, query, make_missing, **variables):
         """One paced GraphQL read as its ``data`` payload, tolerating bodies.
@@ -1213,42 +1613,16 @@ class GithubBoardProvisioner:
         except Exception as err:
             raise iface.TrackerError(f"board unreachable: {err}") from err
 
-    def _read_body(self, query, make_missing, **variables):
-        """One paced GraphQL read as its full response body.
+    def _read_owner(self, query, **variables):
+        """One paced two-alias read as its tolerant ``data`` payload.
 
-        The owner lookup expects a NOT_FOUND error on the losing half
-        beside the winning half's data, which ``graphql`` refuses to
-        return; this goes through the raw seam instead, paced as a read,
-        and decides from the body, never from the exit code.
+        The provision lookup asks one login as both halves, the way the
+        reader does; both go through the one two-alias helper, so the
+        losing half's ``NOT_FOUND`` noise never fails the lookup. A body
+        whose data resolves nothing is returned as-is: the caller decides
+        a missing board from the data, with its own message.
         """
-        pacer = self._active_pacer()
-        try:
-            pacer.acquire(cost=gh.GRAPHQL_CALL_COST)
-            out = self._run(gh.graphql_args(query, variables), paced=True)
-        except gh.GhError as err:
-            text = str(err) or repr(err)
-            if err.kind == "unavailable" or gh.is_rate_limited(text):
-                pacer.cooldown(gh.retry_after_s(text))
-                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-            body = _response_body(err)
-            if body is None:
-                if _missing_only(text):
-                    raise make_missing() from err
-                raise iface.TrackerError(f"board unreachable: {text}") from err
-        except Exception as err:
-            raise iface.TrackerError(f"board unreachable: {err}") from err
-        else:
-            try:
-                body = json.loads(out)
-            except ValueError:
-                raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
-        if not isinstance(body, dict):
-            raise iface.TrackerError(f"unusable board answer: {body!r}")
-        _check_body_errors(body, pacer)
-        data = body.get("data")
-        if data is None or isinstance(data, dict):
-            return data
-        raise iface.TrackerError(f"unusable board answer: {body!r}")
+        return _two_alias_data(query, variables, self._run, self._pacer)
 
     def _resolve_owner(self, login):
         """``(kind, node id)`` for one board owner login.
@@ -1264,7 +1638,7 @@ class GithubBoardProvisioner:
                 f"board owner {login!r} resolves to neither a user nor an organization"
             )
 
-        data = self._read_body(_OWNER_QUERY, missing, login=login)
+        data = self._read_owner(_OWNER_QUERY, login=login)
         if not isinstance(data, dict):
             raise missing()
         user = data.get("user")
@@ -1412,7 +1786,7 @@ class GithubBoardProvisioner:
 
         if spec.project_id is not None:
             return self._read_project_by_id(spec.project_id)
-        data = self._read(_BY_NUMBER, missing, owner=spec.owner, number=spec.number)
+        data = self._read_owner(_BY_NUMBER, owner=spec.owner, number=spec.number)
         if not isinstance(data, dict):
             raise missing()
         user = data.get("user")
@@ -1443,9 +1817,9 @@ class GithubBoardProvisioner:
         after = None
         while True:
             if after is None:
-                data = self._read(_TITLES, None, login=spec.owner)
+                data = self._read_owner(_TITLES, login=spec.owner)
             else:
-                data = self._read(_TITLES, None, login=spec.owner, after=after)
+                data = self._read_owner(_TITLES, login=spec.owner, after=after)
             entries, info = _titles_entries(data)
             for eid, number, title in entries:
                 if title == spec.title:
@@ -1813,9 +2187,9 @@ class GithubBoardProvisioner:
         after = None
         while True:
             if after is None:
-                payload = self._read(_ITEMS, None, project=project_id)
+                payload = self._read(_PROVISION_ITEMS, None, project=project_id)
             else:
-                payload = self._read(_ITEMS, None, project=project_id, after=after)
+                payload = self._read(_PROVISION_ITEMS, None, project=project_id, after=after)
             node = payload.get("node") if isinstance(payload, dict) else None
             items = node.get("items") if isinstance(node, dict) else None
             if not isinstance(items, dict):
@@ -1854,105 +2228,53 @@ class GithubBoardProvisioner:
         """``(node id, number)`` for the tracker repo's open issues.
 
         Closed issues stay people's history to add by hand, and pull
-        requests are never board items korapy creates. A malformed page
-        fails closed, never as a partial issue set.
+        requests are never board items korapy creates. The page-walk is
+        the shared listing helper; anything but open is skipped, since
+        this listing asked for open only.
         """
-        base = f"repos/{repo}/issues?state=open&per_page=100"
-        page = 1
-        while True:
-            path = base if page == 1 else f"{base}&page={page}"
-            try:
-                payload = json.loads(gh.paced_run(["api", path], run=self._run, pacer=self._pacer))
-            except gh.GhError as err:
-                text = str(err) or repr(err)
-                if gh.is_rate_limited(text):
-                    raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-                raise iface.TrackerError(f"board unreachable: {text}") from err
-            except Exception as err:
-                raise iface.TrackerError(f"board unreachable: {err}") from err
-            if not isinstance(payload, list):
-                raise _fail(f"issues of {repo} are not a list")
-            for entry in payload:
-                if not isinstance(entry, dict):
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if "pull_request" in entry:
-                    continue
-                if entry.get("state") != "open":
-                    continue
-                number = entry.get("number")
-                node_id = entry.get("node_id")
-                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if not isinstance(node_id, str) or not node_id:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                yield node_id, number
-            if len(payload) < 100:
-                return
-            page += 1
+        for entry in _list_issue_entries(self._run, self._pacer, repo, "open"):
+            if "pull_request" in entry:
+                continue
+            if entry.get("state") != "open":
+                continue
+            yield _issue_ref(entry, repo)
 
     def _add_item(self, project_id, content_id):
         """One issue added to the board: its item id, or ``_ItemRefused``.
 
-        A temporary move conflict (the first adds after a link or
-        create) retries bounded and never refuses; a permission answer
-        and an exhausted conflict refuse with a fix line instead.
+        The shared module add above, bound to this provisioner's seam.
         """
-        attempts = 0
-        while True:
-            try:
-                payload = self._mutate(_ADD_ITEM, projectId=project_id, contentId=content_id)
-            except iface.TrackerRateLimited:
-                raise
-            except _BoardForbidden as err:
-                raise _ItemRefused(
-                    "the account may not add items to it; add it on the board by hand, then re-run"
-                ) from err
-            except iface.TrackerError as err:
-                text = str(err)
-                if "(HTTP 403)" in text:
-                    raise _ItemRefused(
-                        "the account may not add items to it; "
-                        "add it on the board by hand, then re-run"
-                    ) from err
-                if _transient_add_failure(text) and attempts + 1 < _ADD_ATTEMPTS:
-                    attempts += 1
-                    continue
-                raise _ItemRefused(f"{text}; re-run to retry") from err
-            node = payload.get("addProjectV2ItemById") if isinstance(payload, dict) else None
-            item = node.get("item") if isinstance(node, dict) else None
-            item_id = item.get("id") if isinstance(item, dict) else None
-            if not isinstance(item_id, str) or not item_id:
-                raise _fail(f"unusable board add answer: {payload!r}")
-            return item_id
+        return _add_item(self._run, self._pacer, project_id, content_id)
 
     def populate(self, project_id, repo):
         """Add the tracker repo's open issues missing from the board.
 
         Item-add only: no field value is ever written. Open issues
         only, whatever their author; closed issues and pull requests
-        are never added. Each issue the run could not add reports its
-        own refused line, and a re-run converges because presence is
-        re-read each time. A listing that falls over raises
+        are never added. The adds run through the one shared adder the
+        board step uses, uncapped; a rate limit still propagates like
+        any other adapter failure. Each issue the run could not add
+        reports its own refused line, and a re-run converges because
+        presence is re-read each time. A listing that falls over raises
         ``TrackerError`` instead of adopting on partial knowledge.
         """
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("board populate needs a project id")
         present = self._board_content_ids(project_id)
-        added: list = []
-        kept: list = []
-        refused: list = []
-        for node_id, number in self._open_issue_refs(repo):
-            name = f"{repo}#{number}"
-            if node_id in present:
-                kept.append(name)
-                continue
-            try:
-                self._add_item(project_id, node_id)
-            except _ItemRefused as err:
-                refused.append(f"could not add {name} to the board: {err}")
-            else:
-                added.append(name)
-        return iface.BoardPopulate(tuple(added), tuple(kept), tuple(refused))
+        candidates = [
+            (node_id, node_id, f"{repo}#{number}")
+            for node_id, number in self._open_issue_refs(repo)
+        ]
+        adopted = add_missing_issues(
+            self._run,
+            self._pacer,
+            project_id=project_id,
+            present=present,
+            candidates=candidates,
+        )
+        if adopted.stopped is not None:
+            raise iface.TrackerRateLimited(*adopted.stopped)
+        return iface.BoardPopulate(adopted.added, adopted.kept, adopted.refused)
 
     def preview_populate(self, project_id, repo):
         """What ``populate`` would add, changing nothing. Read-only.

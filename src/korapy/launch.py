@@ -24,6 +24,7 @@ A live unit the log does not prove ours is left running and named (see
 is live at all.
 """
 
+import json
 import os
 import socket
 import sqlite3
@@ -33,14 +34,9 @@ from dataclasses import dataclass, replace
 
 from korapy import accounts, admission, board, disk, host_ledger, models, paths, profiles
 from korapy import projects, prompts, quota, quota_ledger, registry, resources, runtimes
-from korapy import settings, units, worktrees
+from korapy import pushenv, settings, units, worktrees
 from korapy.runtimes import muse
 from korapy.runtimes import tail as runtime_tail
-
-#: The run time limit handed to the runtime, in seconds for the unit's
-#: RuntimeMaxSec. It is the same limit as runtimes.DEFAULT_MAX_TIME ("3h");
-#: a test asserts the two agree.
-RUNTIME_MAX_S = 3 * 60 * 60
 
 #: Appended to an admission error when the live agent is a registered one.
 REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
@@ -55,6 +51,72 @@ ROLE_FILE = "role"
 
 settings.register("clone.path", str, "", "the repository's main clone (relative to the ops root)")
 settings.register("clone.default_branch", str, "main", "the default branch of the clone")
+
+
+def _check_max_time(value):
+    """A wall-clock duration, unchanged: `<n>[s|m|h|d]`, bare is seconds."""
+    accounts.parse_duration(value, "agents.max_time")
+    return value
+
+
+def _check_reviewer_max_time(value):
+    """A reviewer wall-clock duration, unchanged: `<n>[s|m|h|d]`, bare is seconds."""
+    accounts.parse_duration(value, "agents.reviewer_max_time")
+    return value
+
+
+settings.register(
+    "agents.max_time",
+    str,
+    runtimes.DEFAULT_MAX_TIME,
+    "wall-clock limit for one agent run, like 3h (bare is seconds)",
+    check=_check_max_time,
+)
+settings.register(
+    "agents.reviewer_max_time",
+    str,
+    runtimes.DEFAULT_MAX_TIME,
+    "wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time",
+    check=_check_reviewer_max_time,
+)
+
+
+def max_time_for(resolved, reviewer=False):
+    """The `(duration text, seconds)` capping one run: the reviewer limit for reviewers.
+
+    The one resolver for the wall-clock limit. The launch and resume
+    paths pass the text to the runtime and the seconds to the unit's
+    RuntimeMaxSec; nothing else reads these keys. `reviewer_max_time`
+    wins for reviewers only when it was set, so reviewers otherwise
+    follow `agents.max_time`.
+    """
+    key = "agents.max_time"
+    if reviewer and resolved.values["agents.reviewer_max_time"].origin != settings.DEFAULT:
+        key = "agents.reviewer_max_time"
+    text = resolved[key]
+    if not isinstance(text, str):
+        raise LaunchError(f"{key} must be a duration like 3h, not {text!r}")
+    try:
+        seconds = int(accounts.parse_duration(text, key))
+    except ValueError as err:
+        raise LaunchError(str(err)) from None
+    if seconds < 1:
+        raise LaunchError(f"{key} must be a positive duration, got {text!r}")
+    return text, seconds
+
+
+def _close_outcome(started_at, limit_s, now):
+    """The outcome closing a dead unit: timed-out past its wall-clock limit, else ok.
+
+    Pure: an unreadable start reads ok, never timed-out.
+    """
+    if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
+        return "ok"
+    try:
+        elapsed = float(now) - float(started_at)
+    except (TypeError, ValueError, OverflowError):
+        return "ok"
+    return "timed-out" if elapsed >= limit_s else "ok"
 
 
 class LaunchError(Exception):
@@ -298,7 +360,9 @@ def _ensure_slices(decided, run):
     """Create the host slice then the project slice with their limits, in order.
 
     Nothing is created when no host budget is configured. An existing
-    slice reads as created; parents always precede their children.
+    slice reads as created; parents always precede their children. A
+    zero share (a ceiling-0 project reserves nothing) starts the slice
+    with no limits.
     """
     if decided.host is None:
         return
@@ -396,7 +460,7 @@ def admit(
     now = None
     where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
     if base.host is not None:
-        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        shares = projects.budget_shares(registered, total_cap=tgt.resolved["admission.total_cap"])
         limits = resources.join(base, shares, ledger.get("foreign", []), where=where)
         now = (now_fn or time.time)()
         _require_role_price(tgt, role, where)
@@ -487,10 +551,26 @@ def unproven(tgt, number, *, list_fn):
     return seen
 
 
-def _env(adapter, session, unit):
+def _env(adapter, session, unit, extra=None):
     env = dict(adapter.env(session))
     env[AGENT_ID_VAR] = unit
+    if extra:
+        env.update(extra)
     return env
+
+
+def _push_extra(tgt, *, git, ssh_probe=None, gh_login=None):
+    """The unit's extra push environment for the target's clone.
+
+    The one resolver (`pushenv.launch_env`) decides from the clone's
+    origin URL: the HTTPS fallback entries when SSH cannot work, {}
+    otherwise. A clone nothing can push raises LaunchError (exit 4)
+    naming both fixes, before the launch makes anything.
+    """
+    try:
+        return pushenv.launch_env(tgt.clone, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
+    except pushenv.PushRefused as err:
+        raise LaunchError(str(err)) from None
 
 
 def _model_chains(tgt, pool, ledger, now, chains):
@@ -594,12 +674,16 @@ def select_profile(
 
     The declarations validate (exit 4), the six layers resolve, and the
     `--model`/`--runtime` refinements apply to the winner for this run
-    only, noted in the provenance source. With no `[profiles.*]` table
-    declared and no flag, the layers fall through to the built-in default
-    without touching the board store. The resolver runs before the caller
-    makes anything, so a bad profile fails before any worktree or unit
-    exists. `store` is the board store (or a fake with `.item`); `tracker`
-    re-reads stale rows live, and None trusts the cached row.
+    only, noted in the provenance source. A `--runtime` refinement
+    re-validates the profile's options against the effective adapter's
+    schema: keys from one runtime never land in another's config, and
+    unknown keys fail exit 4 naming the key and the runtime. With no
+    `[profiles.*]` table declared and no flag, the layers fall through
+    to the built-in default without touching the board store. The
+    resolver runs before the caller makes anything, so a bad profile
+    fails before any worktree or unit exists. `store` is the board store
+    (or a fake with `.item`); `tracker` re-reads stale rows live, and
+    None trusts the cached row.
     """
     pool = accounts.providers() if pool is None else pool
     parsed = profiles.validate(tgt.resolved.profiles, pool)
@@ -633,6 +717,13 @@ def select_profile(
     )
     refined = runtime if runtime is not None else profile.runtime
     _adapter(refined)
+    if runtime is not None:
+        # The options validated against the declared runtime; the refined
+        # run validates them again against the effective adapter, so a
+        # `--runtime` switch never writes one runtime's keys verbatim into
+        # another's config. Unknown keys fail exit 4 naming the key and
+        # the runtime.
+        profiles.validate_options(profile.name, refined, profile.options)
     bits = []
     if runtime is not None:
         bits.append(f"--runtime {runtime}")
@@ -648,29 +739,42 @@ def select_profile(
     )
 
 
-def _close_previous(tgt, number, list_fn):
+def _close_previous(tgt, number, list_fn, now_fn=None):
     """Mark done the registry entries of this ticket's earlier generations.
 
     Only entries whose units are no longer live are closed: a unit still
     live keeps its entry, and admission still refuses the ticket for it.
     Unknown or already finished ids are skipped, so a session logged
-    before launch wrote registry entries relaunches cleanly. Returns the
-    units closed.
+    before launch wrote registry entries relaunches cleanly. A unit
+    that ran past the wall-clock limit it launched under closes as
+    timed-out, so the dashboard shows why it ended; anything else
+    closes as ok. The limit is the one recorded on the entry at launch,
+    never the setting at close time; entries that record none (from
+    before limits were recorded, or registered by hand) fall back to
+    the current setting. Returns the units closed.
     """
     logged = []
+    roles = {}
     for session in _leaves(tgt, number):
         for unit in units.started_units(session.path):
             if unit not in logged:
                 logged.append(unit)
+                roles[unit] = session.role
     if not logged:
         return []
     live = {name for name, active, _sub in list_fn(tgt.prefix) if active in units.LIVE_STATES}
+    now = (now_fn or time.time)()
     closed = []
     for unit in logged:
         if unit in live:
             continue
+        found = registry.entry(unit)
+        started = found.get("started_at") if found is not None else None
+        recorded = found.get("max_time_s") if found is not None else None
+        if isinstance(recorded, bool) or not isinstance(recorded, (int, float)) or recorded < 1:
+            _, recorded = max_time_for(tgt.resolved, reviewer=(roles[unit] == "reviewer"))
         try:
-            registry.done(unit)
+            registry.done(unit, outcome=_close_outcome(started, recorded, now))
         except registry.RegistryError:
             continue
         except OSError as err:
@@ -680,7 +784,7 @@ def _close_previous(tgt, number, list_fn):
     return closed
 
 
-def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
+def _register_started(tgt, unit, number, model, role=None, *, runtime, profile, limit_s):
     """Register the unit before it starts, so agent list and snapshot show it.
 
     The ticket names the registered project of the ops root, so the
@@ -690,7 +794,11 @@ def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
     profile's name, so snapshot shows the recorded profile. Both are
     required keyword arguments: every launch resolves one profile since
     the cutover, and registering a None runtime would fail closed in
-    the registry instead of running the recorded setup.
+    the registry instead of running the recorded setup. `limit_s` is the
+    wall-clock limit in seconds the unit launches under, recorded so the
+    close path attributes the timeout from it, never from the setting at
+    close time. It is required too: the launch already resolved it for
+    the unit's RuntimeMaxSec.
     Raises LaunchError naming the unit when the registry cannot record
     it; the unit is not running yet.
     """
@@ -704,6 +812,7 @@ def _register_started(tgt, unit, number, model, role=None, *, runtime, profile):
             model=model,
             role=role,
             profile=profile,
+            max_time_s=limit_s,
         )
     except (registry.RegistryError, OSError) as err:
         raise LaunchError(f"cannot register the agent {unit}: {err}") from None
@@ -755,6 +864,8 @@ def launch(
     tracker=None,
     controllers_read=None,
     pressure_fn=None,
+    ssh_probe=None,
+    gh_login=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
 
@@ -782,7 +893,9 @@ def launch(
 
     `profile` is the `--profile` flag: the layer-1 profile name. `model`
     and `runtime` are one-shot refinements of the resolved profile for
-    this launch only. The profile resolves before anything is made (no
+    this launch only. The profile's `options` lay under `--runtime-config`
+    in the per-launch config (the flag file wins shared keys), through
+    `_session_config`. The profile resolves before anything is made (no
     worktree, no unit on a bad profile); with no `[profiles.*]`
     declaration and no flag, the layers fall through to the built-in
     default. Every launch records the resolved profile next to the
@@ -840,7 +953,11 @@ def launch(
         raise
     adapter = _adapter(selection.runtime)
     session_runtime = selection.runtime
-    _close_previous(tgt, number, list_fn)
+    # How this launch pushes is decided before the first lock: a clone
+    # nothing can push refuses here (exit 4), before any worktree, unit
+    # or registry entry exists for it.
+    push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
+    _close_previous(tgt, number, list_fn, now_fn=now_fn)
 
     with units.spawn_lock():
         decided = admit(
@@ -889,7 +1006,14 @@ def launch(
         except paths.PathError as err:
             raise LaunchError(str(err)) from None
         session_id = _write_session(
-            session, adapter, session_runtime, prompt, runtime_config, chains, role
+            session,
+            adapter,
+            session_runtime,
+            prompt,
+            runtime_config,
+            chains,
+            role,
+            options=selection.profile.options,
         )
         try:
             profiles.record_profile(
@@ -905,12 +1029,13 @@ def launch(
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
             try:
+                limit_text, limit_s = max_time_for(tgt.resolved, reviewer=reviewer)
                 if session_id is None:
                     command = adapter.argv(
                         session,
                         prompt,
                         model=model,
-                        max_time=runtimes.DEFAULT_MAX_TIME,
+                        max_time=limit_text,
                         reviewer=reviewer,
                     )
                 else:
@@ -918,11 +1043,11 @@ def launch(
                         session,
                         prompt,
                         model=model,
-                        max_time=runtimes.DEFAULT_MAX_TIME,
+                        max_time=limit_text,
                         reviewer=reviewer,
                         session_id=session_id,
                     )
-                env = _env(adapter, session, unit)
+                env = _env(adapter, session, unit, extra=push_extra)
             except ValueError as err:
                 raise LaunchError(str(err)) from None
             argv = units.unit_argv(
@@ -931,7 +1056,7 @@ def launch(
                 session,
                 command,
                 env,
-                RUNTIME_MAX_S,
+                limit_s,
                 **_slice_props(
                     decided,
                     resources.config(tgt.resolved).roles,
@@ -951,6 +1076,7 @@ def launch(
             role,
             runtime=session_runtime,
             profile=selection.profile.name,
+            limit_s=limit_s,
         )
         try:
             _ensure_slices(decided, run)
@@ -997,11 +1123,76 @@ def _recorded_role(session):
     return role
 
 
-def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None, role=None):
+#: The session file holding the launch's raw `--runtime-config`, so a
+#: resume with `--profile` or `--runtime` can re-apply the operator's
+#: overrides under the chains. One fact, one place: this module is the
+#: only writer and reader of the file.
+RUNTIME_CONFIG_FILE = "runtime_config.json"
+
+
+def _record_runtime_config(session, runtime_config):
+    """Record the launch's raw `--runtime-config` in the session dir.
+
+    A launch without overrides removes any record, so a rebuilt config
+    never inherits another run's overrides. Records the raw dict, not
+    the merged config, so the resume can lay it over the new profile's
+    options through `_session_config` again.
+    """
+    target = os.path.join(session, RUNTIME_CONFIG_FILE)
+    if runtime_config:
+        paths.atomic_write_text(target, json.dumps(runtime_config, indent=1, sort_keys=True) + "\n")
+    else:
+        try:
+            os.remove(target)
+        except FileNotFoundError:
+            pass
+
+
+def _recorded_runtime_config(session):
+    """The launch's raw `--runtime-config`, or None when it had none.
+
+    A missing file reads as no overrides. A corrupt one fails closed
+    (exit 4): silently dropping overrides would run the agent on the
+    wrong setup.
+    """
+    target = os.path.join(session, RUNTIME_CONFIG_FILE)
+    try:
+        with open(target, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as err:
+        raise LaunchError(f"cannot read the agent's runtime config record: {err}") from None
+    if not isinstance(raw, dict):
+        raise LaunchError(f"the runtime config record {target} must hold a JSON object")
+    return raw
+
+
+def _session_config(adapter, options, runtime_config, chains):
+    """The per-launch config: profile options under `--runtime-config`, chains on top.
+
+    The resolved profile's `options` lay first; the command line's
+    `--runtime-config` wins on every shared key, and the live chains lay
+    over both through the adapter's `with_models`, the way chains
+    already did. One helper owns the order, so a launch and a resume
+    with flags build the same config.
+    """
+    config = {**(options or {}), **(runtime_config or {})}
+    if chains:
+        config = adapter.with_models(config, chains)
+    return config
+
+
+def _write_session(
+    session, adapter, runtime, prompt, runtime_config, chains=None, role=None, options=None
+):
     """The prompt, the runtime and role records and the per-launch config.
 
     Writes into a fresh role generation dir, so no record is ever
-    inherited from another role's session. Returns the fresh muse
+    inherited from another role's session. The per-launch config lays
+    the profile's `options` under `--runtime-config` (see
+    `_session_config`), and the raw `--runtime-config` is recorded
+    beside it for a later flagged resume. Returns the fresh muse
     session id for a muse launch, else None. The id is generated here,
     recorded here and passed to `argv` by the caller, so the recorded
     id and the run's id cannot differ.
@@ -1012,10 +1203,9 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         runtimes.record(session, runtime)
         if role is not None:
             paths.atomic_write_text(os.path.join(session, ROLE_FILE), role + "\n")
-        config = runtime_config or {}
-        if chains:
-            config = adapter.with_models(config, chains)
+        config = _session_config(adapter, options, runtime_config, chains)
         adapter.write_config(session, config)
+        _record_runtime_config(session, runtime_config)
         if adapter.name == muse.NAME:
             session_id = muse.new_session_id()
             muse.record_session_id(session, session_id)
@@ -1055,6 +1245,8 @@ def resume(
     store=None,
     tracker=None,
     controllers_read=None,
+    ssh_probe=None,
+    gh_login=None,
 ):
     """Resume ticket `number`'s newest session of `role` in a new unit.
 
@@ -1065,7 +1257,13 @@ def resume(
     before profiles were recorded falls back to its recorded runtime.
     With `--profile` (or `--model`/`--runtime`) the flag layer decides
     for the resumed run instead, the same way it does at launch, and the
-    new profile is recorded over the old one. A lone `--runtime` without
+    new profile is recorded over the old one. A resume with `--profile`
+    or `--runtime` also rebuilds the session config from the new
+    profile's options, the launch's recorded `--runtime-config` (still
+    winning over the new options) and chains through `_session_config`;
+    any other resume keeps the recorded setup. The new adapter's resume
+    handle is checked before anything is rewritten, so a refused flagged
+    resume leaves the session untouched. A lone `--runtime` without
     any declared profile still switches the run to that runtime.
     The reviewer mode is the one the launch ran with: a resumed reviewer
     stays read-only.
@@ -1123,7 +1321,10 @@ def resume(
         raise LaunchError(
             f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
         )
-    _close_previous(tgt, number, list_fn)
+    _close_previous(tgt, number, list_fn, now_fn=now_fn)
+    # Decided like at launch, before the first lock: a clone nothing
+    # can push refuses here (exit 4), before any worktree or unit exists.
+    push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
 
     with units.spawn_lock():
         admit(
@@ -1167,6 +1368,24 @@ def resume(
             raise _no_session(tgt, number, role, "session to resume")
         if selection is not None:
             adapter = _adapter(selection.runtime)
+            # The new adapter's handle decides before anything is
+            # rewritten: a refused flagged resume leaves the config and
+            # the profile record byte-identical, so a later flagless
+            # resume still runs the recorded setup.
+            handle = adapter.resume_handle(session)
+            if handle is None:
+                raise LaunchError(
+                    f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+                )
+            if profile is not None or runtime is not None:
+                try:
+                    kept = _recorded_runtime_config(session)
+                    adapter.write_config(
+                        session,
+                        _session_config(adapter, selection.profile.options, kept, selection.chains),
+                    )
+                except (ValueError, TypeError, OSError) as err:
+                    raise LaunchError(f"cannot write the agent's session: {err}") from None
             try:
                 profiles.record_profile(
                     session,
@@ -1188,12 +1407,12 @@ def resume(
             else:
                 session_runtime = runtimes.recorded(session)
                 adapter = _adapter(session_runtime)
+            handle = adapter.resume_handle(session)
+            if handle is None:
+                raise LaunchError(
+                    f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+                )
         recorded = _recorded_role(session)
-        handle = adapter.resume_handle(session)
-        if handle is None:
-            raise LaunchError(
-                f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
-            )
         if adapter.name == muse.NAME:
             try:
                 muse.write_message(session, message)
@@ -1203,15 +1422,16 @@ def resume(
             tgt.prefix, tgt.repo, number, max(_next_unit_gen(_leaves(tgt, number)), 1)
         )
         try:
+            limit_text, limit_s = max_time_for(tgt.resolved, reviewer=(recorded == "reviewer"))
             command = adapter.argv(
                 session,
                 message,
                 model=model,
                 resume=handle,
-                max_time=runtimes.DEFAULT_MAX_TIME,
+                max_time=limit_text,
                 reviewer=(recorded == "reviewer"),
             )
-            env = _env(adapter, session, unit)
+            env = _env(adapter, session, unit, extra=push_extra)
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
@@ -1220,7 +1440,7 @@ def resume(
             session,
             command,
             env,
-            RUNTIME_MAX_S,
+            limit_s,
             **_slice_props(
                 decided,
                 resources.config(tgt.resolved).roles,
@@ -1236,6 +1456,7 @@ def resume(
             recorded,
             runtime=session_runtime,
             profile=profile_name,
+            limit_s=limit_s,
         )
         try:
             _ensure_slices(decided, run)

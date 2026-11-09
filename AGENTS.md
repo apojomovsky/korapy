@@ -20,6 +20,8 @@ korapy is public. Nothing in it identifies a person, a host or an account, and t
 
 Use generic stand-ins: `example.com`, `suite@korapy.invalid`, `~/.config/korapy/`, "a project", `host-1`. The only named person in the repository is the copyright holder in `LICENSE`; everything else stays generic. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
 
+One exception: the repository's own owner and name may appear in the README's CI status badge and clone URL, and nowhere else. An account that is not the repository owner never appears.
+
 ## Layout
 
 | Path | What |
@@ -63,6 +65,7 @@ The rules the design rests on:
   `git fetch origin && git worktree add .worktrees/<n>-<slug> -b <type>/<n>-<slug> origin/master`.
   Remove the worktree after the PR merges.
 - **No force pushes.** Rewriting a branch that exists on the remote drops it for every other agent and clone, and the `pre-push` hook refuses it (deleting a remote branch too). If a rewrite is genuinely needed, get the maintainer's explicit go-ahead in your own session, then re-run with `KORAPY_FORCE_PUSH_APPROVED=1 git push --force-with-lease`.
+- **The pre-push hook still gates every push.** It runs the suite, then stamps the tree it passed. It skips the suite only on proof for the identical clean tree: its own stamp for that tree, or a fresh green-matrix proof from `make check` covering the same interpreters. Both proofs are cache state resolved through `paths`, never trusted across trees; a dirty tree, a stale, corrupt or foreign proof always runs the suite again. A failing suite still blocks the push.
 - **Never skip hooks.** Never pass `--no-verify`, and never set an env override that bypasses a hook. When a hook blocks you, use the decision protocol below.
 - **Merges.** Merge `origin/master` into your branch when master moves on. Never rebase a pushed branch. A maintainer merges PRs (squash).
 
@@ -79,7 +82,7 @@ The rules the design rests on:
    - it is covered by tests in the same PR.
 
    File everything else as an issue with `needs-triage` and a priority label. A deferral is an issue, not a paragraph in a PR body.
-4. **Takeoff:** `make pre-pr-check PR_BODY=<file>`, plus `TEST=1` for the full suite, and `make check`. Fix what they report.
+4. **Takeoff:** `make check`, then `make pre-pr-check PR_BODY=<file> TEST=1`. Fix what they report. When `make check` just passed on the same tree, `pre-pr-check` reuses that proof instead of running the suite again; with no fresh proof it runs the suite as before.
 5. **Open the PR** once, ready for review (never a draft). `Closes #N` comes first in the body (`Refs #N` for a partial win). The body says what changed and why, then `## Review`, which records:
    - the reviewer id;
    - the question asked;
@@ -95,7 +98,7 @@ The rules the design rests on:
 
 `priority:urgent` is the maintainers' alone.
 
-**README freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update `README.md` in the same PR. If no README change is needed, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
+**Docs freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update the reference in the same PR: `docs/commands.md` for verbs, flags and exit codes, `docs/configuration.md` for settings, the install section of `docs/guide.md` for install steps and host programs. The README changes only when the pitch, the install or the quickstart changes; if none of those needs it, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
 
 ## Approval gates
 
@@ -128,3 +131,9 @@ Dispatched agents run headless. When the turn ends, the process exits, and any b
 - **External contributions are for maintainers.** An agent never merges, reviews, comments on, labels, closes or works on a PR or issue from outside the maintainers, or any fork PR. Tell a maintainer and stop.
 - **Secrets.** Tokens and account metadata (runtime logins, the GitHub token, provider API keys, korapy's API token) are read at call time and never stored or logged. The same goes for quota payloads beyond their usage numbers.
 - **Report only what you ran.** Every claim about a command's result comes from a command you actually ran. Never invent output.
+
+## Board stewardship
+
+The board is the maintainer's view of the work; a stale board is a defect, not a nuisance.
+
+No agent or coordinator leaves the board stale: the loop keeps every card in step with its issue, and a coordinator who dispatches work outside the loop makes that work visible to the board the moment it starts (a claim, or a registered agent) and never ends a session with drift.

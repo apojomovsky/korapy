@@ -9,6 +9,8 @@ each `RepoRow` as a `Check`, so this module never imports `doctor`.
 
 from typing import NamedTuple
 
+from korapy import pushenv
+
 
 class RepoSite(NamedTuple):
     """One project the remote rows cover, with its readings as data.
@@ -19,7 +21,10 @@ class RepoSite(NamedTuple):
     Both are meaningless without an origin and are ignored then.
     `cause` names the gather failure behind an "unknown" reading (the
     tracker unreachable, no access, an unreadable clone), and is None
-    for a cleanly gathered site.
+    for a cleanly gathered site. `tracker_repo` is the configured
+    `owner/name` and `canonical` the name the tracker answers for it
+    (the renamed name after a GitHub rename), each None when unknown;
+    the tracker row compares them.
     """
 
     name: str
@@ -27,6 +32,13 @@ class RepoSite(NamedTuple):
     branch: str = "unknown"
     labels: str = "unknown"
     cause: str | None = None
+    tracker_repo: str | None = None
+    canonical: str | None = None
+    #: How a launch would push to this origin: "ssh", "https" (the
+    #: fallback rewrites SSH GitHub addresses to HTTPS through the host
+    #: `gh` login) or "refuse" (neither path works). None means no
+    #: reading, and then the report carries no push row.
+    push: str | None = None
 
 
 class RepoRow(NamedTuple):
@@ -137,10 +149,91 @@ def _labels_row(site: RepoSite) -> RepoRow:
     )
 
 
+def _tracker_row(site: RepoSite) -> RepoRow | None:
+    """The canonical-name row: warn when the tracker answers a rename.
+
+    The configured `owner/name` and the tracker's answered name agree
+    after a healthy setup; after a GitHub rename the tracker answers
+    the new name while the config still holds the old one, and
+    search-based calls quietly return nothing for the old name. Case
+    alone never warns: tracker lookups are case-insensitive. No row
+    when either name is unknown: an unreadable name is not evidence.
+    """
+    from korapy import reponame
+
+    if not site.tracker_repo or not site.canonical:
+        return None
+    name = f"tracker:{site.name}"
+    if reponame.canonical_matches(site.tracker_repo, site.canonical):
+        return RepoRow(
+            name,
+            "ok",
+            f"the tracker answers {site.tracker_repo} as configured",
+            "",
+        )
+    return RepoRow(
+        name,
+        "warn",
+        f"{site.name}: configured as {site.tracker_repo} but the tracker answers"
+        f" {site.canonical}: the repository was renamed",
+        f"run `korapy repo rename {site.tracker_repo} {site.canonical}`,"
+        " then point the entry at the new name and run `korapy doctor` again",
+    )
+
+
+def _push_row(site: RepoSite) -> RepoRow | None:
+    """The push-path row: how a launch would push to this origin.
+
+    No row without a reading, or without an origin (the remote row
+    already covers that). SSH reads ok; the HTTPS fallback reads ok
+    with a note; an unpushable origin fails naming both fixes.
+    """
+    if site.push is None or site.origin is None:
+        return None
+    name = f"push:{site.name}"
+    if site.push == "refuse":
+        return RepoRow(
+            name,
+            "fail",
+            f"{site.name}: neither SSH nor the host gh login can push to the origin remote",
+            "restore the SSH agent (or add a key usable without one),"
+            " or run `gh auth login`, then run `korapy doctor` again",
+        )
+    if site.push == "https":
+        return RepoRow(
+            name,
+            "ok",
+            f"{site.name}: no usable SSH agent, so pushes rewrite SSH GitHub"
+            " addresses to HTTPS through the host gh login",
+            "",
+        )
+    if site.push != "ssh":
+        return None
+    if pushenv.is_ssh_github_url(site.origin):
+        return RepoRow(
+            name,
+            "ok",
+            f"SSH to the remote works for {site.name}; pushes use it",
+            "",
+        )
+    return RepoRow(
+        name,
+        "ok",
+        f"the origin for {site.name} needs no SSH agent, so pushes work as configured",
+        "",
+    )
+
+
 def check_sites(sites) -> list[RepoRow]:
-    """One remote row plus one labels row per site, in order. Pure."""
+    """Remote, labels and push rows per site, in order, then the tracker row when readable."""
     rows = []
     for site in sites:
         rows.append(_remote_row(site))
         rows.append(_labels_row(site))
+        pushed = _push_row(site)
+        if pushed is not None:
+            rows.append(pushed)
+        tracker = _tracker_row(site)
+        if tracker is not None:
+            rows.append(tracker)
     return rows

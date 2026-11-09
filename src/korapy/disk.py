@@ -197,8 +197,12 @@ def _inside(real, roots):
     return any(real == root or real.startswith(root + os.sep) for root in roots)
 
 
-def _done_tickets(entries, now):
-    """`{(repo, number)}` whose every registry entry is finished or gone."""
+def done_tickets(entries, now):
+    """`{(repo, number)}` whose every registry entry is finished or gone.
+
+    The one resolver for this fact: `hygiene` session planning calls
+    this helper instead of keeping its own copy.
+    """
     states: dict[tuple, list[str]] = {}
     for entry in entries:
         ticket = registry.ticket_of(entry)
@@ -287,7 +291,7 @@ def plan(
         live = list_fn()
     except Exception:  # noqa: BLE001 - an unreadable listing keeps everything
         live = None
-    done = _done_tickets(entries, now)
+    done = done_tickets(entries, now)
     if live is None:
         notes.append("live units unreadable: session candidates are kept")
     session_names: set[str] = set()
@@ -447,7 +451,7 @@ def apply(candidates, *, remove, roots, session_retention_days, now, entries, li
         live_error = str(err) or "live listing failed"
     else:
         live_error = ""
-    done = _done_tickets(entries, now)
+    done = done_tickets(entries, now)
     cutoff = now - session_retention_days * 24 * 60 * 60
     for candidate in candidates:
         if candidate.kind not in (PR_BODY, SESSION) or not candidate.safe:

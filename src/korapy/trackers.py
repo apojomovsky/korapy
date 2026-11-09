@@ -10,6 +10,7 @@ too: paced REST for label mode, the raw ``gh`` runner for board mode
 
 from typing import NamedTuple
 
+from korapy import boardstatus
 from korapy import tracker as iface
 from korapy.github import gh
 from korapy.github.board import BoardReader, BoardSchema, BoardTracker, GithubBoardProvisioner
@@ -73,15 +74,42 @@ class BoardBackedTracker(BoardTracker):
     new instance, so nothing goes stale across passes.
     """
 
-    def __init__(self, board_config, run, pacer=None, *, max_pages):
+    def __init__(
+        self, board_config, run, pacer=None, *, max_pages, adopt_limit=None, status_limit=None
+    ):
         super().__init__(board_config, run, pacer, max_pages=max_pages)
         self._project = None
         self._board_schema: BoardSchema | None = None
+        self._adopt_limit = adopt_limit
+        self._status_limit = status_limit
 
     @property
     def board_poll_pages(self) -> int:
         """The board page cap this instance polls and scans with."""
         return self._max_pages
+
+    @property
+    def board_adopt_limit(self) -> int | None:
+        """The per-repo-per-pass adopt cap carried from settings, or None when unset."""
+        return self._adopt_limit
+
+    @property
+    def board_status_limit(self) -> int | None:
+        """The per-repo-per-pass Status write cap carried from settings.
+
+        None when unset: the status step then stays read-only, the way
+        the adopt step does without its cap.
+        """
+        return self._status_limit
+
+    @property
+    def board_status_ids(self) -> dict:
+        """The derived key to Status option id map from the board config.
+
+        Only states with a non-empty id are synced; the step reads an
+        empty map as an unmapped project and changes nothing.
+        """
+        return boardstatus.status_ids(self._board)
 
     def _fetch_project_cached(self):
         """The live board project object, fetched once per instance.
@@ -134,13 +162,40 @@ class BoardBackedTracker(BoardTracker):
         """Every REST item, oldest first, for a full resync."""
         return self._issues.items(repo)
 
+    def pulls_index(self, repo: str, max_calls: int, *, merged_since: float | None = None):
+        """The open and recently merged pull requests on the repo, by ticket.
+
+        The board variant carries no pull requests of its own, but the
+        pull requests still live on the repository, so the index
+        delegates to the REST adapter like the change feed does.
+        """
+        return self._issues.pulls_index(repo, max_calls, merged_since=merged_since)
+
     def comment(self, repo: str, number: int, body: str) -> None:
         """One decision-protocol comment, through the REST adapter."""
         self._issues.comment(repo, number, body)
 
+    def comments(self, repo: str, number: int) -> tuple[str, ...]:
+        """Bodies of the item's comments, through the REST adapter.
+
+        Comments live on the repository whatever the tracker variant,
+        so a board repo reads through the same adapter call as a
+        labels one.
+        """
+        return self._issues.comments(repo, number)
+
     def add_label(self, repo: str, number: int, label: str) -> None:
-        """The one decision label, through the REST adapter."""
+        """The loop-owned labels, through the REST adapter."""
         self._issues.add_label(repo, number, label)
+
+    def remove_label(self, repo: str, number: int, label: str) -> None:
+        """The one decision label's removal, through the REST adapter.
+
+        Labels live on the repository whatever the tracker variant, so
+        a board repo removes through the same adapter call as a labels
+        one.
+        """
+        self._issues.remove_label(repo, number, label)
 
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """The bootstrap labels, through the REST adapter.
@@ -153,6 +208,15 @@ class BoardBackedTracker(BoardTracker):
     def missing_labels(self, repo: str) -> tuple[str, ...]:
         """Names of the bootstrap labels absent on ``repo``, through the adapter."""
         return self._issues.missing_labels(repo)
+
+    def canonical_repo(self, repo: str) -> str:
+        """The tracker's canonical name, through the REST adapter.
+
+        Labels and names live on the repository whatever the tracker
+        variant, so a board repo answers through the same adapter call
+        as a labels one.
+        """
+        return self._issues.canonical_repo(repo)
 
     def _fetch_single(self, project_id, repo, number):
         """The board item node behind ``repo#number``, else ``TrackerError``."""
@@ -259,9 +323,10 @@ class SetupEntry(NamedTuple):
     The label half needs a tracker and the board half needs a spec;
     both derive from this, so no caller re-loads settings to recover
     them. ``board`` is the resolved ``[repo.board]`` table (or None
-    when the entry names none), and ``max_pages`` is the resolved
-    board poll cap. No tracker is built here: setup builds it lazily,
-    per entry, inside its loop.
+    when the entry names none), ``max_pages`` is the resolved board
+    poll cap, and ``adopt_limit`` the resolved per-repo-per-pass
+    adopt cap. No tracker is built here: setup builds it lazily, per
+    entry, inside its loop.
     """
 
     name: str  # the entry name, which the reports print
@@ -270,6 +335,7 @@ class SetupEntry(NamedTuple):
     variant: str  # "labels" | "board", as resolved
     board: object  # the resolved board table, or None
     max_pages: int  # the resolved board poll cap
+    adopt_limit: int  # the resolved per-repo-per-pass adopt cap
 
 
 def setup_entry(root, name, *, git) -> SetupEntry:
@@ -298,6 +364,7 @@ def setup_entry(root, name, *, git) -> SetupEntry:
         variant=str(resolved["tracker.variant"]),
         board=resolved.board,
         max_pages=resolved["board.poll_pages"],
+        adopt_limit=resolved["board.add_per_pass"],
     )
 
 
@@ -312,21 +379,36 @@ def setup_tracker(entry, *, run=None, pacer=None) -> iface.Tracker:
     """
     if entry.variant == "board" and entry.board is None:
         return build_tracker(
-            variant="labels", board=None, max_pages=entry.max_pages, run=run, pacer=pacer
+            variant="labels",
+            board=None,
+            max_pages=entry.max_pages,
+            adopt_limit=entry.adopt_limit,
+            run=run,
+            pacer=pacer,
         )
     return build_tracker(
-        variant=entry.variant, board=entry.board, max_pages=entry.max_pages, run=run, pacer=pacer
+        variant=entry.variant,
+        board=entry.board,
+        max_pages=entry.max_pages,
+        adopt_limit=entry.adopt_limit,
+        run=run,
+        pacer=pacer,
     )
 
 
-def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.Tracker:
+def build_tracker(
+    *, variant, board, max_pages, adopt_limit=None, status_limit=None, run=None, pacer=None
+) -> iface.Tracker:
     """One repo's tracker from validated settings data: the one factory.
 
     ``variant`` is ``resolved["tracker.variant"]``, ``board`` is the
     resolved ``[repo.board]`` table (or None), ``max_pages`` is the
-    resolved ``board.poll_pages``. A missing ``run`` wires the
-    production runners (paced REST for label mode, the raw runner for
-    board mode); tests pass a fake. Unknown variants and board mode
+    resolved ``board.poll_pages``, ``adopt_limit`` the resolved
+    ``board.add_per_pass`` (None leaves the board step's adopt off),
+    and ``status_limit`` the resolved ``board.status_per_pass`` (None
+    leaves the board step's Status sync off). A missing ``run`` wires
+    the production runners (paced REST for label mode, the raw runner
+    for board mode); tests pass a fake. Unknown variants and board mode
     without a board table are refused, never run as label mode.
     """
     if variant == "labels":
@@ -337,7 +419,12 @@ def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.T
                 "tracker.variant is 'board' but no [board] table names the project board"
             )
         return BoardBackedTracker(
-            board, gh.run if run is None else run, pacer=pacer, max_pages=max_pages
+            board,
+            gh.run if run is None else run,
+            pacer=pacer,
+            max_pages=max_pages,
+            adopt_limit=adopt_limit,
+            status_limit=status_limit,
         )
     want = ", ".join(repr(v) for v in sorted(VARIANTS))
     raise ValueError(f"unknown tracker variant {variant!r} (want one of {want})")
@@ -375,18 +462,25 @@ def production_board_provisioner(*, run=None, pacer=None) -> GithubBoardProvisio
     return GithubBoardProvisioner(gh.run if run is None else run, pacer=pacer)
 
 
-def production_trackers(root, names, *, git) -> tuple[dict[str, RepoTracker], str | None]:
+def production_trackers(
+    root, names, *, git, entries=None
+) -> tuple[dict[str, RepoTracker], str | None]:
     """``({entry name: RepoTracker}, None)`` for one ops root, or ``({}, problem)``.
 
     Resolves each entry once through the shared ``repo_operators`` and
     the settings resolver, then builds each tracker through the one
     factory. ``names`` are entry names, already defaulted by the caller.
+    ``entries`` is the root's already-resolved ``{name: (tracker repo,
+    operators)}`` entries: with it the pass shares its one resolution
+    instead of resolving again; with none, the builder resolves its
+    own.
     """
     from korapy import settings, syncli
 
-    entries, problem = syncli.repo_operators(root, list(names), git)
-    if problem is not None:
-        return {}, problem
+    if entries is None:
+        entries, problem = syncli.repo_operators(root, list(names), git)
+        if problem is not None:
+            return {}, problem
     mapping: dict[str, RepoTracker] = {}
     for name in names:
         if name not in entries:
@@ -402,6 +496,8 @@ def production_trackers(root, names, *, git) -> tuple[dict[str, RepoTracker], st
                 variant=variant,
                 board=resolved.board,
                 max_pages=resolved["board.poll_pages"],
+                adopt_limit=resolved["board.add_per_pass"],
+                status_limit=resolved["board.status_per_pass"],
             )
         except (ValueError, settings.SettingsError) as err:
             return {}, f"[[repo]] {name}: {err}"

@@ -92,8 +92,18 @@ class NoReadings(unittest.TestCase):
                 "resources-marker",
                 "resources-pressure",
                 "resources-foreign",
+                "heavy",
+                "heavy-stuck",
                 "resources-slices",
             ],
+        )
+
+    def test_heavy_wait_factor_defaults_to_canonical_constant(self):
+        from korapy import heavy
+
+        self.assertEqual(
+            resourcedoctor.ResourceReadings._field_defaults["heavy_wait_factor"],
+            heavy.DEFAULT_WAIT_FACTOR,
         )
 
 
@@ -580,6 +590,82 @@ class SliceDrift(unittest.TestCase):
             },
         )
         self.assertEqual(by_name(resourcedoctor.check(state))["resources-slices"].status, "ok")
+
+    def test_a_zero_share_slice_without_limits_is_ok(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": resourcedoctor.parse_show(
+                    "MemoryMax=infinity\nCPUQuotaPerSecUSec=infinity\n"
+                ),
+            },
+        )
+        self.assertEqual(by_name(resourcedoctor.check(state))["resources-slices"].status, "ok")
+
+    def test_stale_limits_on_a_zero_share_slice_warn(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("no launch reconciles it", row.detail)
+        self.assertNotIn("reconcile on the next launch", row.detail)
+        self.assertIn("zero-share", row.fix)
+        self.assertIn("stop the slice by hand", row.fix)
+        self.assertNotIn("launch an agent", row.fix)
+
+    def test_mixed_drift_names_the_reconcilable_project(self):
+        state = readings(
+            shares={"web": R.Share(weight=1.0), "shadow": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": props("8589934592", "8000000"),
+                "korapy-shadow.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("korapy-shadow.slice", row.detail)
+        self.assertIn("launch an agent of web", row.fix)
+        self.assertIn("hand stop", row.fix)
+
+    def test_host_plus_zero_share_drift_names_the_hand_stop(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("17179869184", "4000000"),
+                "korapy-web.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy.slice", row.detail)
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("launch an agent", row.fix)
+        self.assertIn("hand stop", row.fix)
+
+    def test_two_zero_share_slices_drifting_name_the_hand_stop(self):
+        state = readings(
+            shares={"web": R.Share(weight=0), "api": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("17179869184", "4000000"),
+                "korapy-web.slice": props("16777216000", "8000000"),
+                "korapy-api.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("korapy-api.slice", row.detail)
+        self.assertIn("launch an agent", row.fix)
+        self.assertIn("hand stop", row.fix)
 
 
 class ParseShow(unittest.TestCase):

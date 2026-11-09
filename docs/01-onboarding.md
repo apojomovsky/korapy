@@ -102,7 +102,8 @@ Everything a project might reasonably do differently is a named setting with a d
 | `checks.test` | detected (see 3) | the command the agent and takeoff run |
 | `checks.takeoff` | `[checks.test]` | any list of commands; each must exit 0 |
 | `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
-| `checks.suite_lock_timeout_s` | `3600` | seconds a second takeoff waits for the full-suite lock before giving up (exit 75) |
+| `[heavy]` `cpu_m`, `memory_mb` | the host budget | the lane caps; a cap above the host budget is refused (exit 4) |
+| `[heavy]` `commands`, `default_weight` | `1000` millicores, `1000` MB | the commands that run through the heavy lane and their weights; a listed command runs in a transient scope with lane limits and records one ledger row, an unlisted command runs as before |
 | `agents.cap` | 1 | this project's ceiling on the host |
 | `review.budget.base_minutes` | `15` | reviewer minutes before the diff size matters |
 | `review.budget.seconds_per_line` | `6` | reviewer seconds per changed line |
@@ -183,7 +184,7 @@ When in doubt, put it in the overlay first. A rule that turns out to hold for ev
 
 ## 4. Overrides without forking
 
-- **Prompts.** Each role (worker, reviewer, triage) has a built-in template with named placeholders: `{issue}`, `{title}`, `{branch}`, `{worktree}`, `{checks.test}`, `{overlay}`, `{project_agents_md}`. `korapy prompts eject worker` copies the template to `.korapy/prompts/worker.md` for editing. korapy warns when the built-in template changes after the ejected copy was taken.
+- **Prompts.** Each role (worker, reviewer, triage, research) has a built-in template with named placeholders: `{issue}`, `{title}`, `{branch}`, `{worktree}`, `{checks.test}`, `{overlay}`, `{project_agents_md}`. `korapy prompts eject worker` copies the template to `.korapy/prompts/worker.md` for editing. korapy warns when the built-in template changes after the ejected copy was taken.
 - **Code hooks**, for what a setting cannot express: custom eligibility, a keep-check, a takeoff gate. `korapy.toml` names a Python entry point (`hooks = "my_tools.korapy:Project"`) that implements the project protocol from [`00-design.md`](00-design.md), section 2. Without it, the defaults apply: GitHub issues with the ready label are eligible, and a branch is kept while it has an open PR or unpushed commits.
 - **Where hook code lives:** in the ops root. In the split layout, the ops repository becomes a small uv project: a `pyproject.toml` that depends on korapy (pinned through `[tool.uv.sources]`), and a module with the hooks that `korapy.toml` names. The code is versioned with the rest of the ops side, and the project never sees it. In the inline layout, the same module lives in the project.
 - **Language.** korapy is a tool installed on the host, not a dependency of the project. A project with no Python in it never needs any. Only a project with code hooks depends on korapy as a library, pinned through `[tool.uv.sources]`.
@@ -226,6 +227,19 @@ Because `--fix` cannot reach beyond the user and the clones, agents may run it.
 - **The tracker and forge** (GitHub today):
   - `gh` is logged in and can see the repository;
   - the labels exist.
+- **Renamed repositories:** when the tracker answers a different
+  canonical name than the configured `tracker.repo` (the repository was
+  renamed on the forge), `doctor` warns on a `tracker:<name>` row.
+  `korapy repo rename OLD NEW --plan` prints what would move, and
+  `korapy repo rename OLD NEW` moves the store's keys (items, claims
+  with agent and epoch, outbox, sync cursors) in one transaction,
+  refusing while a live or stale agent entry or a live-held claim names the repo.
+  Session directories and review records are keyed by the short
+  repository name and are not touched by this verb (see #479).
+  The verb leaves a timestamped backup beside the store (the newest
+  five are kept); to restore one, stop the dispatch timer and copy it
+  back over the store file. After the move, update the clone's origin
+  remote and `tracker.repo`, then re-run `doctor`.
 
 ## 7. Testing onboarding
 

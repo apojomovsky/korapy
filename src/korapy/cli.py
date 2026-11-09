@@ -8,13 +8,17 @@ from collections.abc import Sequence
 from korapy import (
     accounts,
     agentcli,
+    boardcli,
     coordcli,
+    decisioncli,
     deps,
     diskcli,
     doctor,
     drivehub,
+    freezecli,
     gccli,
     githubcli,
+    heavycli,
     hubcli,
     init,
     launch,
@@ -29,6 +33,7 @@ from korapy import (
     promptscli,
     quotacli,
     registry,
+    repocli,
     reviewcli,
     serve,
     settings,
@@ -160,9 +165,16 @@ def cmd_prose(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    from korapy import push
+    from korapy import push, pushenv, worktrees
 
-    return push.verified_push(os.getcwd(), remote=args.remote, branch=args.branch)
+    try:
+        extra = pushenv.launch_env(os.getcwd(), git=worktrees.git)
+    except pushenv.PushRefused as err:
+        print(f"korapy push: {err}", file=sys.stderr)
+        return USAGE
+    return push.verified_push(
+        os.getcwd(), remote=args.remote, branch=args.branch, env=extra or None
+    )
 
 
 def cmd_budget(args: argparse.Namespace) -> int:
@@ -233,16 +245,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)
+    decisioncli.add_parser(sub)
     diskcli.add_parser(sub)
     drivehub.add_parser(sub)
+    freezecli.add_parser(sub)
     hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     mergecli.add_parser(sub)
     agentcli.add_parser(sub)
+    boardcli.add_parser(sub)
     ghcli.add_parser(sub)
     githubcli.add_parser(sub)
+    heavycli.add_parser(sub)
     quotacli.add_parser(sub)
+    repocli.add_parser(sub)
     serve.add_parser(sub)
     snapshot.add_parser(sub)
     syncli.add_parser(sub)

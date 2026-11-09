@@ -283,32 +283,107 @@ def limits(found: list[Project], *, total_cap: int, repo_cap: int) -> admission.
     return built
 
 
+def _effective_cap(project: Project, total_cap: int) -> int | None:
+    """The slots `project` may still take: its ceiling clamped to the host total.
+
+    The same clamp `limits` applies for the count gate, so the budget
+    split and the count admission agree on who can start agents. None
+    (uncapped) reads as the whole total.
+    """
+    if project.ceiling is None:
+        return total_cap
+    return min(project.ceiling, total_cap)
+
+
+def budget_shares(found: list[Project], *, total_cap: int) -> dict[str, dict]:
+    """The resource shares for the host budget split, keyed by project name.
+
+    The one resolver for which projects share the budget: the budget
+    derivation, the slice reconciliation and the doctor row all read it,
+    so the can-this-project-launch rule lives in exactly one place.
+
+    A project whose effective cap is 0 (a ceiling of 0, or a host total
+    of 0) can start no agent, so it reserves nothing: its weight and
+    floors read as zero, and a floor on it is ignored. Its name stays in
+    the table with its configured ceilings, so its own share caps at
+    zero and raising the ceiling restores its old share on the next
+    launch. Every other project passes its `[resources]` table through
+    unchanged.
+    """
+    shares = {}
+    for project in found:
+        table = dict(project.resources or {})
+        if _effective_cap(project, total_cap) == 0:
+            table["weight"] = 0
+            for key in _RESOURCE_FLOORS.values():
+                table[key] = 0
+            for key in _RESOURCE_CEILINGS.values():
+                table.setdefault(key, None)
+        shares[project.name] = table
+    return shares
+
+
+def check_and_sources(
+    config_dir: str | None = None,
+) -> tuple[list[str], list[tuple[str, str, str | None]]]:
+    """Registry problems plus every resolving entry, in one pass.
+
+    Returns (problems, sources): `sources` holds one (project, entry,
+    source file) per resolving eligibility entry, sorted by project
+    name like `load_all`. Each policy module imports once here, never
+    calling the entry function; projects without an entry and entries
+    that do not resolve are skipped in `sources` and reported in
+    `problems`. [] problems means every registration is usable; a
+    missing registry dir counts as usable. The one loader for both
+    answers, so one pass never imports a policy twice.
+    """
+    try:
+        found = load_all(config_dir)
+    except ProjectsError as err:
+        return [str(err)], []
+    try:
+        total = settings.load(root=None)["admission.total_cap"]
+    except settings.SettingsError as err:
+        return [str(err)], []
+    problems = []
+    sources = []
+    for project in found:
+        if project.ceiling is not None and project.ceiling > total:
+            problems.append(
+                f"project {project.name} asks ceiling {project.ceiling}, host allows {total}"
+            )
+        if project.eligibility is None:
+            continue
+        try:
+            policy = eligibility.load_policy(
+                project.eligibility, project=project.name, base=project.root
+            )
+        except eligibility.EligibilityError as err:
+            problems.append(str(err))
+        else:
+            sources.append((project.name, project.eligibility, policy.source))
+    return problems, sources
+
+
+def policy_sources(config_dir: str | None = None) -> list[tuple[str, str, str | None]]:
+    """Every resolving eligibility entry as (project, entry, source file).
+
+    Sorted by project name, like `load_all`. Projects without an entry
+    and entries that do not resolve are skipped: `check` already
+    reports the broken ones. Resolving imports the policy module but
+    never calls the entry function. One pass through
+    `check_and_sources`; see it for the shared loader.
+    """
+    return check_and_sources(config_dir)[1]
+
+
 def check(config_dir: str | None = None) -> list[str]:
     """Problems with the registry: bad files, ceilings above the host total,
     and eligibility entries that do not resolve.
 
     [] means every registration is usable. A missing registry dir counts
     as usable: the host just holds one unregistered project. Resolving
-    imports the policy module but never calls the entry function.
+    imports the policy module but never calls the entry function. One
+    pass through `check_and_sources`; see it for the shared loader.
     """
-    try:
-        found = load_all(config_dir)
-    except ProjectsError as err:
-        return [str(err)]
-    try:
-        total = settings.load(root=None)["admission.total_cap"]
-    except settings.SettingsError as err:
-        return [str(err)]
-    problems = []
-    for project in found:
-        if project.ceiling is not None and project.ceiling > total:
-            problems.append(
-                f"project {project.name} asks ceiling {project.ceiling}, host allows {total}"
-            )
-        if project.eligibility is not None:
-            problem = eligibility.check_entry(
-                project.eligibility, project=project.name, base=project.root
-            )
-            if problem is not None:
-                problems.append(problem)
-    return problems
+    return check_and_sources(config_dir)[0]

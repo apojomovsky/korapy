@@ -18,9 +18,13 @@ import unittest
 from unittest import mock
 
 from korapy import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
+from korapy import syncli
 from korapy import tracker
 from korapy import projects as projects_mod
-from tests.test_tracker import FakeTracker, reading
+from korapy.github import tracker as ghtracker
+from tests.test_board_adopt import AdoptingBoardTracker
+from tests.test_sync import UnreadableListingStore
+from tests.test_tracker import FakeRun, FakeTracker, reading
 
 
 def stored(path, items):
@@ -72,8 +76,31 @@ def project_named(name, entry=None, root=None):
     )
 
 
+def driven_for(found, store):
+    """`{project name: fixture repos}` so an older test drives its rows.
+
+    `found` is `[(name, wants)]` or `[Project]` (`Project` is a
+    named tuple, so a plain-tuple check alone cannot tell them
+    apart); the repos are the policy wants plus the store rows, so
+    every fixture row and every request stays driven exactly as
+    before scoping existed. Tests that pin scoping pass `driven`
+    explicitly instead.
+    """
+    names = [entry[0] if type(entry) is tuple else entry.name for entry in found]
+    repos = set()
+    for entry in found:
+        if type(entry) is tuple:
+            repos.update(repo for repo, _number, _kind in entry[1])
+    try:
+        repos.update(item.repo for item in store.items())
+    except (board.StoreError, sqlite3.Error):
+        pass
+    return {name: frozenset(repos) for name in names}
+
+
 def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=None, **fields):
     """`run_pass` with every host read injected: no outside world."""
+    fallback_driven = driven_for(found, store)
     if policy_dir is not None and found:
         entries = []
         for name, wants in found:
@@ -101,6 +128,7 @@ def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=No
         "gone_s": 3600.0,
     }
     values.update(fields)
+    values.setdefault("driven", fallback_driven)
     return drive.run_pass(**values)
 
 
@@ -200,6 +228,548 @@ class RenderTest(unittest.TestCase):
         self.assertIn("would resume 1", text)
         self.assertIn("would review 1", text)
         self.assertIn("would fix 1", text)
+
+    def test_summary_names_the_pulls_call_count(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+            ],
+            label="pass",
+            plan=False,
+            pulls_calls=3,
+        )
+        self.assertIn("pass: 1 candidate(s)", text)
+        self.assertIn("started 1", text)
+        self.assertIn("pulls calls 3", text)
+
+    def test_summary_counts_zero_pulls_calls_by_default(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("pulls calls 0", text)
+
+    def test_summary_flags_a_limited_pulls_lookup(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="skip",
+                    reason="app#7: linked pulls unreadable, start refused (pulls lookup limited)",
+                ),
+            ],
+            label="pass",
+            plan=False,
+            pulls_calls=1,
+            pulls_limited=True,
+        )
+        self.assertIn("pulls calls 1", text)
+        self.assertIn("pulls lookup limited", text)
+
+
+class PullsLookupPassTest(unittest.TestCase):
+    """The batched pulls lookup over a full pass. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-pulls-pass-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def run_pass(self, store, plan=False, found=(), **fields):
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store, self.lock, out, err, plan=plan, found=found, policy_dir=self.policies, **fields
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_store_with_hundreds_of_rows_costs_one_pulls_listing(self):
+        numbers = list(range(1, 301))
+        store = stored(self.db, [("app", number, "open") for number in numbers])
+        self.addCleanup(store.close)
+        gh = FakeRun()
+        gh.add(
+            "repos/app/issues?state=all&sort=updated&direction=asc&per_page=100",
+            [],
+        )
+        gh.add(
+            "repos/app/pulls?state=open&sort=updated&direction=asc&per_page=100",
+            [],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", number, "start") for number in numbers])],
+            tracker_factory=lambda repo: adapter,
+            index_for=drive.pulls_index_for(lambda repo: adapter),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        pulls_calls = [call for call in gh.calls if call[1].startswith("repos/app/pulls?")]
+        self.assertEqual(len(pulls_calls), 1)
+        self.assertIn("pulls calls 1", out)
+
+    def test_a_pass_with_no_fetchable_candidate_lists_nothing(self):
+        store = stored(self.db, [("app", 7, "closed")])
+        self.addCleanup(store.close)
+        fake = FakeTracker()
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call for call in fake.calls if call[0] == "pulls_index"], [])
+        self.assertIn("pulls calls 0", out)
+
+    def test_a_capped_pass_reports_limited_and_refuses_starts(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker()
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=0,
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("pulls lookup limited", out)
+        self.assertIn("linked pulls unreadable, start refused (pulls lookup limited", out)
+        self.assertIn("pulls lookup limited", out.splitlines()[-1])
+
+    def test_fix_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "fix")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, fix refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_resume_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "resume")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, resume refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_fix_on_a_live_claimed_row_with_a_held_pull_is_hold_skipped(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="open")]}
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "fix")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            read_labels=lambda kind, repo, number: ["hold"] if kind == "pr" else [],
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#12", out)
+        self.assertIn("pulls calls 1", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_takeover_start_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            finished_for={("app", 7): ("drive-host-1-x", "worker")},
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, review refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_takeover_start_on_a_live_claimed_row_with_a_held_pull_is_hold_skipped(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="open")]}
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            finished_for={("app", 7): ("drive-host-1-x", "worker")},
+            read_labels=lambda kind, repo, number: ["hold"] if kind == "pr" else [],
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#12", out)
+        self.assertIn("pulls calls 1", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_takeover_starts_in_one_repo_share_a_single_listing(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        store.claim("app", 8, "drive-host-1-y", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start"), ("app", 8, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7), ("blue", "app", 8)}),
+            finished_for={
+                ("app", 7): ("drive-host-1-x", "worker"),
+                ("app", 8): ("drive-host-1-y", "worker"),
+            },
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: linked pulls unreadable, review refused", out)
+        self.assertIn("app#8: linked pulls unreadable, review refused", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_a_bad_pulls_setting_is_recorded_and_the_pass_caps_at_the_default(self):
+        from korapy import eligibility
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        items = store.items()
+        project = project_named("blue", entry="dummy:eligible")
+        policy = eligibility.LoadedPolicy(
+            project="blue",
+            entry="dummy:eligible",
+            func=lambda rows, *, now: [eligibility.StartRequest("app", 7, "start")],
+        )
+        fake = FakeTracker()
+        out = io.StringIO()
+        with (
+            mock.patch.object(eligibility, "load_policy", return_value=policy),
+            mock.patch.object(
+                drive.settings,
+                "load",
+                side_effect=settings.SettingsError("bad pulls budget"),
+            ),
+        ):
+            gated, problems, _, pulls_calls, pulls_limited = drive._gate_all(
+                items,
+                [project],
+                out,
+                now=2000.0,
+                live_set=frozenset(),
+                limits=admission.Limits(total=4),
+                quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+                pool=None,
+                ledger_data={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                fix_threshold="high",
+                index_for=drive.pulls_index_for(lambda repo: fake),
+                pulls_max_calls=None,
+                driven={"blue": frozenset({"app"})},
+            )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bad pulls budget", problems[0])
+        self.assertEqual(
+            [call for call in fake.calls if call[0] == "pulls_index"],
+            [("pulls_index", "app", drive.DEFAULT_PULLS_MAX_CALLS)],
+        )
+        self.assertEqual(pulls_calls, 1)
+        self.assertFalse(pulls_limited)
+        self.assertEqual(len(gated), 1)
+
+
+class PullsBudgetValidationTest(unittest.TestCase):
+    """`drive.pulls_max_calls` takes only a positive integer."""
+
+    def test_the_validator_refuses_anything_but_a_positive_integer(self):
+        for value in (0, -3, True, "x"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    drive._positive_calls(value)
+
+    def test_the_validator_passes_a_positive_integer_through(self):
+        self.assertEqual(drive._positive_calls(1), 1)
+        self.assertEqual(drive._positive_calls(20), 20)
+
+    def test_the_resolver_names_the_key(self):
+        for value in (0, -3, True, "x"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(settings.SettingsError, "drive.pulls_max_calls"):
+                    settings.resolve(project={"drive": {"pulls_max_calls": value}})
+
+    def test_a_bad_file_value_names_the_file_and_key(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-pulls-budget-"))
+        config = os.path.join(tmp, "config")
+        os.makedirs(config)
+        root = os.path.join(tmp, "ops")
+        os.makedirs(root)
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write("[drive]\npulls_max_calls = 0\n")
+        with self.assertRaisesRegex(
+            settings.SettingsError, r"korapy\.toml.*drive\.pulls_max_calls"
+        ):
+            settings.load(root=root, env={"KORAPY_CONFIG": config})
+
+
+class BrokenPolicyIsolationTest(unittest.TestCase):
+    """One broken policy skips only its project; the pass still runs others."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-broken-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_broken_policy_skips_only_that_project(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        good_path = os.path.join(self.policies, "good.py")
+        with open(good_path, "w", encoding="utf-8") as handle:
+            handle.write(policy_source([("app", 7, "start")]))
+        good = project_named("good", good_path + ":eligible")
+        bad = project_named("bad", "missing_policy_xyz:eligible")
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=True,
+            found=[good, bad],
+            driven={"good": frozenset({"app"}), "bad": frozenset({"app"})},
+        )
+        self.assertEqual(code, 4)
+        named = [line for line in err.getvalue().splitlines() if "project bad" in line]
+        self.assertEqual(len(named), 1)
+        self.assertIn("missing_policy_xyz:eligible", named[0])
+        self.assertIn("good app#7: start", out.getvalue())
+
+    def test_a_pulls_seam_loads_the_good_policy_once_and_reports_the_rest(self):
+        from korapy import eligibility
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        counter = os.path.join(self.tmp.name, "imports.log")
+        good_path = os.path.join(self.policies, "good.py")
+        with open(good_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        f"with open({counter!r}, 'a', encoding='utf-8') as _h:",
+                        "    _h.write('imported\\n')",
+                        "def eligible(rows, *, now):",
+                        "    from korapy.eligibility import StartRequest",
+                        "    return [StartRequest('app', 7, 'start')]",
+                        "",
+                    ]
+                )
+            )
+        good = project_named("good", good_path + ":eligible")
+        bad = project_named("bad", "missing_policy_xyz:eligible")
+        none = project_named("none")
+        fake = FakeTracker()
+        out = io.StringIO()
+        gated, problems, _requested, pulls_calls, pulls_limited = drive._gate_all(
+            store.items(),
+            [good, bad, none],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={
+                name: drive.QuotaSource(chains={}, stale_after=10**12)
+                for name in ("good", "bad", "none")
+            },
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=5,
+            driven={
+                "good": frozenset({"app"}),
+                "bad": frozenset({"app"}),
+                "none": frozenset(),
+            },
+        )
+        with open(counter, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bad", problems[0])
+        self.assertIn("missing_policy_xyz:eligible", problems[0])
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [f"project none: {eligibility.no_entry_line('none')}"],
+        )
+        self.assertEqual([row.project for row in gated], ["good"])
+        self.assertIn(("pulls_index", "app", 5), fake.calls)
+        self.assertEqual(pulls_calls, 1)
+        self.assertFalse(pulls_limited)
+
+
+class PolicyLoadOnceTest(unittest.TestCase):
+    """Each resolving policy imports once per pass, not once per loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-policy-once-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_pass_with_a_pulls_lookup_imports_each_policy_once(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        counter = os.path.join(self.tmp.name, "imports.log")
+        policy_path = os.path.join(self.policies, "blue.py")
+        with open(policy_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        f"with open({counter!r}, 'a', encoding='utf-8') as _h:",
+                        "    _h.write('imported\\n')",
+                        "def eligible(rows, *, now):",
+                        "    from korapy.eligibility import StartRequest",
+                        "    return [StartRequest('app', 7, 'start')]",
+                        "",
+                    ]
+                )
+            )
+        project = project_named("blue", policy_path + ":eligible")
+        fake = FakeTracker()
+        out = io.StringIO()
+        gated, problems, _requested, _calls, _limited = drive._gate_all(
+            store.items(),
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=5,
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(len(gated), 1)
+        with open(counter, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
+
+
+class NoEntrySkipLineTest(unittest.TestCase):
+    """A project without an entry prints the shared eligibility skip line."""
+
+    def test_the_gate_prints_the_eligibility_no_entry_line(self):
+        from korapy import eligibility
+
+        project = project_named("blue")
+        out = io.StringIO()
+        gated, problems, _requested, _calls, _limited = drive._gate_all(
+            [],
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=None,
+            pulls_max_calls=5,
+            driven={"blue": frozenset()},
+        )
+        self.assertEqual(gated, [])
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [f"project blue: {eligibility.no_entry_line('blue')}"],
+        )
 
 
 class PlanTest(unittest.TestCase):
@@ -525,6 +1095,141 @@ class CmdDriveTest(unittest.TestCase):
         self.assertEqual(code, 4)
 
 
+class CmdDriveMapFailureTest(unittest.TestCase):
+    """A broken project config at map-build time refuses the pass.
+
+    `production_repo_map` raising `SettingsError` through `cmd_drive`
+    exits 4 in both the plan and the claiming path, naming the
+    problem, instead of joining the pass against a guessed map.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-map-")
+        self.addCleanup(self.tmp.cleanup)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def run_cmd(self, plan):
+        host_settings = settings.resolve(
+            env={}, flags={"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
+        )
+        with (
+            mock.patch.object(drive.board, "open_store", return_value=mock.MagicMock()),
+            mock.patch.object(drive.settings, "load", return_value=host_settings),
+            mock.patch.object(drive.projects, "load_all", return_value=[]),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=settings.SettingsError("test config names no tracker repo"),
+            ),
+            mock.patch.object(drive.sys, "stdout", self.out),
+            mock.patch.object(drive.sys, "stderr", self.err),
+        ):
+            return drivehub.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
+
+    def test_plan_with_a_broken_repo_map_is_a_usage_error(self):
+        self.assertEqual(self.run_cmd(plan=True), 4)
+        self.assertIn("korapy drive: test config names no tracker repo", self.err.getvalue())
+
+    def test_claiming_with_a_broken_repo_map_is_a_usage_error(self):
+        self.assertEqual(self.run_cmd(plan=False), 4)
+        self.assertIn("korapy drive: test config names no tracker repo", self.err.getvalue())
+
+
+class UnreadableListingTest(unittest.TestCase):
+    """A store whose repo listing cannot be read fails the pass cleanly.
+
+    `sync_all` reports one store line instead of raising, and both the
+    plan and the claiming pass exit 4 naming the problem.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-listing-")
+        self.addCleanup(self.tmp.cleanup)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def run_pass(self, plan, problem):
+        store = UnreadableListingStore(problem)
+        fields = {}
+        if not plan:
+            fields["tracker_factory"] = lambda repo: FakeTracker()
+        code = hermetic_pass(
+            store,
+            os.path.join(self.tmp.name, "drive.lock"),
+            self.out,
+            self.err,
+            plan=plan,
+            **fields,
+        )
+        return code
+
+    def test_plan_with_an_unreadable_listing_is_exit_four(self):
+        code = self.run_pass(plan=True, problem=board.StoreError("test listing unreadable"))
+        self.assertEqual(code, 4)
+        self.assertIn("korapy drive: test listing unreadable", self.err.getvalue())
+
+    def test_claiming_with_an_unreadable_listing_is_exit_four(self):
+        code = self.run_pass(plan=False, problem=board.StoreError("test listing unreadable"))
+        self.assertEqual(code, 4)
+        self.assertIn(
+            "korapy drive: store repo listing unreadable: test listing unreadable",
+            self.err.getvalue(),
+        )
+
+
+class BoardKeptLineTest(unittest.TestCase):
+    """The pass prints one board line when the step changed or found drift.
+
+    A pass that adopted a card or still sees drift verdicts names the
+    counts on stderr, so the journal shows the board being kept; a
+    quiet pass prints no board line at all. Fakes only: a scripted
+    board tracker plus a temporary store, through the hermetic pass.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-boardline-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def drive_pass(self, store, fake):
+        return hermetic_pass(
+            store,
+            self.lock,
+            self.out,
+            self.err,
+            plan=False,
+            tracker_factory=lambda repo: fake,
+        )
+
+    def test_changed_board_step_prints_one_line(self):
+        store = stored(self.db, [("example/demo", 7, "open"), ("example/demo", 8, "open")])
+        self.addCleanup(store.close)
+        fake = AdoptingBoardTracker(
+            items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            board_items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            adopt_report=tracker.BoardAdopt(("example/demo#8",), (), (), None),
+        )
+        code = self.drive_pass(store, fake)
+        self.assertEqual(code, drive.OK)
+        self.assertIn(
+            "korapy drive: board kept: 1 added, drift remaining: 1",
+            self.err.getvalue(),
+        )
+
+    def test_quiet_board_step_prints_no_line(self):
+        store = stored(self.db, [("example/demo", 7, "open")])
+        self.addCleanup(store.close)
+        fake = AdoptingBoardTracker(
+            items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            board_items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            adopt_report=tracker.BoardAdopt((), (), (), None),
+        )
+        code = self.drive_pass(store, fake)
+        self.assertEqual(code, drive.OK)
+        self.assertNotIn("board kept", self.err.getvalue())
+
+
 class HoldLabelWiringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-hold-")
@@ -554,6 +1259,11 @@ class HoldLabelWiringTest(unittest.TestCase):
     def passing_cmd(self, plan):
         seen = {}
         launcher_seen = {}
+        built = {
+            "stuck": mock.MagicMock(return_value=({}, 600.0, {})),
+            "finished": mock.MagicMock(return_value={}),
+            "orphan": mock.MagicMock(return_value=(set(), set(), 3600.0)),
+        }
 
         def fake_run_pass(**kwargs):
             seen.update(kwargs)
@@ -570,12 +1280,13 @@ class HoldLabelWiringTest(unittest.TestCase):
                 mock.patch.object(drive.board, "open_store", return_value=store),
                 mock.patch.object(drive.settings, "load", return_value=host_settings) as loaded,
                 mock.patch.object(drive.projects, "load_all", return_value=[]),
-                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0, {})),
-                mock.patch.object(drive, "production_finished_for", return_value={}),
-                mock.patch.object(drive, "production_agent_roles", return_value={}),
                 mock.patch.object(
-                    drive, "production_orphan_inputs", return_value=(set(), set(), 3600.0)
-                ),
+                    drive, "production_repo_map", return_value={"app": "acme/app"}
+                ) as built_map,
+                mock.patch.object(drive, "production_stuck_inputs", built["stuck"]),
+                mock.patch.object(drive, "production_finished_for", built["finished"]),
+                mock.patch.object(drive, "production_agent_roles", return_value={}),
+                mock.patch.object(drive, "production_orphan_inputs", built["orphan"]),
                 mock.patch.object(drive, "production_operators", return_value=({}, None)),
                 mock.patch.object(
                     drive,
@@ -591,10 +1302,10 @@ class HoldLabelWiringTest(unittest.TestCase):
                 del os.environ["KORAPY_STATE"]
             else:
                 os.environ["KORAPY_STATE"] = old
-        return code, seen, launcher_seen, loaded
+        return code, seen, launcher_seen, loaded, built, built_map
 
     def test_a_plan_reads_the_hold_label_once_and_passes_it_in(self):
-        code, seen, _, loaded = self.passing_cmd(plan=True)
+        code, seen, _, loaded, _, _ = self.passing_cmd(plan=True)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
         self.assertEqual(seen.get("agent_tickets"), {})
@@ -602,7 +1313,7 @@ class HoldLabelWiringTest(unittest.TestCase):
         self.assertEqual(loaded.call_count, 1)
 
     def test_a_claiming_pass_reads_the_hold_label_once_and_passes_it_in(self):
-        code, seen, launcher_seen, loaded = self.passing_cmd(plan=False)
+        code, seen, launcher_seen, loaded, _, _ = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
         self.assertEqual(seen.get("agent_tickets"), {})
@@ -610,9 +1321,103 @@ class HoldLabelWiringTest(unittest.TestCase):
         self.assertEqual(loaded.call_count, 1)
 
     def test_a_claiming_pass_reads_max_starts_from_the_resolved_settings(self):
-        code, seen, _, _ = self.passing_cmd(plan=False)
+        code, seen, _, _, _, _ = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("max_starts"), 50)
+
+    def test_a_plan_builds_one_repo_map_and_threads_it_to_every_builder(self):
+        code, seen, _, _, built, built_map = self.passing_cmd(plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(built_map.call_count, 1)
+        for name in ("stuck", "finished", "orphan"):
+            self.assertEqual(built[name].call_args.kwargs.get("mapping"), {"app": "acme/app"}, name)
+
+    def test_the_plan_pass_reads_the_same_projects_the_map_was_built_from(self):
+        code, seen, _, _, _, _ = self.passing_cmd(plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["projects_fn"](), [])
+
+    def test_a_claiming_pass_threads_the_same_map_into_the_pass(self):
+        code, seen, _, _, _, built_map = self.passing_cmd(plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(built_map.call_count, 1)
+
+    def test_a_claiming_pass_reads_the_same_projects_the_map_was_built_from(self):
+        code, seen, _, _, _, _ = self.passing_cmd(plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["projects_fn"](), [])
+
+
+class ClaimingPassResolvesOnceTest(unittest.TestCase):
+    """The claiming pass resolves short-to-tracker once per root and shares it.
+
+    One `repo_operators` call per registered root feeds the string
+    map, the operators and the tracker factory, so a config edit
+    between the builds cannot leave the factory without the map's
+    repo: the factory serves every repo the map names.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-once-")
+        self.addCleanup(self.tmp.cleanup)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.config = os.path.join(self.tmp.name, "config")
+        self.root = os.path.join(self.tmp.name, "ops")
+        os.makedirs(os.path.join(self.config, "projects.d"))
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
+        with open(
+            os.path.join(self.config, "projects.d", "blue.toml"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(f"name = 'blue'\nunit_prefix = 'blue-agent-'\nroot = {self.root!r}\n")
+        store = stored(os.path.join(self.state, "board.sqlite"), [])
+        store.close()
+        self.seen = {}
+        self.out, self.err = io.StringIO(), io.StringIO()
+        env = {"KORAPY_STATE": self.state, "KORAPY_CONFIG": self.config}
+        self._env_patch = mock.patch.dict(os.environ, env)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+
+    def test_one_resolution_feeds_the_map_the_operators_and_the_factory(self):
+        real_operators = syncli.repo_operators
+        calls = []
+
+        def counting(root, names, git):
+            calls.append(root)
+            return real_operators(root, names, git)
+
+        def fake_run_pass(**kwargs):
+            self.seen.update(kwargs)
+            return 0
+
+        with (
+            mock.patch.object(syncli, "repo_operators", side_effect=counting),
+            mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0, {})),
+            mock.patch.object(drive, "production_finished_for", return_value={}),
+            mock.patch.object(drive, "production_agent_roles", return_value={}),
+            mock.patch.object(
+                drive, "production_orphan_inputs", return_value=(set(), set(), 3600.0)
+            ),
+            mock.patch.object(drive, "production_launcher", return_value=mock.MagicMock()),
+            mock.patch.object(drive, "production_stopper", return_value=None),
+            mock.patch.object(drive, "run_pass", side_effect=fake_run_pass),
+            mock.patch.object(drive.sys, "stdout", self.out),
+            mock.patch.object(drive.sys, "stderr", self.err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [self.root])
+        self.assertEqual(self.seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(self.seen.get("operators"), {"acme/app": ["acme"]})
+        factory = self.seen.get("tracker_factory")
+        self.assertIsNotNone(factory)
+        assert factory is not None
+        for repo in self.seen["repo_map"].values():
+            self.assertIsNotNone(factory(repo))
 
 
 class DriveSyncExitTest(unittest.TestCase):

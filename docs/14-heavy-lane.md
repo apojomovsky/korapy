@@ -77,8 +77,8 @@ changed spelling; the sixth is deferred with reasons.
    command and role, a conservative cold-start default,
    recency weighting with a small-sample rule, a changed
    command as a new key, and starved samples excluded from
-   duration learning. Hand-tuned weights stay only as the
-   first-run default.
+   duration and CPU-rate learning. Hand-tuned weights stay
+   only as the first-run default.
 4. **Pressure-aware admission.** Adopted as specified:
    pressure delays admission and never touches a running job
    (section 7). The readers already exist
@@ -256,11 +256,15 @@ Purpose: regenerate the portable per-key summary
 (section 6.5) from the raw ledger files.
 
 Arguments: `[--out PATH]`. Standard output always carries
-the rollup JSON document; `--out PATH` additionally writes
-the same bytes atomically to the given path. Exit 0 with
-an empty key set when the ledger is empty (nothing learned
-yet, not a failure), 4 on usage. The verb never commits;
-the operator commits the copy it points at.
+the rollup JSON document, and the verb refreshes the
+default file at `heavy.rollup_path()`
+(`<state>/heavy/rollup.json`) with the same bytes and
+writes them to the path given by `--out PATH` when one is
+given; both writes are atomic
+(`paths.atomic_write_text`). Exit 0 with an empty key set
+when the ledger is empty (nothing learned yet, not a
+failure), 4 on usage. The verb never commits; the operator
+commits the copy it points at.
 
 ## 4. State: files and single resolvers
 
@@ -503,7 +507,8 @@ Estimates are robust statistics over the raw rows per
 a hand reader with `jq` can reproduce them. Rules:
 
 - Window: the trailing 20 rows of the key within the
-  trailing 90 days. Duration sets (`wall_s`) exclude rows
+  trailing 90 days. Duration sets (`wall_s`) and CPU
+  parallelism sets (`cpu_s` over `wall_s`) exclude rows
   flagged starved; peak sets (`peak_mb`) use all rows.
 - Small samples: with fewer than 3 rows, the prediction is
   the maximum observed, not an average. A first heavy
@@ -574,11 +579,11 @@ The derived per-key summary is a separate small file meant
 to be committed to a project's private ops repository, so
 a fresh clone or a new host starts with warm estimates:
 `korapy heavy rollup [--out PATH]` (PROPOSED) regenerates
-it from the raw files. The default path resolves through
-`heavy.rollup_path()` (`<state>/heavy/rollup.json`);
-`--out` writes a copy wherever the operator points it, and
-the operator commits it. korapy never commits anything
-itself. The rollup carries its `schema_version`, its
+it from the raw files and refreshes the default file,
+resolved through `heavy.rollup_path()`
+(`<state>/heavy/rollup.json`); `--out` writes a copy
+wherever the operator points it, and the operator commits
+it. korapy never commits anything itself. The rollup carries its `schema_version`, its
 source range, and per key the peak p50 and p90, the
 duration p50 and p90, the sample count, the flaky flag,
 and the portable work figures below. It holds hashes,
@@ -922,7 +927,10 @@ AGENTS.md). Later tickets build on earlier ones.
    pid-liveness and clock seams. Criteria: backfill
    admits a small job past a big head; the skip bound
    stops starvation; a reaped holder frees its weight
-   with no ledger row; pid reuse leaks nothing.
+   with no ledger row; pid reuse leaks nothing. Note from
+   ticket 2: until this ticket lands, a waiter row that
+   outlives its owner can wedge the lane head until manual
+   repair; the stale-waiter reaping here cures that window.
 4. The estimator and the rollup verb. Per-cgroup capture
    through injected readers, the section 6.3 rules
    (median plus p90, small-sample maximum, starved
@@ -940,7 +948,11 @@ AGENTS.md). Later tickets build on earlier ones.
    for lane health, stuck-waiter and stuck-holder rows,
    bypass counts, the corrupt-`lane.json` row.
    Criteria: saturated refuses while shares are free;
-   absent files read unknown; every row renders.
+   absent files read unknown; every row renders. Note from
+   ticket 2: the lane budget is resolved once per run, not
+   every admit pass, while section 4 says admission resolves
+   the live budget from settings every pass; this ticket owns
+   re-resolving per pass.
 6. Bypass, roles, journal surface and docs. `--bypass`
    with required reason, `--role` with the takeoff
    default through the module call, `recent[]` ring,

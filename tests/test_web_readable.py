@@ -1,0 +1,323 @@
+"""Ticket 525: the dashboard reads plainly (content, clarity, visual pass).
+
+Rendering-only change: the snapshot document keeps its stable schema
+(pinned below); only the page text and styling move. Source-discipline
+tests over the packaged `korapy/web/` files, the same pattern as
+`test_webui.py`: no JS runner, no network beyond loopback, no real state
+dirs. One test class per ticket point, then the visual-pass pins.
+"""
+
+import copy
+import unittest
+from importlib import resources
+
+from korapy import drive, snapshot
+from tests.test_serve import DRIVE, ServeCase
+from tests.test_snapshot import (
+    HOST,
+    T0,
+    config,
+    doc_limits,
+    doc_pressure,
+    entry,
+    quota_view,
+    usage,
+    view,
+)
+
+
+def web_text(name):
+    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
+
+
+def function_body(source, name):
+    """The text of `function name(...)` through its closing brace line."""
+    import re
+
+    match = re.search(
+        r"(?:export )?function " + re.escape(name) + r"\(.*?^\}",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert match is not None, "no function " + name
+    return match.group(0)
+
+
+def build_doc():
+    rows = view((entry("a1"), "live"))
+    made = snapshot.resources_section(
+        rows,
+        HOST,
+        doc_limits(),
+        doc_pressure(),
+        [],
+        lambda *args: None,
+        live_by_owner={"proj-a": ["a1"]},
+        project_names={"proj-a"},
+    )
+    return snapshot.build(
+        T0, HOST, rows, quota_view(), config(), usage, copy.deepcopy(DRIVE), resources_view=made
+    )
+
+
+class SnapshotSchemaUnchanged(ServeCase):
+    """Ticket 651 grows the document: the panel sections and the new
+    row and header facts below. Anything else still changes nothing."""
+
+    def test_top_level_and_header_keys_are_stable(self):
+        self.assertEqual(
+            set(build_doc()),
+            {
+                "schema_version",
+                "fleet_header",
+                "agents",
+                "quota",
+                "capacity",
+                "resources",
+                "disk",
+                "drive",
+                "attention",
+                "plan",
+            },
+        )
+
+    def test_fleet_header_keys_are_stable(self):
+        self.assertEqual(
+            set(build_doc()["fleet_header"]),
+            {
+                "host",
+                "now",
+                "tz_offset_s",
+                "now_iso",
+                "agents_live",
+                "agents_stale",
+                "agents_finished",
+            },
+        )
+
+
+class AgentCount(unittest.TestCase):
+    """Point 1: the strip headlines live, stale and finished counts."""
+
+    def test_strip_headlines_live_stale_and_finished(self):
+        body = function_body(web_text("views.js"), "stripSegments")
+        for bit in ("agents_live", "agents_stale", "agents_finished"):
+            self.assertIn(bit, body)
+
+    def test_collapsed_finished_history(self):
+        views = web_text("views.js")
+        self.assertIn("finished (history)", views)
+        self.assertIn("isFinishedRow", views)
+        self.assertIn('"details"', views)
+        self.assertIn('"summary"', views)
+
+    def test_only_finished_rows_sit_behind_the_toggle(self):
+        # An unknown future state must stay visible, never wear the
+        # finished label: only an explicit finished state collapses.
+        views = web_text("views.js")
+        self.assertIn('row.state === "finished"', views)
+
+    def test_finished_toggle_survives_rerenders(self):
+        views = web_text("views.js")
+        self.assertIn('addEventListener("toggle"', views)
+
+    def test_strip_says_finished_is_history(self):
+        views = web_text("views.js")
+        self.assertIn("Finished entries are history, not agents.", views)
+
+
+class QuotaAge(unittest.TestCase):
+    """Point 2: the reading's age in words, stale marked and explained."""
+
+    def test_quota_read_format_helper_exists(self):
+        fmt = web_text("fmt.js")
+        self.assertIn("export function formatQuotaRead(", fmt)
+        self.assertIn("export function formatCountdown(", fmt)
+        self.assertIn("export function formatResetLine(", fmt)
+
+    def test_quota_card_explains_stale_and_refresh(self):
+        views = web_text("views.js")
+        self.assertIn("older than its freshness bound counts as stale", views)
+        self.assertIn("korapy quota refresh", views)
+
+    def test_quota_card_renders_the_snapshot_stale_reason(self):
+        # The card renders the snapshot's stale_reason field as-is;
+        # the words come from the server helper, never a second
+        # derivation in the page.
+        views = web_text("views.js")
+        self.assertIn("stale_reason", views)
+        self.assertIn("quotaProvider", views)
+
+    def test_window_reset_reads_as_local_time_with_countdown(self):
+        # The reset line is composed, not pasted: the local clock plus
+        # the countdown, so the suite pins the composition itself.
+        fmt = web_text("fmt.js")
+        self.assertIn(" local, ", fmt)
+        self.assertIn("formatCountdown(target, nowMs)", fmt)
+        self.assertIn("reset time not reported", fmt)
+        self.assertIn("due now", fmt)
+        views = web_text("views.js")
+        self.assertIn("formatResetLine(", views)
+
+
+class CapacityLabels(unittest.TestCase):
+    """Point 3: every capacity field labelled in plain words."""
+
+    def test_capacity_fields_are_labelled(self):
+        views = web_text("views.js")
+        for label in ("Agents running", "Per-repo limit", "Pending", "By project"):
+            self.assertIn(label, views)
+        self.assertNotIn("Total capacity", views)
+        self.assertNotIn("Per-repo cap", views)
+
+    def test_capacity_explains_each_field(self):
+        views = web_text("views.js")
+        self.assertIn("of the host's total allowance", views)
+        self.assertIn("no per-repo limit", views)
+        self.assertIn("The host does not track a queue yet.", views)
+
+
+class ResourceBars(unittest.TestCase):
+    """Point 4: labelled budget/charged/measured bars with spelled-out units."""
+
+    def test_unit_format_helpers_exist(self):
+        fmt = web_text("fmt.js")
+        self.assertIn("export function formatCpu(", fmt)
+        self.assertIn("export function formatMem(", fmt)
+        self.assertIn("millicores", fmt)
+        self.assertIn("cores", fmt)
+
+    def test_gauge_cards_explain_the_reservation_tick(self):
+        views = web_text("views.js")
+        self.assertIn("tick inside is the share the loop reserved", views)
+        self.assertIn("of the host", views)
+
+    def test_bare_field_names_are_replaced_by_labels(self):
+        views = web_text("views.js")
+        self.assertIn('"abbr"', views)
+        self.assertIn("central processing unit", views)
+
+
+class DriveSection(unittest.TestCase):
+    """Point 5: the dispatch loop names itself and explains every field."""
+
+    def test_drive_is_named_the_dispatch_loop(self):
+        views = web_text("views.js")
+        self.assertIn("Dispatch loop", views)
+
+    def test_drive_fields_are_labelled_with_help(self):
+        views = web_text("views.js")
+        for label in ("Status", "Last pass", "Last result", "Daily budget"):
+            self.assertIn(label, views)
+        self.assertIn("starts today", views)
+        self.assertIn("Resumes and plans never count.", views)
+
+    def test_last_exit_reads_as_words(self):
+        fmt = web_text("fmt.js")
+        self.assertIn("export function exitWord(", fmt)
+        self.assertIn("finished cleanly", fmt)
+
+    def test_pause_help_names_the_pause_file(self):
+        # The card renders the snapshot's pause_file, which the drive
+        # section reports from drive.PAUSE_NAME (pinned in
+        # test_web_polish.py), so the page never carries its own copy.
+        views = web_text("views.js")
+        self.assertIn("pause_file", views)
+        self.assertTrue(drive.PAUSE_NAME)
+
+
+class SectionHelp(unittest.TestCase):
+    """Point 6: every section describes itself; errors say what to do."""
+
+    def test_every_card_carries_a_one_line_description(self):
+        views = web_text("views.js")
+        for desc in (
+            "Agents on this host right now.",
+            "What the providers last reported.",
+            "How many agents this host may run.",
+            "Host load from the kernel, per core.",
+            "Host memory used from MemTotal and MemAvailable.",
+            "Only items that need a human.",
+            "Free space on the state and cache disks.",
+            "The drive pass: sync boards, claim tickets, start agents.",
+        ):
+            self.assertIn(desc, views)
+
+    def test_abbreviations_carry_tooltips(self):
+        views = web_text("views.js")
+        self.assertIn('"abbr"', views)
+        self.assertIn("central processing unit", views)
+        self.assertIn('setAttribute("title"', views)
+
+    def test_error_cards_say_what_to_do(self):
+        views = web_text("views.js")
+        self.assertIn("korapy doctor", views)
+
+    def test_empty_agents_says_how_to_start_one(self):
+        views = web_text("views.js")
+        self.assertIn("korapy launch", views)
+
+
+class VisualPass(unittest.TestCase):
+    """The visual pass: grid, meters, table, themes, small screens."""
+
+    def test_cards_lay_out_as_a_grid_with_a_full_width_banner(self):
+        css = web_text("app.css")
+        self.assertIn("grid-template-columns", css)
+        self.assertIn("#attention", css)
+
+    def test_meters_have_ok_low_stale_states(self):
+        css = web_text("app.css")
+        for state in (".meter.ok", ".meter.low", ".meter.stale"):
+            self.assertIn(state, css)
+        views = web_text("views.js")
+        for state in ('"meter ok"', '"meter low"', '"meter stale"'):
+            self.assertIn(state, views)
+
+    def test_agents_render_as_a_table_with_phone_cards(self):
+        views = web_text("views.js")
+        for tag in ('"table"', '"thead"', '"tbody"', '"details"'):
+            self.assertIn(tag, views)
+        css = web_text("app.css")
+        # Narrow screens show one card per row: the ticket and state
+        # lead on the first line, the note sits below, the rest reads
+        # as compact inline meta, never a label-per-field list.
+        for cls in (".c-ticket", ".c-state", ".c-note"):
+            self.assertIn(cls, css)
+        self.assertNotIn("attr(data-th)", css)
+
+    def test_themes_and_figures_stay(self):
+        css = web_text("app.css")
+        self.assertIn("prefers-color-scheme", css)
+        self.assertIn("tabular-nums", css)
+
+    def test_narrow_layout_stays_single_column(self):
+        css = web_text("app.css")
+        self.assertIn("@media (max-width: 700px)", css)
+
+    def test_full_disk_reads_high_like_full_budget(self):
+        # Disk bars band through the same cuts as every other bar, so
+        # full never reads as low usage and NaN never reads as healthy.
+        views = web_text("views.js")
+        self.assertIn("meter(used, bandFor(used),", views)
+
+    def test_no_second_poll_loop_appears(self):
+        app = web_text("app.js")
+        self.assertNotIn("setInterval", app)
+
+    def test_shipped_bytes_stay_under_the_maintainer_cap(self):
+        # Ticket 659 split the gauge figures (short figure plus small
+        # detail line, and durations for running-for) and the cap with
+        # it: 160 KB total. Ticket 651 adds the data panels (derived
+        # states, plan band, honest quota, sort menu,
+        # placeholders) and the cap with it: 170 KB total, still no
+        # framework, no build step, no images.
+        total = sum(
+            len(resources.files("korapy").joinpath(f"web/{name}").read_bytes())
+            for name in ("index.html", "app.css", "app.js", "api.js", "fmt.js", "views.js")
+        )
+        self.assertLessEqual(total, 170 * 1024)
+
+
+if __name__ == "__main__":
+    unittest.main()

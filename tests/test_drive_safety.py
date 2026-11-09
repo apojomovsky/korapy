@@ -505,6 +505,42 @@ class DriveStatusTest(unittest.TestCase):
         self.assertTrue(status["paused"])
         self.assertEqual(status["pause_reason"], "operator break")
 
+    def test_status_lists_waited_tickets_in_journal_order(self):
+        os.makedirs(os.path.dirname(self.paths["journal_path"]), exist_ok=True)
+        with open(self.paths["journal_path"], "w", encoding="utf-8") as handle:
+            handle.write('{"event": "pass_start", "at": 1}\n')
+            handle.write(
+                '{"event": "skip", "at": 2, "project": "p", "ticket": "app#7",'
+                ' "code": "cap",'
+                ' "reason": "app#7: day cap reached (1 of 1 today), not started"}\n'
+            )
+            handle.write(
+                '{"event": "skip", "at": 3, "project": "p", "ticket": "app#9",'
+                ' "code": "cap",'
+                ' "reason": "app#9: day cap reached (1 of 1 today), not started"}\n'
+            )
+            handle.write(
+                '{"event": "pass_end", "at": 4, "exit": 0, "started": 0,'
+                ' "skipped_by_reason": {}, "released": 0, "gave_up": 0}\n'
+            )
+        status = self.status()
+        self.assertEqual(status["skipped_by_reason"], {"cap": 2})
+        self.assertEqual(
+            status["waits"],
+            [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: day cap reached (1 of 1 today), not started",
+                },
+                {
+                    "ticket": "app#9",
+                    "code": "cap",
+                    "reason": "app#9: day cap reached (1 of 1 today), not started",
+                },
+            ],
+        )
+
     def test_held_lock_shows_in_status(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)

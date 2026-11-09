@@ -6,15 +6,21 @@ to a temporary directory, and injected plain-data inputs for every
 host read, so nothing reaches the network, subprocesses or real dirs.
 """
 
+import calendar
+import inspect
 import io
 import os
+from dataclasses import replace
 import tempfile
 import unittest
 from unittest import mock
 
-from korapy import accounts, admission, board, drive, projects, registry
+from korapy import accounts, admission, board, drive, eligibility, policies, projects, registry
 from korapy.eligibility import LinkedPull, StartRequest, TicketRow
-from tests.test_drive import policy_source, stored
+from korapy.github import tracker as ghtracker
+from tests.test_drive import driven_for, policy_source, stored
+from tests.test_eligibility import item as board_item
+from tests.test_tracker import FakeRun, FakeTracker, pr_payload, reading
 
 
 def request(repo="app", number=7, kind="start", weight=0.0):
@@ -29,6 +35,8 @@ def row(
     priority="",
     labels=(),
     external=False,
+    pulls=(),
+    claimed_at=None,
 ):
     return TicketRow(
         repo=repo,
@@ -38,7 +46,13 @@ def row(
         priority=priority,
         labels=labels,
         external=external,
+        pulls=pulls,
+        claimed_at=claimed_at,
     )
+
+
+def open_pull(number):
+    return LinkedPull(number=number, state="open")
 
 
 def requests_of(items):
@@ -651,6 +665,7 @@ class PassWiringTest(unittest.TestCase):
             "gone_s": 3600.0,
         }
         values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
         code = drive.run_pass(**values)
         return code, out.getvalue(), err.getvalue()
 
@@ -853,10 +868,966 @@ class PassWiringTest(unittest.TestCase):
                 now=2000.0,
                 projects_fn=lambda: [self.project("blue", entry)],
                 live=frozenset(),
+                driven={"blue": frozenset({"app"})},
             )
         self.assertEqual(code, 0)
         self.assertEqual(err.getvalue(), "")
         self.assertIn("app#7: start", out.getvalue())
+
+
+def lows_record():
+    return {"verdict": "approve-with-findings", "findings": [{"severity": "low", "text": "t"}]}
+
+
+def normal_record():
+    return {"verdict": "approve-with-findings", "findings": [{"severity": "normal", "text": "t"}]}
+
+
+class OpenPullGateTest(unittest.TestCase):
+    """The gate reads linked pulls from the row, never live.
+
+    Rows arrive with pulls populated from the tracker; the gate has no
+    pull seam of its own, so policies and the gate cannot disagree.
+    """
+
+    def test_a_fresh_start_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(row_=row(pulls=(open_pull(9),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+        self.assertIn("not a fresh start", gated.reason)
+
+    def test_an_unclaimed_fix_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(kind="fix", row_=row(pulls=(open_pull(9),))))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("skip", "start", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_an_unclaimed_resume_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(kind="resume", row_=row(pulls=(open_pull(9),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_a_fix_on_a_claimed_row_proceeds_despite_an_open_pull(self):
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x", pulls=(open_pull(9),))))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("pull #", gated.reason)
+
+    def test_a_review_proceeds_despite_an_open_pull(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=(open_pull(9),))),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+
+    def test_a_closed_linked_pull_does_not_block_a_start(self):
+        gated = gate(entry(row_=row(pulls=(LinkedPull(number=9, state="closed"),))))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_start_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(entry(row_=row(pulls=(LinkedPull(number=9, state="merged"),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_a_review_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=(LinkedPull(number=9, state="merged"),))),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_a_fix_on_a_claimed_row_with_a_merged_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="fix",
+                row_=row(agent="drive-host-1-x", pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_a_closed_row_is_withdrawn_as_merged(self):
+        gated = gate(entry(row_=row(state="closed")))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_two_open_linked_pulls_name_the_first(self):
+        gated = gate(entry(row_=row(pulls=(open_pull(9), open_pull(4)))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+        self.assertNotIn("#4", gated.reason)
+
+    def test_two_merged_linked_pulls_name_the_first(self):
+        pulls = (
+            LinkedPull(number=9, state="merged"),
+            LinkedPull(number=4, state="merged"),
+        )
+        gated = gate(entry(row_=row(pulls=pulls)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9", gated.reason)
+        self.assertIn("merged", gated.reason)
+        self.assertNotIn("#4", gated.reason)
+
+    def test_a_merged_pull_wins_over_an_open_pull(self):
+        pulls = (open_pull(9), LinkedPull(number=4, state="merged"))
+        gated = gate(entry(row_=row(pulls=pulls)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #4", gated.reason)
+        self.assertIn("merged", gated.reason)
+
+    def test_a_resume_with_a_merged_linked_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="resume",
+                row_=row(agent="drive-host-1-x", pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_a_fix_on_an_unclaimed_row_with_a_merged_pull_is_withdrawn(self):
+        gated = gate(
+            entry(
+                kind="fix",
+                row_=row(pulls=(LinkedPull(number=9, state="merged"),)),
+            )
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_a_merged_pull_names_merged_on_an_externally_owned_row(self):
+        # Gate order only: the pass never lists pulls for external rows,
+        # so production rows never carry both flags. The listed-row order
+        # still checks the merged link before external ownership.
+        gated = gate(entry(row_=row(external=True, pulls=(LinkedPull(number=9, state="merged"),))))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_the_start(self):
+        gated = gate(entry(row_=row(pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_review(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=None)),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_fix(self):
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_resume(self):
+        gated = gate(entry(kind="resume", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_names_the_cause(self):
+        candidate = entry(
+            row_=replace(row(pulls=None), pulls_error="tracker down"),
+        )
+        gated = gate(candidate)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+        self.assertIn("tracker down", gated.reason)
+
+    def test_no_linked_pulls_means_a_fresh_start(self):
+        gated = gate(entry(row_=row(pulls=())))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class PullsIndexMapTest(unittest.TestCase):
+    """One listing per repo feeds every ticket in the pass."""
+
+    def test_many_tickets_share_a_single_repo_listing(self):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state="open")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        keys = [("app", 7), ("app", 8), ("app", 9)]
+        found, calls, limited = drive.linked_pulls_map(keys, index_for, max_calls=20)
+        self.assertEqual([pull.number for pull in found[("app", 7)]], [9])
+        self.assertEqual([pull.state for pull in found[("app", 7)]], ["open"])
+        self.assertEqual(found[("app", 8)], ())
+        self.assertEqual(found[("app", 9)], ())
+        self.assertEqual(calls, 1)
+        self.assertFalse(limited)
+        self.assertEqual(fake.calls, [("pulls_index", "app", 20)])
+
+    def test_each_repo_lists_once(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7), ("api", 2)], index_for, max_calls=20
+        )
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(found[("api", 2)], ())
+        self.assertEqual(calls, 2)
+        self.assertFalse(limited)
+        self.assertEqual(
+            sorted(call[1] for call in fake.calls if call[0] == "pulls_index"),
+            ["api", "app"],
+        )
+
+    def test_an_unreadable_repo_maps_its_tickets_to_none(self):
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
+        self.assertIsNone(found[("app", 7)])
+        self.assertEqual(errors[("app", 7)], "tracker down")
+        self.assertFalse(limited)
+
+    def test_a_readable_repo_records_no_error(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(errors, {})
+        self.assertFalse(limited)
+
+    def test_non_pull_links_never_reach_the_row(self):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="issue", state="open")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        self.assertEqual(found[("app", 7)], ())
+
+    def test_a_repo_without_a_tracker_reads_as_no_pulls(self):
+        def missing(repo):
+            raise KeyError(repo)
+
+        index_for = drive.pulls_index_for(missing)
+        found, calls, limited = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(calls, 0)
+        self.assertFalse(limited)
+
+    def test_an_exhausted_budget_refuses_the_remaining_repos(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7), ("api", 2)], index_for, max_calls=1, errors=errors
+        )
+        self.assertEqual(calls, 1)
+        self.assertTrue(limited)
+        refused = [key for key in (("app", 7), ("api", 2)) if found[key] is None]
+        self.assertEqual(len(refused), 1)
+        for key in refused:
+            self.assertIn("pulls lookup limited", errors[key])
+
+    def test_an_incomplete_listing_refuses_its_repo(self):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state="open")]}
+        fake.index_truncated.add("app")
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
+        self.assertIsNone(found[("app", 7)])
+        self.assertIn("pulls lookup limited", errors[("app", 7)])
+        self.assertTrue(limited)
+
+
+class MergedSinceTest(unittest.TestCase):
+    """Each repo's closed-pull listing is cut at its oldest live claim.
+
+    The map builder derives the cutoff from the claim starts, per
+    repo: the oldest claim start bounds the listing, and a repo with
+    no live claim lists no closed pull requests at all.
+    """
+
+    def listing(self, seen):
+        def index_for(repo, budget, *, merged_since=None):
+            seen[repo] = merged_since
+            return {}, 1, True
+
+        return index_for
+
+    def test_the_oldest_live_claim_bounds_the_repo(self):
+        seen: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7), ("app", 8)],
+            self.listing(seen),
+            max_calls=20,
+            claims_by_key={("app", 7): 3000.0, ("app", 8): 2000.0},
+        )
+        self.assertEqual(seen, {"app": 2000.0})
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(calls, 1)
+        self.assertFalse(limited)
+
+    def test_each_repo_reads_its_own_oldest_claim(self):
+        seen: dict = {}
+        drive.linked_pulls_map(
+            [("app", 7), ("api", 2)],
+            self.listing(seen),
+            max_calls=20,
+            claims_by_key={("app", 7): 3000.0, ("api", 2): 1000.0},
+        )
+        self.assertEqual(seen, {"app": 3000.0, "api": 1000.0})
+
+    def test_a_repo_with_no_live_claim_lists_no_closed_pull(self):
+        seen: dict = {}
+        drive.linked_pulls_map(
+            [("app", 7), ("app", 8)],
+            self.listing(seen),
+            max_calls=20,
+            claims_by_key={("app", 7): None, ("app", 8): None},
+        )
+        self.assertEqual(seen, {"app": None})
+
+    def test_no_claims_map_lists_no_closed_pull(self):
+        seen: dict = {}
+        drive.linked_pulls_map([("app", 7)], self.listing(seen), max_calls=20)
+        self.assertEqual(seen, {"app": None})
+
+
+class PullsCheckNeededTest(unittest.TestCase):
+    """Only tickets a check could still start trigger a listing."""
+
+    def check(self, item, hold_label="hold"):
+        rows = eligibility.rows_from_items([item])
+        return drive.pulls_check_needed(rows[0], hold_label=hold_label)
+
+    def test_an_open_unclaimed_ticket_needs_the_check(self):
+        self.assertTrue(self.check(board_item()))
+
+    def test_a_closed_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(state="closed")))
+
+    def test_an_externally_owned_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(external=True)))
+
+    def test_a_held_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(labels=["hold"])))
+
+    def test_a_ticket_waiting_on_a_human_needs_no_check(self):
+        self.assertFalse(self.check(board_item(labels=["needs-decision"])))
+        self.assertFalse(self.check(board_item(labels=["needs-triage"])))
+
+    def test_a_ticket_claimed_by_a_managed_agent_needs_the_check(self):
+        self.assertTrue(self.check(board_item(agent="drive-host-1-abc-7")))
+
+    def test_a_foreign_claim_needs_no_check(self):
+        self.assertFalse(self.check(board_item(agent="human-1")))
+
+    def test_a_wanted_key_with_no_row_needs_no_check(self):
+        self.assertFalse(drive.pulls_check_needed(None, hold_label="hold"))
+
+
+class LinkedPullAgreementTest(unittest.TestCase):
+    """Policy and gate read the one tracker-sourced row pulls.
+
+    A ticket with an open linked pull is startable by neither: the
+    policy selects nothing and the gate skips naming the pull.
+    """
+
+    def tracked_rows(self, state="open"):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state=state)]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        items = [board_item()]
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        rows = eligibility.rows_from_items(items, pulls_by_key=found)
+        return fake, rows
+
+    def test_an_open_linked_pull_is_not_startable_by_policy_or_gate(self):
+        _, rows = self.tracked_rows()
+        self.assertEqual(policies.basic(rows, now=1000.0), [])
+        gated = gate(entry(row_=rows[0]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_a_merged_linked_pull_is_withdrawn_by_policy_and_gate(self):
+        _, rows = self.tracked_rows(state="merged")
+        self.assertEqual(policies.basic(rows, now=1000.0), [])
+        gated = gate(entry(row_=rows[0]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_policy_and_gate_share_a_single_repo_listing(self):
+        fake, rows = self.tracked_rows()
+        policies.basic(rows, now=1000.0)
+        gate(entry(row_=rows[0]))
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0][0], "pulls_index")
+
+    def test_the_gate_takes_no_pull_seam(self):
+        self.assertNotIn("pulls_for", inspect.signature(drive.gate).parameters)
+        self.assertNotIn("index_for", inspect.signature(drive.gate).parameters)
+
+    def test_a_hold_label_on_a_linked_pull_names_the_pull(self):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="closed")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        items = [board_item()]
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        (built,) = eligibility.rows_from_items(items, pulls_by_key=found)
+        gated = gate(
+            entry(row_=built),
+            read_labels=labels_for({("issue", "app", 7): [], ("pr", "app", 12): ["hold"]}),
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "hold"))
+        self.assertIn("app#12", gated.reason)
+
+
+class RealPullsChainTest(unittest.TestCase):
+    """Merged state through the production linked-pulls path. Real adapter, fake `gh`.
+
+    The listings the pass already reads carry merged pulls, so an open
+    ticket whose pull merged withdraws instead of starting a new round.
+    The `gh` seam is faked at the adapter boundary; everything above it
+    (the index, the row building, the policy and the gate) is production.
+    """
+
+    OPEN = "repos/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    CLOSED = "repos/app/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+    MERGE_ISO = "2026-11-07T12:00:00Z"
+    MERGE_AT = float(calendar.timegm((2026, 11, 7, 12, 0, 0, 0, 0, 0)))
+
+    def tracked_rows(self, claims=None):
+        if claims is None:
+            claims = {("app", 7): self.MERGE_AT - 100.0}
+        gh = FakeRun()
+        gh.add(self.OPEN, [pr_payload(10, "Work in flight.\n\nCloses #8")])
+        gh.add(
+            self.CLOSED,
+            [
+                pr_payload(
+                    9,
+                    "Landed.\n\nCloses #7",
+                    state="closed",
+                    updated_at=self.MERGE_ISO,
+                    merged_at=self.MERGE_ISO,
+                ),
+                pr_payload(11, "Abandoned.\n\nCloses #6", state="closed"),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        index_for = drive.pulls_index_for(lambda repo: adapter)
+        keys = [("app", 6), ("app", 7), ("app", 8)]
+        found, calls, limited = drive.linked_pulls_map(
+            keys, index_for, max_calls=20, claims_by_key=claims
+        )
+        items = [board_item(number=number) for _, number in keys]
+        rows = eligibility.rows_from_items(items, pulls_by_key=found, claims_by_key=claims)
+        return gh, calls, limited, dict(zip(("six", "seven", "eight"), rows))
+
+    def test_the_listing_costs_two_calls(self):
+        gh, calls, limited, _ = self.tracked_rows()
+        self.assertEqual(calls, 2)
+        self.assertFalse(limited)
+        self.assertEqual(gh.paths(), [self.OPEN, self.CLOSED])
+
+    def test_no_live_claim_lists_no_closed_pull(self):
+        gh, calls, limited, rows = self.tracked_rows(claims={})
+        self.assertEqual(calls, 1)
+        self.assertFalse(limited)
+        self.assertEqual(gh.paths(), [self.OPEN])
+        self.assertEqual(rows["seven"].pulls, ())
+
+    def test_a_merged_pull_reaches_the_row_as_merged(self):
+        _, _, _, rows = self.tracked_rows()
+        self.assertEqual(
+            rows["seven"].pulls,
+            (
+                LinkedPull(
+                    number=9,
+                    state="merged",
+                    updated_at=self.MERGE_AT,
+                    merged_at=self.MERGE_AT,
+                ),
+            ),
+        )
+
+    def test_a_closed_unmerged_pull_never_reaches_the_row(self):
+        _, _, _, rows = self.tracked_rows()
+        self.assertEqual(rows["six"].pulls, ())
+
+    def test_policy_and_gate_withdraw_the_merged_ticket(self):
+        _, _, _, rows = self.tracked_rows()
+        ordered = [rows["six"], rows["seven"], rows["eight"]]
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic(ordered, now=1000.0)],
+            [("app", 6)],
+        )
+        gated = gate(entry(number=7, row_=rows["seven"]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_the_open_ticket_still_refuses_as_open(self):
+        _, _, _, rows = self.tracked_rows()
+        gated = gate(entry(number=8, row_=rows["eight"]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #10 is open", gated.reason)
+
+    def test_the_closed_unmerged_ticket_still_starts(self):
+        _, _, _, rows = self.tracked_rows()
+        gated = gate(entry(number=6, row_=rows["six"]))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class MergedScopeTest(unittest.TestCase):
+    """Merged scope through the production linked-pulls path.
+
+    The pass lists each repo once and builds every row from that one
+    map, so these tests program the tracker double (the merge time on
+    the pull, the claim start beside the row) and let the real
+    `pulls_index_for`, `linked_pulls_map`, `rows_from_items`, policy
+    and gate decide. A merge newer than the ticket's claim start
+    withdraws every kind; a merge older than the claim start reads as
+    landed-before-this-round, so a re-claimed ticket stays startable.
+    A ticket with no claim withdraws, as before.
+    """
+
+    MERGE_AT = 3000.0
+    CLAIM_AT = 2000.0
+
+    def scoped_rows(self, merge_at, claimed_at=CLAIM_AT, agent="drive-host-1-x", pulled_at=None):
+        fake = FakeTracker()
+        fake.index["app"] = {
+            7: [
+                reading(
+                    "app",
+                    9,
+                    kind="pr",
+                    state="merged",
+                    updated_at=merge_at if pulled_at is None else pulled_at,
+                    merged_at=merge_at,
+                )
+            ]
+        }
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, _, _ = drive.linked_pulls_map(
+            [("app", 7)],
+            index_for,
+            max_calls=20,
+            claims_by_key={("app", 7): claimed_at} if claimed_at is not None else None,
+        )
+        items = [board_item(number=7, agent=agent)]
+        claims = {("app", 7): claimed_at} if claimed_at is not None else None
+        return eligibility.rows_from_items(items, pulls_by_key=found, claims_by_key=claims)
+
+    def test_a_newer_merge_withdraws_a_claimed_fix(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT)
+        self.assertEqual(policies.basic([row_], now=1000.0), [])
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+    def test_an_older_merge_lets_the_reclaimed_round_proceed(self):
+        (row_,) = self.scoped_rows(self.CLAIM_AT - 1000.0)
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic([row_], now=1000.0)],
+            [("app", 7)],
+        )
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("merged", gated.reason)
+
+    def test_a_merge_with_no_claim_withdraws(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT, claimed_at=None, agent="")
+        self.assertEqual(policies.basic([row_], now=1000.0), [])
+        gated = gate(entry(number=7, row_=row_))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+
+    def test_the_pull_times_reach_the_row(self):
+        (row_,) = self.scoped_rows(self.MERGE_AT)
+        self.assertEqual(
+            row_.pulls,
+            (
+                LinkedPull(
+                    number=9, state="merged", updated_at=self.MERGE_AT, merged_at=self.MERGE_AT
+                ),
+            ),
+        )
+
+    def test_a_later_update_does_not_rearm_an_old_merge(self):
+        (row_,) = self.scoped_rows(self.CLAIM_AT - 1000.0, pulled_at=self.MERGE_AT)
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic([row_], now=1000.0)],
+            [("app", 7)],
+        )
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("merged", gated.reason)
+
+
+class MergedScopeRealListingTest(unittest.TestCase):
+    """Merge time through the real adapter listing, faked `gh` below it.
+
+    End to end: the payload's `merged_at` rides the parse, the
+    per-repo index, the row and the gate. A pull merged before the
+    claim start proceeds even when a later comment moved its
+    `updated_at` past the claim, while a pull merged since the claim
+    start withdraws. The `gh` seam is faked at the adapter boundary;
+    everything above it is production.
+    """
+
+    OPEN = "repos/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+    CLOSED = "repos/app/pulls?state=closed&sort=updated&direction=desc&per_page=100"
+    MERGE_ISO = "2026-11-07T12:00:00Z"
+    CLAIM_ISO = "2026-11-08T12:00:00Z"
+    TOUCH_ISO = "2026-11-09T12:00:00Z"
+
+    def tracked_row(self, claimed_at, merged_iso, updated_iso):
+        gh = FakeRun()
+        gh.add(self.OPEN, [])
+        gh.add(
+            self.CLOSED,
+            [
+                pr_payload(
+                    9,
+                    "Landed.\n\nCloses #7",
+                    state="closed",
+                    merged_at=merged_iso,
+                    updated_at=updated_iso,
+                ),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        index_for = drive.pulls_index_for(lambda repo: adapter)
+        found, _, _ = drive.linked_pulls_map(
+            [("app", 7)],
+            index_for,
+            max_calls=20,
+            claims_by_key={("app", 7): claimed_at},
+        )
+        items = [board_item(number=7, agent="drive-host-1-x")]
+        (row_,) = eligibility.rows_from_items(
+            items, pulls_by_key=found, claims_by_key={("app", 7): claimed_at}
+        )
+        return gh, row_
+
+    def test_a_merge_before_the_claim_proceeds_despite_a_later_update(self):
+        merge_at = float(calendar.timegm((2026, 11, 7, 12, 0, 0, 0, 0, 0)))
+        touch_at = float(calendar.timegm((2026, 11, 9, 12, 0, 0, 0, 0, 0)))
+        claim_at = float(calendar.timegm((2026, 11, 8, 12, 0, 0, 0, 0, 0)))
+        gh, row_ = self.tracked_row(claim_at, self.MERGE_ISO, self.TOUCH_ISO)
+        self.assertEqual(gh.paths(), [self.OPEN, self.CLOSED])
+        self.assertEqual(
+            row_.pulls,
+            (LinkedPull(number=9, state="merged", updated_at=touch_at, merged_at=merge_at),),
+        )
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("merged", gated.reason)
+
+    def test_a_merge_since_the_claim_withdraws_through_the_real_listing(self):
+        claim_at = float(calendar.timegm((2026, 11, 8, 12, 0, 0, 0, 0, 0)))
+        touch_at = float(calendar.timegm((2026, 11, 9, 12, 0, 0, 0, 0, 0)))
+        gh, row_ = self.tracked_row(claim_at, self.TOUCH_ISO, self.TOUCH_ISO)
+        self.assertEqual(gh.paths(), [self.OPEN, self.CLOSED])
+        self.assertEqual(
+            row_.pulls,
+            (LinkedPull(number=9, state="merged", updated_at=touch_at, merged_at=touch_at),),
+        )
+        gated = gate(entry(number=7, kind="fix", row_=row_))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merged", gated.reason)
+        self.assertIn("pull #9", gated.reason)
+
+
+class ReviewThresholdGateTest(unittest.TestCase):
+    def reviewed(self, role="reviewer"):
+        return {("app", 7): ("drive-r-1", role)}
+
+    def test_a_fix_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_start_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_review_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(kind="review"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_plain_approve_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): {"verdict": "approve", "findings": []}},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_normal_finding_still_opens_a_fix_round(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): normal_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+        self.assertIn("fresh start", gated.reason)
+
+    def test_a_normal_finding_below_a_high_threshold_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): normal_record()},
+            fix_threshold="high",
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_falsy_threshold_falls_back_to_the_default(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold="",
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_an_unset_threshold_grades_against_the_default(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold=None,
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_block_verdict_still_opens_a_fix_round(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): {"verdict": "block", "findings": []}},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_low_threshold_keeps_lows_fixing(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold="low",
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_new_work_after_a_lows_review_is_not_merge_ready(self):
+        gated = gate(
+            entry(kind="review"),
+            finished={("app", 7): ("drive-w-2", "worker")},
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+
+    def test_a_fix_on_a_claimed_row_ignores_the_threshold(self):
+        gated = gate(
+            entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            finished={("app", 7): ("drive-r-1", "reviewer")},
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+
+    def test_no_record_keeps_todays_fix_round(self):
+        gated = gate(entry(kind="fix"), finished=self.reviewed())
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class MissingReviewRecordGateTest(unittest.TestCase):
+    def reviewed_ok(self):
+        return {("app", 7): ("drive-r-1", "reviewer", "ok")}
+
+    def test_a_start_with_a_finished_reviewer_and_no_record_is_review_missing(self):
+        gated = gate(entry(), finished=self.reviewed_ok(), reviews={})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "review-missing"))
+        self.assertIn("reviewer finished without a review record", gated.reason)
+        self.assertIn("review missing", gated.reason)
+
+    def test_review_fix_and_resume_with_no_record_never_open_work(self):
+        for kind in ("review", "fix", "resume"):
+            with self.subTest(kind=kind):
+                gated = gate(entry(kind=kind), finished=self.reviewed_ok(), reviews={})
+                self.assertEqual((gated.verdict, gated.code), ("skip", "review-missing"))
+                self.assertIn("review missing", gated.reason)
+
+    def test_a_finished_reviewer_with_a_record_stays_merge_ready(self):
+        gated = gate(
+            entry(),
+            finished=self.reviewed_ok(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_failed_reviewer_without_a_record_keeps_todays_behavior(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished={("app", 7): ("drive-r-1", "reviewer", "failed")},
+            reviews={},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_no_review_map_means_no_missing_record_check(self):
+        gated = gate(entry(kind="fix"), finished=self.reviewed_ok())
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_pair_without_an_outcome_keeps_todays_behavior(self):
+        gated = gate(
+            entry(),
+            finished={("app", 7): ("drive-r-1", "reviewer")},
+            reviews={},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_kept_claim_never_skips_as_review_missing(self):
+        for kind in ("start", "review", "fix", "resume"):
+            with self.subTest(kind=kind):
+                gated = gate(
+                    entry(kind=kind, row_=row(agent="drive-r-1")),
+                    finished=self.reviewed_ok(),
+                    reviews={},
+                )
+                self.assertNotEqual(gated.code, "review-missing")
+
+    def test_a_short_finished_entry_reads_as_unreviewed(self):
+        gated = gate(entry(), finished={("app", 7): ("drive-r-1",)}, reviews={})
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class MissingReviewRecordsTest(unittest.TestCase):
+    def finished_ok(self):
+        return {("app", 7): ("drive-r-1", "reviewer", "ok")}
+
+    def test_an_unheld_open_row_lists_the_finished_reviewer(self):
+        found = drive.missing_review_records(self.finished_ok(), {}, {("app", 7): row()})
+        self.assertEqual(found, [("app", 7, "drive-r-1")])
+
+    def test_a_kept_claim_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(agent="drive-r-1")}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_closed_row_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(state="closed")}
+        )
+        self.assertEqual(found, [])
+
+    def test_an_external_row_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(external=True)}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_ticket_without_a_row_lists_nothing(self):
+        self.assertEqual(drive.missing_review_records(self.finished_ok(), {}, {}), [])
+
+    def test_a_recorded_review_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {("app", 7): lows_record()}, {("app", 7): row()}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_failed_reviewer_lists_nothing(self):
+        finished = {("app", 7): ("drive-r-1", "reviewer", "failed")}
+        found = drive.missing_review_records(finished, {}, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_no_review_map_lists_nothing(self):
+        found = drive.missing_review_records(self.finished_ok(), None, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_no_finished_map_lists_nothing(self):
+        found = drive.missing_review_records(None, {}, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_a_row_outside_the_driven_repos_lists_nothing(self):
+        finished = {("foreign", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("foreign", 7): row(repo="foreign", number=7)}
+        found = drive.missing_review_records(finished, {}, rows, driven={"blue": ("app",)})
+        self.assertEqual(found, [])
+
+    def test_a_row_inside_the_driven_repos_still_lists(self):
+        finished = {("app", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("app", 7): row(repo="app", number=7)}
+        found = drive.missing_review_records(finished, {}, rows, driven={"blue": ("app",)})
+        self.assertEqual(found, [("app", 7, "drive-r-1")])
+
+    def test_a_row_outside_a_two_project_union_lists_nothing(self):
+        finished = {("third", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("third", 7): row(repo="third", number=7)}
+        found = drive.missing_review_records(
+            finished, {}, rows, driven={"blue": ("app",), "green": ("other",)}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_row_in_the_second_project_repo_still_lists(self):
+        finished = {("other", 7): ("drive-r-1", "reviewer", "ok")}
+        rows = {("other", 7): row(repo="other", number=7)}
+        found = drive.missing_review_records(
+            finished, {}, rows, driven={"blue": ("app",), "green": ("other",)}
+        )
+        self.assertEqual(found, [("other", 7, "drive-r-1")])
+
+    def test_only_unheld_open_rows_list_in_ticket_order(self):
+        finished = {
+            ("app", 9): ("drive-r-9", "reviewer", "ok"),
+            ("app", 7): ("drive-r-1", "reviewer", "ok"),
+            ("app", 8): ("drive-r-8", "reviewer", "ok"),
+        }
+        rows = {
+            ("app", 9): row(number=9),
+            ("app", 7): row(agent="drive-r-1"),
+            ("app", 8): row(number=8),
+        }
+        self.assertEqual(
+            drive.missing_review_records(finished, {}, rows),
+            [("app", 8, "drive-r-8"), ("app", 9, "drive-r-9")],
+        )
+
+    def test_log_skips_a_row_outside_the_driven_repos(self):
+        out = io.StringIO()
+        count = drive.log_missing_reviews(
+            out,
+            {("foreign", 7): ("drive-r-1", "reviewer", "ok")},
+            {},
+            {("foreign", 7): row(repo="foreign", number=7)},
+            driven={"blue": ("app",)},
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":

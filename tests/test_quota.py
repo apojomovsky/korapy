@@ -422,6 +422,34 @@ class StaleAfterForTest(unittest.TestCase):
         self.assertEqual(quota.stale_after_for({}, pool), accounts.DEFAULT_STALE_AFTER_S)
 
 
+class RefreshAfterForTest(unittest.TestCase):
+    def test_derives_half_the_strictest_stale_bound(self):
+        pool = [provider("a", 900.0)]
+        self.assertEqual(
+            quota.refresh_after_for({"worker": ["a/model"]}, pool),
+            450.0,
+        )
+
+    def test_follows_the_strictest_chained_provider(self):
+        pool = [provider("a", 3600.0), provider("tired", 60.0)]
+        self.assertEqual(
+            quota.refresh_after_for({"worker": ["tired/model", "a/model"]}, pool),
+            30.0,
+        )
+
+    def test_an_explicit_override_wins_over_the_derived_half(self):
+        pool = [provider("a", 900.0)]
+        self.assertEqual(
+            quota.refresh_after_for({"worker": ["a/model"]}, pool, override=60),
+            60.0,
+        )
+
+    def test_an_unset_setting_derives_while_a_set_value_overrides(self):
+        self.assertIsNone(quota.refresh_override(settings.resolve(host={}, env={})))
+        resolved = settings.resolve(host={"quota": {"refresh_after_s": 60}}, env={})
+        self.assertEqual(quota.refresh_override(resolved), 60.0)
+
+
 class QuotaSettings(unittest.TestCase):
     def test_low_pct_defaults_to_90(self):
         self.assertEqual(settings.REGISTRY["quota.low_pct"].default, 90)
@@ -429,13 +457,20 @@ class QuotaSettings(unittest.TestCase):
     def test_unknown_blocks_defaults_to_false(self):
         self.assertEqual(settings.REGISTRY["quota.unknown_blocks"].default, False)
 
+    def test_refresh_after_s_defaults_to_900(self):
+        self.assertEqual(settings.REGISTRY["quota.refresh_after_s"].default, 900)
+
     def test_quota_registers_its_settings(self):
         self.assertIn("korapy.quota", settings.PROVIDERS)
 
     def test_a_host_file_may_set_quota_keys(self):
-        resolved = settings.resolve(host={"quota": {"low_pct": 95, "unknown_blocks": True}}, env={})
+        resolved = settings.resolve(
+            host={"quota": {"low_pct": 95, "unknown_blocks": True, "refresh_after_s": 60}},
+            env={},
+        )
         self.assertEqual(resolved["quota.low_pct"], 95)
         self.assertEqual(resolved["quota.unknown_blocks"], True)
+        self.assertEqual(resolved["quota.refresh_after_s"], 60)
 
 
 if __name__ == "__main__":

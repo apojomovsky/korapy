@@ -255,17 +255,21 @@ Purpose: merge one pull request after proving it is mergeable,
 serially, with every precondition reported as data. The forge-side
 half of landing; `push` stays the worktree-side half.
 
-Arguments: `REPO PR --head SHA [--method squash] [--skip CHECK]
-[--json] [--plan]`. `REPO` is `owner/name`; `PR` the pull request
-number. `--head` is required: the exact head SHA the caller
-approved. `--method` takes one value today, `squash`; anything
-else is exit 4, so the flag exists for later extension without
-breaking callers. `--skip` names only `checks`, with the same
+Arguments: `REPO PR --head SHA [--method squash|merge] [--skip CHECK]
+[--json] [--plan] [--wait] [--timeout SECS]`. `REPO` is `owner/name`;
+`PR` the pull request number. `--head` is required: the exact head
+SHA the caller approved. `--method` is `squash` or `merge` and
+defaults to the `merge.method` project setting (`squash`); anything
+else is exit 4. `--skip` names only `checks`, with the same
 recording rule as the gate (section 6); the default is no skips.
 Naming `lock`, `open`, `head`, `review` or `fork` is exit 4:
 those checks establish what is being merged, and skipping
 identity is not a policy choice (mirroring takeoff, section
-5.5).
+5.5). `--wait` polls the forge while the `checks` row is pending
+until it leaves pending, any row fails, or `--timeout` (default
+ten minutes) lands; a `--timeout` without `--wait` is exit 4.
+The wait never holds the per-repo lock: a real merge re-reads
+under the lock after the wait settles.
 
 JSON shape (`--json`): the precondition verdict plus the outcome:
 
@@ -283,16 +287,19 @@ Without `--json`, one line per check plus the outcome, in the
 `takeoff` text style (`merge <name>: <status> - <detail>`).
 
 Exit codes: 0 merged (under `--plan`: mergeable), 1 a
-precondition failed or the merge was refused, 2 the merge lock is
+precondition failed or is still pending (a `--wait` timeout still
+reports `pending`) or the merge was refused, 2 the merge lock is
 held by another merger, 3 the forge is unreachable, 4 usage or
 configuration error. Exit 2 reuses the public race meaning, so
 retry loops treat it like the drive lock.
 
 State read: one fresh forge PR read (state, head SHA, check
-statuses, fork flag), the review record via `mergeup.find_record`
-(the same reader takeoff uses, so both gates agree), and the
-per-repo merge lock. No local worktree state: the merge runs
-forge-side, so a coordinator needs no clone.
+statuses, fork flag), the head-pinned check-runs read for the
+pending count (section 8), the review record via
+`mergeup.find_record` (the same reader takeoff uses, so both
+gates agree), and the per-repo merge lock. No local worktree
+state: the merge runs forge-side, so a coordinator needs no
+clone.
 
 Read-only twin: `--plan`. It reports every precondition row and
 the lock state (`free` or `held`) without taking the lock and
@@ -455,21 +462,38 @@ PRs to the same repo never merge concurrently.
    inherited across a clean merge-up. A block or a missing record
    refuses. This is the same reader takeoff uses, so the merge
    gate and the takeoff gate cannot disagree.
-5. `checks`: the forge's check statuses on the head are green
-   (read from the fresh `pull_request()`, extended per section
-   8). `--skip checks` waives this row and records the skip; it
-   is the only waivable merge check (section 5.4).
+5. `checks`: the forge's check statuses on the head (the verdict
+   from the fresh `pull_request()`, per section 8). Three states:
+   `ok` when green, `pending` while still running (a wait, not a
+   failure: the detail says to wait and carries no fix advice), and
+   `fail` when red (fix the branch and update the PR). A `pending`
+   row blocks with exit 1 like a `fail`, but stays `pending` in the
+   document so a caller branching on the row waits instead of
+   fixing. `--skip checks` waives this row and records the skip;
+   it is the only waivable merge check (section 5.4). Any `fail`
+   beside a pending `checks` row wins at once: the verb never
+   waits out a refusal. The row reports the one checks
+   precondition, not a count of provider checks; a separate count
+   read only decorates the pending detail (section 8).
 6. `fork`: the PR is not from a fork. Fork merges refuse with
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
 
-After the merge call, the verb verifies: re-read the PR and
-require state `merged` plus the merge commit SHA the forge
+After the merge call, the verb verifies per method: re-read the
+PR and require state `merged` plus the merge commit SHA the forge
 reports tied to the pinned head (section 8). A mismatch fails
 closed with exit 1 (the merge happened but is unverified; the
-row says so). A parent check on the merge commit is reserved for
-a future non-squash method; squash produces a single-parent
-commit, so no parent check applies here.
+row says so). For a merge commit the forge seam's merge call
+additionally requires the merge commit's parents to include the
+pinned head: the provider proves it kept the approved commits.
+A squash produces a single-parent commit, so no parent check
+applies there.
+
+The method is `--method` when given, else the `merge.method`
+project setting (`squash` by default, or `merge`). A merge-time
+refusal with every row still green is a method the forge or the
+repository settings do not allow: a `method` row fails exit 1
+naming `merge.method`, and the row appears in no other case.
 
 ### 7.3 How it refuses, and what it never does
 
@@ -490,34 +514,58 @@ verb never:
 
 ## 8. The forge seam for merge
 
-`pull_request()` today returns no check statuses and no
-merge-commit SHA, but sections 5.4 and 7.2 read both. PROPOSED:
-extend `PullRequest` with two fields, read from the same fresh
-PR fetch, so the merge gate needs no second seam:
+The merge verdict comes from two reads. The first is the fresh
+PR fetch, which carries state, head SHA, the checks verdict, the
+fork flag and the merge SHA, so the gate reads those
+consistently. The second is the head-pinned check-runs fetch,
+which carries only the running count. The head can move between
+the two reads, so the count can describe a different head than
+the verdict: that is why the count only decorates a pending row
+and never changes a verdict.
+
+`PullRequest` carries the verdict from the PR fetch:
 
 - `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
   summarizing the forge's check statuses on the head SHA;
+- `checks_pending: int`: how many checks on the head SHA are
+  still running. Fakes set it explicitly; the adapter leaves the
+  default and the verb reads the live count separately (below);
 - `merge_sha: str | None`: the merge commit SHA once the PR
   state is `merged`, else None. The verify step ties this SHA to
   the pinned head.
 
-Only the adapters know the provider shape (the GitHub adapter
-parses both from the same `gh api` PR fetch it already
-performs); everything else takes the `Forge` object. The
-alternative (a separate `checks()` seam method) is rejected: two
-reads can disagree about a moving PR, while one fresh read keeps
-state, head, checks and merge SHA consistent.
+The running count is a separate, optional read that can only
+decorate a pending row, never change a verdict:
 
-`forge.py` gains one more method (PROPOSED):
+- `pending_checks(repo, sha) -> int`: how many check runs on
+  `sha` are still running (one page of up to 100 runs; a head
+  with more runs reports a lower bound). The adapter answers it
+  from the head-pinned check-runs fetch for the head SHA the PR
+  read reported. The merge verb calls it only when the verdict
+  is pending (in `--wait`, once per poll), and only on the merge
+  paths: `review show --pr` never calls it, so an unrelated verb
+  pays no second read and a transient count failure cannot fail
+  it. A failed or unusable count read on the merge path degrades
+  to the count-less pending message instead of an error;
+  passing, failing, and skipped rows never trigger it. A stale
+  count (the head moved between the two reads) still only
+  decorates the pending detail, so it can neither settle a wait
+  nor fail a gate.
+
+Only the adapters know the provider shape; everything else takes
+the `Forge` object.
+
+`forge.py` gains one more method:
 
 ```python
 def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-    """Squash-merge PR `number` and return the merge commit SHA.
+    """Merge PR `number` with `method` and return the merge commit SHA.
 
-    Refuses unless the PR is open at `head_sha`. Raises
-    `ForgeError` when the forge is unreachable or answers
-    something unusable. Only the adapters call `gh` or know
-    provider shapes.
+    `method` is `squash` or `merge`, resolved from the project's
+    `merge.method` setting. Refuses unless the PR is open at
+    `head_sha`. Raises `ForgeError` when the forge is unreachable
+    or answers something unusable. Only the adapters call `gh` or
+    know provider shapes.
     """
 ```
 
@@ -607,6 +655,10 @@ while true; do
   jq -r '.checks[] | "\(.status) \(.name): \(.detail)"' merge.json; exit 1
 done
 ```
+
+A coordinator that would rather wait than poll appends `--wait`
+(`--timeout` bounds the wait): a pending checks row then settles
+in the verb instead of spinning the loop above.
 
 Retrying dispatch (plan first, then run; 75 and 2 retry later):
 

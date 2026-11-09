@@ -33,6 +33,54 @@ from korapy import paths
 #: Where review records live under a ticket's session dir.
 REVIEWS_DIRNAME = "reviews"
 
+
+def local_repo(repo, short_to_tracker):
+    """The session-dir repo name for a store key or entry name. Pure.
+
+    `short_to_tracker` is the `{short [[repo]] name: tracker repo}`
+    map (the drive pass builds it once per pass through its one
+    resolver; single-root callers through the shared per-repo map).
+    Records live beside the ticket's session dir, which is named for
+    the short entry name, while the store and the loop key tickets by
+    the tracker repo: this is the one place that spelling is decided,
+    so writers and every reader agree on the directory.
+
+    A known short name reads as itself; a known tracker repo reads as
+    its short name (the first entry wins when two shorts feed one
+    tracker repo). Any other plain name keeps itself, so records
+    written under a short name no project registers anymore still
+    read. Anything else (a tracker repo no entry feeds, a blank)
+    raises ValueError naming the key: the caller reports it, never an
+    empty result from a swallowed lookup.
+    """
+    key = str(repo or "")
+    if key in short_to_tracker:
+        return key
+    for short, tracker in short_to_tracker.items():
+        if tracker == key:
+            return short
+    if paths.plain_repo_name(key):
+        return key
+    raise ValueError(f"unknown repository {key!r}: no [[repo]] entry feeds it")
+
+
+def store_reader(short_to_tracker, sessions_root=None):
+    """A `review_records_for` read over store keys: `(repo, number) -> record`.
+
+    Translates the store's tracker repo through :func:`local_repo`
+    before reading the ticket's latest record, so the loop finds the
+    record the reviewer wrote under the short name. `sessions_root`
+    pins the session tree (tests); None reads the host default. An
+    unresolvable key raises ValueError naming it, for the caller to
+    report loudly.
+    """
+
+    def read(repo, number):
+        return latest_record(local_repo(repo, short_to_tracker), number, sessions_root)
+
+    return read
+
+
 #: The verdicts a reviewer may state.
 VERDICTS = ("approve", "approve-with-findings", "block")
 
@@ -181,3 +229,105 @@ def read_record(repo, number, commit, sessions_root=None):
 def approves(record):
     """Whether a record lets a change through: approve, with or without findings."""
     return record is not None and record.get("verdict") in ("approve", "approve-with-findings")
+
+
+#: Finding severities, highest first. The shared vocabulary a fix-round
+#: threshold is graded against; reviewers record one per finding and the
+#: loop opens a fix round only for findings at or above its threshold.
+SEVERITIES = ("high", "normal", "low")
+
+#: The default fix-round threshold: findings at or above `normal` open a
+#: fix round, so approving reviews with only lows are merge-ready. One
+#: constant on purpose: the settings default, the gate default and the
+#: grading defaults below all read it, and an agreement test pins them.
+DEFAULT_FIX_THRESHOLD = "normal"
+
+
+def severity_rank(severity) -> int:
+    """One severity's rank, higher first. Pure.
+
+    Known severities rank over `SEVERITIES` in order; anything else
+    (including a blank) ranks above `high`: the loop never silently
+    merges a finding it cannot grade, so an ungraded finding always
+    opens a fix round.
+    """
+    name = str(severity or "").strip().lower()
+    if name in SEVERITIES:
+        return len(SEVERITIES) - SEVERITIES.index(name)
+    return len(SEVERITIES) + 1
+
+
+def check_threshold(value) -> str:
+    """One configured fix-round threshold, normalized. For the settings layer.
+
+    Takes the stripped lowercase name; anything outside `SEVERITIES`
+    raises ValueError. The settings layer reports the failure naming
+    the file and key, so the check only states the rule.
+    """
+    name = str(value).strip().lower() if isinstance(value, str) else ""
+    if name not in SEVERITIES:
+        raise ValueError(f"must be one of {SEVERITIES}, not {value!r}")
+    return name
+
+
+def meets_threshold(findings, threshold=DEFAULT_FIX_THRESHOLD) -> bool:
+    """Whether any finding reaches `threshold`. Pure.
+
+    An unknown threshold raises ValueError; an unknown severity reads
+    as above every threshold, so ungraded findings always meet it. No
+    findings never meet any threshold.
+    """
+    want = check_threshold(threshold)
+    bar = severity_rank(want)
+    for entry in findings or ():
+        severity = entry.get("severity") if isinstance(entry, dict) else ""
+        if severity_rank(severity) >= bar:
+            return True
+    return False
+
+
+def fix_wanted(record, threshold=DEFAULT_FIX_THRESHOLD) -> bool:
+    """Whether a review record asks for a fix round. Pure.
+
+    No record says nothing, so no fix. A `block` verdict always wants
+    one, even with no findings. An approving verdict (`approve` or
+    `approve-with-findings`) wants one only when a finding meets the
+    threshold: lows alone are merge-ready and stay in the record for
+    the coordinator to file as issues.
+    """
+    if record is None:
+        return False
+    if not approves(record):
+        return True
+    return meets_threshold(record.get("findings") or (), threshold)
+
+
+def latest_record(repo, number, sessions_root=None):
+    """The ticket's newest valid review record, or None. Reads only.
+
+    Scans the ticket's reviews dir and returns the valid record with
+    the newest `at` stamp (missing stamps read as zero); corrupt or
+    invalid files are ignored. A re-review writes a new file per
+    commit, so the newest file is the latest review.
+    """
+    directory = reviews_dir(repo, number, sessions_root)
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    newest = None
+    newest_key = None
+    for name in names:
+        if not (name.startswith(RECORD_PREFIX) and name.endswith(".json")):
+            continue
+        payload = _load(os.path.join(directory, name))
+        if payload is None:
+            continue
+        stamp = payload.get("at")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            stamp = 0
+        key = (stamp, name)
+        if newest_key is None or key > newest_key:
+            newest_key = key
+            newest = payload
+    return newest

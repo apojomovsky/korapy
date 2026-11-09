@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -245,6 +246,150 @@ class LimitsTest(HostCase):
         self.assertIn("admission.total_cap", str(ctx.exception))
 
 
+class BudgetSharesTest(unittest.TestCase):
+    """The resource shares for the host budget split: a ceiling of 0 reserves nothing.
+
+    The one resolver for which projects share the budget: the budget
+    derivation, the slice reconciliation and the doctor row all read it.
+    A project whose effective cap is 0 (a ceiling of 0, or no slots in
+    the host total at all) keeps its name but takes no weighted share
+    and no floor, so the split divides the budget among the projects
+    that can start agents.
+    """
+
+    def project(self, name, ceiling=None, resources=None, floor=0):
+        return projects.Project(
+            name=name,
+            unit_prefix=f"{name}-",
+            root=f"/srv/ops/{name}",
+            floor=floor,
+            ceiling=ceiling,
+            eligibility=None,
+            resources=resources,
+        )
+
+    def test_table(self):
+        nothing = {
+            "weight": 0,
+            "cpu_floor_m": 0,
+            "memory_floor_mb": 0,
+            "pids_floor": 0,
+            "cpu_ceiling_m": None,
+            "memory_ceiling_mb": None,
+            "pids_ceiling": None,
+        }
+        cases = [
+            (
+                "an uncapped project keeps its share table",
+                [self.project("web", resources={"weight": 1, "cpu_floor_m": 500})],
+                4,
+                {"web": {"weight": 1, "cpu_floor_m": 500}},
+            ),
+            (
+                "a count floor rides along when the project shares",
+                [
+                    self.project(
+                        "web",
+                        floor=1,
+                        ceiling=2,
+                        resources={"weight": 1},
+                    )
+                ],
+                4,
+                {"web": {"weight": 1}},
+            ),
+            (
+                "a missing resources table reads as empty",
+                [self.project("web")],
+                4,
+                {"web": {}},
+            ),
+            (
+                "a ceiling above the total still shares",
+                [self.project("web", ceiling=9, resources={"weight": 2})],
+                4,
+                {"web": {"weight": 2}},
+            ),
+            (
+                "a ceiling at the total still shares",
+                [self.project("web", ceiling=4, resources={"weight": 2})],
+                4,
+                {"web": {"weight": 2}},
+            ),
+            (
+                "a ceiling of 0 takes no weight and no floor",
+                [
+                    self.project(
+                        "web",
+                        resources={"weight": 1},
+                    ),
+                    self.project(
+                        "shadow",
+                        ceiling=0,
+                        resources={
+                            "weight": 1,
+                            "cpu_floor_m": 500,
+                            "memory_floor_mb": 1024,
+                            "pids_floor": 4,
+                        },
+                    ),
+                ],
+                4,
+                {"web": {"weight": 1}, "shadow": dict(nothing)},
+            ),
+            (
+                "configured ceilings survive the zeroing",
+                [
+                    self.project(
+                        "shadow",
+                        ceiling=0,
+                        resources={"weight": 1, "cpu_ceiling_m": 100},
+                    )
+                ],
+                4,
+                {
+                    "shadow": {
+                        **nothing,
+                        "cpu_ceiling_m": 100,
+                    }
+                },
+            ),
+            (
+                "a ceiling of 0 with no resources table reserves nothing",
+                [self.project("shadow", ceiling=0)],
+                4,
+                {"shadow": dict(nothing)},
+            ),
+            (
+                "zero slots exclude an uncapped project",
+                [self.project("web", resources={"weight": 1})],
+                0,
+                {"web": dict(nothing)},
+            ),
+            (
+                "zero slots exclude a capped project",
+                [self.project("web", ceiling=2, resources={"weight": 1})],
+                0,
+                {"web": dict(nothing)},
+            ),
+        ]
+        for desc, found, total_cap, expected in cases:
+            with self.subTest(desc):
+                self.assertEqual(projects.budget_shares(found, total_cap=total_cap), expected)
+
+    def test_a_ceiling_raised_from_0_to_1_restores_the_share(self):
+        table = {"weight": 1, "cpu_floor_m": 500}
+        paused = projects.budget_shares(
+            [self.project("web", ceiling=0, resources=dict(table))], total_cap=4
+        )
+        self.assertEqual(paused["web"]["weight"], 0)
+        self.assertEqual(paused["web"]["cpu_floor_m"], 0)
+        resumed = projects.budget_shares(
+            [self.project("web", ceiling=1, resources=dict(table))], total_cap=4
+        )
+        self.assertEqual(resumed, {"web": table})
+
+
 class CheckTest(HostCase):
     def test_a_missing_registry_is_usable(self):
         self.assertEqual(projects.check(), [])
@@ -263,6 +408,79 @@ class CheckTest(HostCase):
         path = self.write_project("project-a", raw="not toml = [")
         self.assertEqual(len(projects.check()), 1)
         self.assertIn(path, projects.check()[0])
+
+
+class PolicySourcesTest(HostCase):
+    def write_ops_policy(self, name, text="def eligible(rows, *, now):\n    return []\n"):
+        root = self.roots[name]
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, "blue_policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_resolving_entries_report_project_entry_and_file(self):
+        expected_a = self.write_ops_policy("project-a")
+        expected_b = self.write_ops_policy("project-b")
+        self.write_project("project-a", eligibility="blue_policy:eligible")
+        self.write_project("project-b", eligibility="blue_policy:eligible")
+        try:
+            self.assertEqual(
+                projects.policy_sources(),
+                [
+                    ("project-a", "blue_policy:eligible", expected_a),
+                    ("project-b", "blue_policy:eligible", expected_b),
+                ],
+            )
+        finally:
+            sys.modules.pop("blue_policy", None)
+
+    def test_projects_without_an_entry_and_broken_entries_are_skipped(self):
+        self.write_project("project-a")
+        self.write_project(
+            "project-b",
+            eligibility="missing_policy_xyz:eligible",
+        )
+        self.assertEqual(projects.policy_sources(), [])
+
+
+class CheckAndSourcesTest(HostCase):
+    def write_ops_policy(self, name, text="def eligible(rows, *, now):\n    return []\n"):
+        root = self.roots[name]
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, "blue_policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_one_pass_reports_problems_and_sources_together(self):
+        expected_a = self.write_ops_policy("project-a")
+        expected_b = self.write_ops_policy("project-b")
+        self.write_project("project-a", eligibility="blue_policy:eligible")
+        self.write_project("project-b", eligibility="blue_policy:eligible")
+        try:
+            problems, sources = projects.check_and_sources()
+            self.assertEqual(problems, [])
+            self.assertEqual(
+                sources,
+                [
+                    ("project-a", "blue_policy:eligible", expected_a),
+                    ("project-b", "blue_policy:eligible", expected_b),
+                ],
+            )
+        finally:
+            sys.modules.pop("blue_policy", None)
+
+    def test_one_pass_reports_problems_without_sources(self):
+        self.write_project("project-a")
+        self.write_project(
+            "project-b",
+            eligibility="missing_policy_xyz:eligible",
+        )
+        problems, sources = projects.check_and_sources()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("project-b", problems[0])
+        self.assertEqual(sources, [])
 
 
 class AdmitAcrossProjectsTest(HostCase):

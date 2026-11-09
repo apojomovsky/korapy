@@ -16,6 +16,7 @@ UNKNOWN = "unknown"
 
 DEFAULT_LOW_PCT = 90
 DEFAULT_UNKNOWN_BLOCKS = False
+DEFAULT_REFRESH_AFTER_S = 900
 
 settings.register(
     "quota.low_pct", int, DEFAULT_LOW_PCT, "usage percent at which a provider reads low"
@@ -25,6 +26,12 @@ settings.register(
     bool,
     DEFAULT_UNKNOWN_BLOCKS,
     "an unknown provider blocks its roles instead of passing them",
+)
+settings.register(
+    "quota.refresh_after_s",
+    int,
+    DEFAULT_REFRESH_AFTER_S,
+    "explicit refresh age for quota readings; when unset the pass refreshes at half the strictest stale bound",
 )
 
 
@@ -128,6 +135,32 @@ def stale_after_for(chains, pool) -> float:
     if not bounds:
         return float(accounts.DEFAULT_STALE_AFTER_S)
     return min(bounds)
+
+
+def refresh_after_for(chains, pool, override=None) -> float:
+    """The quota refresh age for `chains`: an explicit override, else half the bound.
+
+    `override` is the `quota.refresh_after_s` setting when explicitly set
+    (None when unset, see `refresh_override`). The derived age is half of
+    `stale_after_for` over the same chains and pool the gate judges by,
+    so a reading refreshes well before it counts stale; half never
+    exceeds the bound it derives from.
+    """
+    if override is not None:
+        return float(override)
+    return float(stale_after_for(chains, pool)) / 2.0
+
+
+def refresh_override(resolved) -> float | None:
+    """The explicit `quota.refresh_after_s`, or None when unset (derive).
+
+    `resolved` is the host settings; only a set value (any layer above
+    the default) overrides the derived refresh age.
+    """
+    item = resolved.values["quota.refresh_after_s"]
+    if item.origin == settings.DEFAULT:
+        return None
+    return float(item.value)
 
 
 def gate(

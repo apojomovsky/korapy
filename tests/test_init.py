@@ -283,18 +283,22 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
+# board.add_per_pass = 20  # missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)
+# board.drift_max_age_s = 600  # seconds a card may stay out of step with its issue before the doctor fails the repo
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
 # board.ready = "ready"  # label that makes an issue eligible
 # board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
+# board.status_per_pass = 20  # board Status writes per repo per pass (default: 20; 0 or less syncs nothing)
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
-# checks.suite_lock_timeout_s = 3600  # seconds a second takeoff waits for the full-suite lock before giving up (exit 75)
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
 # checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
@@ -305,8 +309,13 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
+#
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -320,13 +329,18 @@ TAIL = """# Defaults: uncomment to override.
 # hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
+# [merge]
+# merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
+#
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # explicit refresh age for quota readings; when unset the pass refreshes at half the strictest stale bound
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]
@@ -349,7 +363,7 @@ TAIL = """# Defaults: uncomment to override.
 # serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
 # serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
 # serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
-# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.port = 8420  # port to bind (default 8420, a fixed unprivileged port with no common clash; 0 picks a free port for a second or throwaway instance)
 # serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
 # serve.tail_max = 200  # maximum activity lines one tail read returns
 #
@@ -417,17 +431,21 @@ commits.conventional = false
 # admission.total_cap = 4  # live plus pending agents the host admits in total
 #
 # [agents]
+# agents.max_time = "3h"  # wall-clock limit for one agent run, like 3h (bare is seconds)
+# agents.reviewer_max_time = "3h"  # wall-clock limit for reviewer runs, like 30m; when unset it follows agents.max_time
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
+# board.add_per_pass = 20  # missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)
+# board.drift_max_age_s = 600  # seconds a card may stay out of step with its issue before the doctor fails the repo
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
 # board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
+# board.status_per_pass = 20  # board Status writes per repo per pass (default: 20; 0 or less syncs nothing)
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
-# checks.suite_lock_timeout_s = 3600  # seconds a second takeoff waits for the full-suite lock before giving up (exit 75)
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
 # checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
@@ -438,8 +456,13 @@ commits.conventional = false
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
+#
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -452,13 +475,18 @@ commits.conventional = false
 # hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
+# [merge]
+# merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
+#
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # explicit refresh age for quota readings; when unset the pass refreshes at half the strictest stale bound
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]
@@ -481,7 +509,7 @@ commits.conventional = false
 # serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
 # serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
 # serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
-# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.port = 8420  # port to bind (default 8420, a fixed unprivileged port with no common clash; 0 picks a free port for a second or throwaway instance)
 # serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
 # serve.tail_max = 200  # maximum activity lines one tail read returns
 #

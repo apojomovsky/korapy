@@ -652,6 +652,71 @@ class ShareCap(unittest.TestCase):
             R.share_cap(R.Limits(host=bad.host, gone_s=-1.0), "web", NOW)
 
 
+def zeroed(**overrides):
+    """The resolver output for a project that reserves nothing: no weight, no floor."""
+    share = {
+        "weight": 0,
+        "cpu_floor_m": 0,
+        "memory_floor_mb": 0,
+        "pids_floor": 0,
+        "cpu_ceiling_m": None,
+        "memory_ceiling_mb": None,
+        "pids_ceiling": None,
+    }
+    share.update(overrides)
+    return share
+
+
+class ZeroShareSplit(unittest.TestCase):
+    """The split with one zeroed project: the other keeps the whole budget.
+
+    A ceiling-0 project takes no weighted share and no floor: the
+    derivation divides the host budget among the projects that can
+    start agents, and the zeroed project's own cap is zero.
+    """
+
+    def table(self, projects):
+        return limits(host=(3000, 8000, 512), projects=projects)
+
+    def test_a_two_project_split_gives_the_other_the_whole_budget(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        cap = R.share_cap(host, "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (3000, 8000, 512))
+
+    def test_the_zeroed_project_caps_at_zero(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        cap = R.share_cap(host, "shadow", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (0, 0, 0))
+
+    def test_a_floored_split_still_gives_the_other_the_whole_budget(self):
+        host = self.table(
+            {
+                "web": {"weight": 1, "cpu_floor_m": 500, "memory_floor_mb": 1024},
+                "shadow": zeroed(),
+            }
+        )
+        joined = R.join(
+            host, {name: host.projects[name] for name in host.projects}, (), where="here"
+        )
+        cap = R.share_cap(joined, "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (3000, 8000, 512))
+
+    def test_the_other_project_may_fill_the_whole_budget(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        verdict = R.admit(
+            req("web"), charged((2000, 5000, 100), {"web": (2000, 5000, 100)}), host, NOW
+        )
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_launch_under_a_zero_share_is_refused(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        verdict = R.admit(req("shadow"), charged(), host, NOW)
+        self.assertFalse(verdict.allowed)
+
+
 class Codes(unittest.TestCase):
     def test_codes_are_stable_strings(self):
         self.assertEqual(
@@ -798,6 +863,47 @@ class PressureParse(unittest.TestCase):
         self.assertIsNone(reading.memory_some_avg10)
         self.assertFalse(reading.saturated)
 
+    def test_host_facts_ride_the_same_reading(self):
+        reading = R.parse_pressure(LOADAVG, MEMINFO, 2)
+        self.assertEqual(reading.ncpu, 2)
+        self.assertEqual(reading.load_1min, 0.8)
+        self.assertEqual(reading.mem_total_mb, round(8000000 / 1024, 1))
+        self.assertEqual(reading.mem_available_mb, round(4400000 / 1024, 1))
+
+    def test_host_facts_read_unknown_without_a_source(self):
+        reading = R.parse_pressure("garbage\n", "MemTotal: nope\n", None)
+        self.assertIsNone(reading.ncpu)
+        self.assertIsNone(reading.load_1min)
+        self.assertIsNone(reading.mem_total_mb)
+        self.assertIsNone(reading.mem_available_mb)
+        self.assertFalse(reading.saturated)
+
+    def test_meminfo_without_available_leaves_absolutes_unknown(self):
+        reading = R.parse_pressure(LOADAVG, "MemTotal: 8000000 kB\n", 2)
+        self.assertIsNone(reading.mem_available_pct)
+        self.assertIsNone(reading.mem_total_mb)
+        self.assertIsNone(reading.mem_available_mb)
+
+    def test_negative_available_reads_unknown_everywhere(self):
+        meminfo = "MemTotal: 8000000 kB\nMemAvailable: -4 kB\n"
+        reading = R.parse_pressure(LOADAVG, meminfo, 2)
+        self.assertIsNone(reading.mem_available_pct)
+        self.assertIsNone(reading.mem_total_mb)
+        self.assertIsNone(reading.mem_available_mb)
+
+    def test_dict_carries_the_host_facts(self):
+        found = R.pressure_dict(R.parse_pressure(LOADAVG, MEMINFO, 2))
+        self.assertEqual(
+            {key: found[key] for key in ("ncpu", "load_1min")},
+            {"ncpu": 2, "load_1min": 0.8},
+        )
+        self.assertEqual(found["mem_total_mb"], round(8000000 / 1024, 1))
+        self.assertEqual(found["mem_available_mb"], round(4400000 / 1024, 1))
+
+    def test_dict_rejects_a_non_integer_ncpu(self):
+        with self.assertRaises(R.LimitsError):
+            R.pressure_dict({"saturated": False, "ncpu": 2.5})
+
 
 class ReadPressure(unittest.TestCase):
     def test_reads_through_the_injected_reader(self):
@@ -908,6 +1014,10 @@ class CapacityReport(unittest.TestCase):
                 "saturated": False,
                 "cpu_some_avg10": None,
                 "memory_some_avg10": None,
+                "ncpu": None,
+                "load_1min": None,
+                "mem_total_mb": None,
+                "mem_available_mb": None,
             },
         )
 

@@ -119,6 +119,98 @@ export function canonicalJson(value) {
   return text === undefined ? "null" : text;
 }
 
+// Idle seconds in words: "idle 42s". The panel's own fact, not an
+// age: it names how long the agent has sat without a heartbeat.
+// Unknown stays unknown, never a busy zero.
+export function formatIdle(value) {
+  if (value === null || value === undefined) {
+    return "unknown";
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return String(value);
+  }
+  const secs = Math.max(0, Math.round(value));
+  if (secs < 60) {
+    return "idle " + secs + "s";
+  }
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) {
+    return "idle " + mins + "m";
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return "idle " + hours + "h";
+  }
+  return "idle " + Math.floor(hours / 24) + "d";
+}
+
+// A stamp carrying the machine's local offset, sliced for display:
+// the server stamps the offset, the page only slices its wall-clock
+// fields. A string stamp never round-trips through Date: that would
+// render it in the viewer's zone instead of the machine's. Unknown
+// stays unknown, never a converted guess.
+export function formatLocalTime(value) {
+  if (value === null || value === undefined) {
+    return "unknown";
+  }
+  if (typeof value === "string") {
+    const match = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/.exec(value);
+    if (match === null) {
+      return value;
+    }
+    return (
+      match[1].slice(2) +
+      "-" +
+      match[2] +
+      "-" +
+      match[3] +
+      " " +
+      match[4] +
+      ":" +
+      match[5] +
+      " local"
+    );
+  }
+  const ms = parseEpoch(value);
+  if (ms === null || ms === undefined) {
+    return "unknown";
+  }
+  if (typeof ms !== "number") {
+    return String(ms);
+  }
+  const at = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    pad(at.getFullYear() % 100) +
+    "-" +
+    pad(at.getMonth() + 1) +
+    "-" +
+    pad(at.getDate()) +
+    " " +
+    pad(at.getHours()) +
+    ":" +
+    pad(at.getMinutes()) +
+    " local"
+  );
+}
+
+// A retention window in words for the finished toggle caption:
+// "6 hours". Anything unparseable reads as "a while", never zero.
+export function formatRetentionWindow(ms) {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+    return "a while";
+  }
+  const hours = Math.round(ms / 3600000);
+  if (hours >= 2) {
+    return String(hours) + " hours";
+  }
+  if (hours === 1) {
+    return "1 hour";
+  }
+  const mins = Math.max(1, Math.round(ms / 60000));
+  return mins === 1 ? "1 minute" : String(mins) + " minutes";
+}
+
 // A reset epoch as wall-clock hours and minutes for the quota bars.
 // Null reads as not reported; anything unparseable is shown verbatim,
 // the same degradation rule as the timestamp parsers above.
@@ -133,6 +225,264 @@ export function formatClock(value) {
   const at = new Date(ms);
   const pad = (n) => String(n).padStart(2, "0");
   return pad(at.getHours()) + ":" + pad(at.getMinutes());
+}
+
+// A provider reading rendered in plain words: its age. Whether the
+// server counts it as stale rides the badge and the pill state, so
+// this sentence never suffixes it. Anything missing reads as never
+// recorded, never as a fresh zero.
+export function formatQuotaRead(info, nowMs) {
+  if (info === null || info === undefined || typeof info !== "object") {
+    return "no reading yet";
+  }
+  const readAt = parseEpoch(info.read_at);
+  if (readAt === null || readAt === undefined) {
+    return "no reading yet";
+  }
+  if (typeof readAt !== "number") {
+    return "read " + String(readAt);
+  }
+  const aged = formatAge(readAt, nowMs);
+  return "read " + aged;
+}
+
+// How long until a stamp, in plain words. Null reads as not reported;
+// a stamp already past reads as due now, never as a negative wait.
+export function formatCountdown(targetMs, nowMs) {
+  if (targetMs === null || targetMs === undefined) {
+    return "not reported";
+  }
+  if (typeof targetMs !== "number" || typeof nowMs !== "number") {
+    return String(targetMs);
+  }
+  if (targetMs <= nowMs) {
+    return "due now";
+  }
+  const secs = Math.round((targetMs - nowMs) / 1000);
+  const days = Math.floor(secs / 86400);
+  const hours = Math.floor((secs % 86400) / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  // Non-breaking spaces keep a countdown on one line: "3 d 4 h"
+  // never wraps mid-unit on a narrow screen.
+  const gap = "\u00a0";
+  if (days > 0) {
+    return hours > 0
+      ? "in" + gap + days + gap + "d" + gap + hours + gap + "h"
+      : "in" + gap + days + gap + "d";
+  }
+  if (hours > 0) {
+    return mins > 0
+      ? "in" + gap + hours + gap + "h" + gap + mins + gap + "m"
+      : "in" + gap + hours + gap + "h";
+  }
+  if (mins > 0) {
+    return "in" + gap + mins + gap + "m";
+  }
+  return "in" + gap + secs + gap + "s";
+}
+
+// Presentation bands for host gauges: the same 0.7/0.9 cuts the
+// charged bars already use, so every bar on the page bands alike.
+// Anything unparseable reads as unknown, never as a healthy zero.
+export function bandFor(frac) {
+  if (typeof frac !== "number" || !Number.isFinite(frac)) {
+    return "unknown";
+  }
+  if (frac < 0.7) {
+    return "ok";
+  }
+  if (frac < 0.9) {
+    return "low";
+  }
+  return "high";
+}
+
+// A fraction clamped to the bar domain. Null stays null so the bar
+// renders unknown instead of empty.
+export function clamp01(frac) {
+  if (typeof frac !== "number" || !Number.isFinite(frac)) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, frac));
+}
+
+// How long something has run, in plain words: "4h". Null reads as
+// not reported; anything unparseable is shown verbatim, the same
+// degradation rule as the timestamp parsers above.
+export function formatDuration(startMs, nowMs) {
+  if (startMs === null || startMs === undefined) {
+    return "not reported";
+  }
+  if (typeof startMs !== "number" || typeof nowMs !== "number") {
+    return String(startMs);
+  }
+  const secs = Math.max(0, Math.round((nowMs - startMs) / 1000));
+  if (secs < 5) {
+    return "just now";
+  }
+  if (secs < 60) {
+    return secs + "s";
+  }
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) {
+    return mins + "m";
+  }
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    return hours + "h";
+  }
+  return Math.floor(hours / 24) + "d";
+}
+
+// Host load as a short figure: "0.40 per core". A missing reading
+// is not reported, never an idle zero.
+export function formatLoadFigure(load1min, ncpu) {
+  if (load1min === null || load1min === undefined || ncpu === null || ncpu === undefined) {
+    return "not reported";
+  }
+  if (
+    typeof load1min !== "number" ||
+    !Number.isFinite(load1min) ||
+    typeof ncpu !== "number" ||
+    !Number.isFinite(ncpu) ||
+    ncpu <= 0
+  ) {
+    return String(load1min) + " per core";
+  }
+  return (load1min / ncpu).toFixed(2) + " per core";
+}
+
+// The load total behind the figure: "1.60 load on 4 cores". Missing
+// readings leave an empty detail, so the gauge renders no sub-line.
+export function formatLoadDetail(load1min, ncpu) {
+  if (load1min === null || load1min === undefined || ncpu === null || ncpu === undefined) {
+    return "";
+  }
+  if (
+    typeof load1min !== "number" ||
+    !Number.isFinite(load1min) ||
+    typeof ncpu !== "number" ||
+    !Number.isFinite(ncpu) ||
+    ncpu <= 0
+  ) {
+    return String(load1min) + " load on " + String(ncpu) + " cores";
+  }
+  return load1min.toFixed(2) + " load on " + String(ncpu) + " cores";
+}
+
+// Host memory used as a short figure: "4.2 GB". A missing half
+// reads as not reported, never as empty or full. An impossible
+// reading (available above total, or below zero) is a broken meter,
+// not an idle host, so it reads as not reported too.
+export function formatMemFigure(totalMb, availMb) {
+  if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
+    return "not reported";
+  }
+  if (
+    typeof totalMb !== "number" ||
+    !Number.isFinite(totalMb) ||
+    typeof availMb !== "number" ||
+    !Number.isFinite(availMb) ||
+    totalMb <= 0
+  ) {
+    return "not reported";
+  }
+  if (availMb > totalMb || availMb < 0) {
+    return "not reported";
+  }
+  return ((totalMb - availMb) / 1024).toFixed(1) + " GB";
+}
+
+// The memory total behind the figure: "of 7.6 GB". Missing or
+// broken readings leave an empty detail, so the gauge renders no
+// sub-line.
+export function formatMemDetail(totalMb, availMb) {
+  if (totalMb === null || totalMb === undefined || availMb === null || availMb === undefined) {
+    return "";
+  }
+  if (
+    typeof totalMb !== "number" ||
+    !Number.isFinite(totalMb) ||
+    typeof availMb !== "number" ||
+    !Number.isFinite(availMb) ||
+    totalMb <= 0
+  ) {
+    return "";
+  }
+  if (availMb > totalMb || availMb < 0) {
+    return "";
+  }
+  return "of " + (totalMb / 1024).toFixed(1) + " GB";
+}
+
+// A quota window reset as local wall-clock time plus the wait in
+// words. The clock is local time; the countdown says how far away.
+export function formatResetLine(resetsAt, nowMs) {
+  const target = parseEpoch(resetsAt);
+  if (target === null || target === undefined) {
+    return "reset time not reported";
+  }
+  if (typeof target !== "number") {
+    return "resets " + String(target);
+  }
+  const wait = formatCountdown(target, nowMs);
+  if (wait === "due now") {
+    return "resets " + formatClock(resetsAt) + " local, due now";
+  }
+  return "resets " + formatClock(resetsAt) + " local, " + wait;
+}
+
+// Millicores spelled out as cores too, so a bare 2000 reads as 2
+// cores. Null reads as not reported; anything unparseable is shown
+// verbatim, the timestamp formatters' degradation rule.
+export function formatCpu(cpuM) {
+  if (cpuM === null || cpuM === undefined) {
+    return "not reported";
+  }
+  if (typeof cpuM !== "number" || !Number.isFinite(cpuM)) {
+    return String(cpuM);
+  }
+  const cores = cpuM / 1000;
+  const shown = Number.isInteger(cores) ? String(cores) : cores.toFixed(1);
+  return shown + (cores === 1 ? " core" : " cores") + " (" + String(cpuM) + " millicores)";
+}
+
+// Megabytes spelled out as gigabytes too. Same degradation rule as
+// formatCpu above.
+export function formatMem(memoryMb) {
+  if (memoryMb === null || memoryMb === undefined) {
+    return "not reported";
+  }
+  if (typeof memoryMb !== "number" || !Number.isFinite(memoryMb)) {
+    return String(memoryMb);
+  }
+  return (memoryMb / 1024).toFixed(1) + " GB (" + String(memoryMb) + " MB)";
+}
+
+// A drive pass exit code in words. The loop's own convention: 0 means
+// the pass finished, 1 that there was nothing to do, 2 that another
+// pass held the lock, 3 that a service could not be reached, 4 a
+// usage or settings error. Null means no pass end was recorded.
+export function exitWord(code) {
+  if (code === null || code === undefined) {
+    return "not recorded yet";
+  }
+  if (code === 0) {
+    return "finished cleanly";
+  }
+  if (code === 1) {
+    return "nothing to do";
+  }
+  if (code === 2) {
+    return "another pass was already running";
+  }
+  if (code === 3) {
+    return "a service could not be reached";
+  }
+  if (code === 4) {
+    return "bad configuration or usage";
+  }
+  return "exit " + String(code);
 }
 
 // Presentation hygiene, not a sanitizer: the text-node rule is the

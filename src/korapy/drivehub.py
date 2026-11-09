@@ -15,9 +15,10 @@ import sqlite3
 import sys
 import time
 
-from korapy import board, drive
+from korapy import accounts, board, drive
+from korapy import freeze
 from korapy import hub as hubmod
-from korapy import paths, projects, settings, syncli, trackers, units
+from korapy import paths, projects, quota, settings, syncli, trackers, units
 
 
 class HubMode:
@@ -263,6 +264,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             max_starts = host_settings["drive.max_starts_per_day"]
             hold_label = host_settings["board.hold_label"]
             hub_url = host_settings["hub.url"]
+            quota_refresh_override = quota.refresh_override(host_settings)
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
@@ -279,21 +281,41 @@ def cmd_drive(args: argparse.Namespace) -> int:
             except projects.ProjectsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
+            resolved = {}
+            for project in registered:
+                try:
+                    names = settings.repo_names(project.root)
+                except settings.SettingsError as err:
+                    print(f"korapy drive: {err}", file=sys.stderr)
+                    return drive.USAGE
+                entries, problem = syncli.repo_operators(project.root, names, syncli._git)
+                if problem is not None:
+                    print(f"korapy drive: {problem}", file=sys.stderr)
+                    return drive.USAGE
+                resolved[project.root] = entries
             moment = time.time()
             try:
+                repo_map = drive.production_repo_map(registered, resolved=resolved)
                 planned_states, _, planned_tickets = drive.production_stuck_inputs(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
                 planned_finished = drive.production_finished_for(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
                 planned_roles = drive.production_agent_roles(now=moment)
+                planned_reviews = drive.production_review_reader(
+                    registered, git=syncli._git, mapping=repo_map
+                )
+                driven = {
+                    project.name: drive.driven_repos(project, resolved=resolved)
+                    for project in registered
+                }
             except settings.SettingsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
             try:
                 _, planned_live, _ = drive.production_orphan_inputs(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
             except settings.SettingsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
@@ -313,29 +335,44 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 err=sys.stderr,
                 hold_label=hold_label,
                 pause_path=drive.pause_path(),
+                freeze_path=freeze.freeze_path(),
+                projects_fn=lambda: registered,
                 agent_states=planned_states,
                 finished_for=planned_finished,
                 agent_roles=planned_roles,
                 agent_tickets=planned_tickets,
                 live_units=planned_live,
+                repo_map=repo_map,
+                review_reader=planned_reviews,
+                driven=driven,
             )
         try:
             registered = projects.load_all()
         except projects.ProjectsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
-        operators, problem = drive.production_operators(registered, syncli._git)
-        if problem is not None:
-            print(f"korapy drive: {problem}", file=sys.stderr)
-            return drive.USAGE
-        by_repo: dict = {}
+        resolved = {}
         for project in registered:
             try:
                 names = settings.repo_names(project.root)
             except settings.SettingsError as err:
                 print(f"korapy drive: {err}", file=sys.stderr)
                 return drive.USAGE
-            mapping, problem = trackers.production_trackers(project.root, names, git=syncli._git)
+            entries, problem = syncli.repo_operators(project.root, names, syncli._git)
+            if problem is not None:
+                print(f"korapy drive: {problem}", file=sys.stderr)
+                return drive.USAGE
+            resolved[project.root] = entries
+        operators, problem = drive.production_operators(registered, syncli._git, resolved=resolved)
+        if problem is not None:
+            print(f"korapy drive: {problem}", file=sys.stderr)
+            return drive.USAGE
+        by_repo: dict = {}
+        for project in registered:
+            root_entries = resolved[project.root]
+            mapping, problem = trackers.production_trackers(
+                project.root, list(root_entries), git=syncli._git, entries=root_entries
+            )
             if problem is not None:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
@@ -345,16 +382,52 @@ def cmd_drive(args: argparse.Namespace) -> int:
         def tracker_factory(repo, _by_repo=by_repo):
             return _by_repo[repo]
 
+        driven = {
+            project.name: drive.driven_repos(project, resolved=resolved) for project in registered
+        }
         moment = time.time()
         try:
+            repo_map = drive.production_repo_map(registered, resolved=resolved)
             stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
-                registered, now=moment, git=syncli._git
+                registered, now=moment, mapping=repo_map
             )
-            finished_for = drive.production_finished_for(registered, now=moment, git=syncli._git)
+            finished_for = drive.production_finished_for(registered, now=moment, mapping=repo_map)
             agent_roles = drive.production_agent_roles(now=moment)
+            review_reader = drive.production_review_reader(
+                registered, git=syncli._git, mapping=repo_map
+            )
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
+        try:
+            quota_pool, _ = accounts.pool()
+        except accounts.AccountsError as problem:
+            print(f"korapy drive: {problem}", file=sys.stderr)
+            return drive.USAGE
+        quota_refresh_after_s = quota.refresh_after_for(
+            drive.union_quota_chains(registered, quota_pool),
+            quota_pool,
+            override=quota_refresh_override,
+        )
+
+        def record_research_event(project, repo, number, findings_body):
+            from korapy import coordevents
+            from korapy.coord import project_root
+
+            coordevents.record(
+                [
+                    {
+                        "kind": "research",
+                        "ref": f"{repo}#{number}",
+                        "evidence": drive.research.first_line(findings_body),
+                        "state": findings_body,
+                    }
+                ],
+                root=project_root(project),
+                kinds=[],
+                now=moment,
+            )
+
         return drive.run_pass(
             plan=False,
             store=store,
@@ -368,17 +441,28 @@ def cmd_drive(args: argparse.Namespace) -> int:
             launcher=drive.production_launcher(registered, store=store, hold_label=hold_label),
             agent_states=stuck_states,
             stale_s=stuck_stale,
-            stop_unit=drive.production_stopper(registered),
+            stop_unit=drive.production_stopper(registered, mapping=repo_map),
             restarts_path=drive.restarts_path(),
-            stuck_project=lambda repo, number: drive.production_stuck_project(registered, repo),
+            stuck_project=lambda repo, number: drive.production_stuck_project(
+                registered, repo, mapping=repo_map
+            ),
             agent_roles=agent_roles,
             agent_tickets=stuck_tickets,
             finished_for=finished_for,
             journal_path=drive.journal_path(),
             pause_path=drive.pause_path(),
+            freeze_path=freeze.freeze_path(),
             day_path=drive.day_path(),
             max_starts=max_starts,
             hub=hub,
+            repo_map=repo_map,
+            review_reader=review_reader,
+            index_for=drive.pulls_index_for(tracker_factory),
+            driven=driven,
+            pool=quota_pool,
+            quota_refresh_after_s=quota_refresh_after_s,
+            comments_for=drive.research_comments_for(tracker_factory),
+            record_event=record_research_event,
         )
 
 

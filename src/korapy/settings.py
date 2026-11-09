@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 from korapy import paths
+from korapy.boardstatus import STATUS_ID_ATTRS
 from korapy.trackers import VARIANTS
 
 if TYPE_CHECKING:
@@ -86,9 +87,11 @@ PROVIDERS = (
     "korapy.detect",
     "korapy.disk",
     "korapy.drive",
+    "korapy.freeze",
     "korapy.hold",
     "korapy.hub",
     "korapy.launch",
+    "korapy.merge",
     "korapy.prompts",
     "korapy.quota",
     "korapy.registry",
@@ -140,7 +143,11 @@ class BoardConfig(NamedTuple):
     ``priority_map`` keys are opaque board option ids, never resolved
     against the registry; display names are comments only. Columns default
     to ``""`` (unmapped); at least the board address (the owner plus the
-    number or the node id) is always present."""
+    number or the node id) is always present. The four ``status_*``
+    attributes are the board's Status option ids per derived state
+    (available, claimed, in review, done): a state with no id is never
+    synced, so a project mapping none of them keeps the read-only
+    behavior."""
 
     project_owner: str
     project_number: int | None
@@ -153,6 +160,10 @@ class BoardConfig(NamedTuple):
     pool_column: str
     blocked_by_column: str
     priority_map: dict[str, str]
+    status_available: str = ""
+    status_claimed: str = ""
+    status_review: str = ""
+    status_done: str = ""
 
 
 @dataclass(frozen=True)
@@ -178,6 +189,18 @@ class Resolved:
     #: config. Project files and repo entries cannot set it: the host
     #: budget is one machine fact, and it reads as unknown there.
     resources: "Tables | None" = None
+    #: The raw ``[heavy]`` table from the project file, or {} when it
+    #: sets none. The lane validates it through ``heavy.check_table``;
+    #: this stays unchecked here so the shape errors name the lane in
+    #: one place. Repo entries cannot set it: the table is project-wide,
+    #: and it reads as unknown settings there.
+    heavy: dict = field(default_factory=dict)
+    #: The raw ``[hygiene.<name>]`` tables from the project file, or {}
+    #: when the project sets none. Hygiene validates them through
+    #: ``hygiene.check_table``; this stays unchecked here so the shape
+    #: errors name the rule in one place. Repo entries cannot set them:
+    #: rules are project-wide, and they read as unknown settings there.
+    hygiene: dict = field(default_factory=dict)
     #: Raw ``[profiles.<name>]`` tables, the host config shadowing the
     #: project file per name. The launch path validates them through
     #: ``profiles.validate``; this stays unchecked here so the shape and
@@ -351,12 +374,19 @@ _BOARD_COLUMNS = (
     "blocked_by_column",
 )
 
+#: Concept keys holding a Status option id per derived state; the one
+#: source is ``boardstatus.STATUS_ID_ATTRS`` (the state-to-attribute
+#: map the status step and the doctor resolve ids through), read here
+#: as plain attribute names. All default to unmapped when the table
+#: omits them, and a state with no id is never synced.
+_BOARD_STATUS_IDS = tuple(attr for _, attr in STATUS_ID_ATTRS)
+
 #: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
 #: the ``[private]`` precedent: strict keys, so a typo fails here instead
 #: of silently running label mode. Derived from the
-#: address and column groups above (plus ``priority_map``), so a concept
-#: added to one group is never silently dropped by the other.
-_BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",))
+#: address, column and status-id groups above (plus ``priority_map``),
+#: so a concept added to one group is never silently dropped by the other.
+_BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",) + _BOARD_STATUS_IDS)
 
 
 def _split_board(raw, where):
@@ -404,7 +434,7 @@ def _check_board(raw, where):
     if (number is None) == (node is None):
         raise SettingsError(f"{where}: [board] needs exactly one of project_number or project_id")
     columns = {}
-    for key in _BOARD_COLUMNS:
+    for key in _BOARD_COLUMNS + _BOARD_STATUS_IDS:
         if key not in raw:
             columns[key] = ""
             continue
@@ -412,6 +442,10 @@ def _check_board(raw, where):
         if not isinstance(value, str) or not value:
             raise SettingsError(f"{where}: [board] {key} must be a non-empty string")
         columns[key] = value
+    if any(columns[key] for key in _BOARD_STATUS_IDS) and not columns["status_column"]:
+        raise SettingsError(
+            f"{where}: [board] status option ids need status_column to name the Status column"
+        )
     mapping = raw.get("priority_map", {})
     if not isinstance(mapping, dict):
         raise SettingsError(f"{where}: [board] priority_map must be a table of option ids")
@@ -518,6 +552,41 @@ def _repo_entries(repos, project_name):
     return entries, boards, repo_profiles
 
 
+def read_project(root):
+    """The ops root's parsed ``korapy.toml`` table, from one file read.
+
+    ``{}`` when there is no root or no file. A broken file raises
+    SettingsError. The one reader for entry views: matching, the
+    tracker map and settings resolution all take this table instead of
+    reading the file again, so one pass never mixes tables from a
+    concurrent edit.
+    """
+    _load_providers()
+    if not root:
+        return {}
+    return _load(os.path.join(root, PROJECT_FILE))
+
+
+def read_host(env=None):
+    """The host config's parsed table, from one file read.
+
+    ``{}`` when there is no file. A broken file raises SettingsError.
+    """
+    env = os.environ if env is None else env
+    return _load(os.path.join(paths.config_dir(env), HOST_CONFIG_NAME))
+
+
+def entry_names(table, project_name):
+    """Names of the ``[[repo]]`` entries in one parsed project table.
+
+    `table` is the pre-read project file (see `read_project`): the one
+    validated derivation of entry names, shared by matching and the
+    tracker map instead of re-reading entry names from the raw table.
+    """
+    entries, _, _ = _repo_entries(table.get("repo", []), project_name)
+    return list(entries)
+
+
 def repo_names(root):
     """Names of the ``[[repo]]`` entries in the ops root's korapy.toml,
     in file order. Empty when there is no root or no file."""
@@ -525,9 +594,37 @@ def repo_names(root):
     if not root:
         return []
     project_path = os.path.join(root, PROJECT_FILE)
-    project = _load(project_path)
-    entries, _, _ = _repo_entries(project.get("repo", []), project_path)
-    return list(entries)
+    return entry_names(read_project(root), project_path)
+
+
+def match_covering(table, root, clone, project_name):
+    """The ``[[repo]]`` entry name whose ``clone.path`` covers ``clone``.
+
+    `table` is the pre-read project file (see `read_project`): the
+    match validates that single parse instead of reading the file
+    again. A relative `clone.path` resolves against the ops root, and
+    the match compares real paths, so the answer never depends on the
+    working directory. Several entries covering the same clone are a
+    SettingsError: the entry name keys hooks and ticket records, so it
+    must stay unambiguous. None when no entry covers the clone.
+    """
+    entries, _, _ = _repo_entries(table.get("repo", []), project_name)
+    want = os.path.realpath(clone)
+    matched = []
+    for name, values in entries.items():
+        path = values.get("clone.path")
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(root, path))
+        if os.path.realpath(path) == want:
+            matched.append(name)
+    if len(matched) > 1:
+        raise SettingsError(
+            f"{project_name}: several [[repo]] entries match this clone "
+            f"({', '.join(matched)}): give each entry a distinct clone.path"
+        )
+    return matched[0] if matched else None
 
 
 def covering_repo(root, clone):
@@ -543,23 +640,7 @@ def covering_repo(root, clone):
     if not root:
         return None
     project_path = os.path.join(root, PROJECT_FILE)
-    entries, _, _ = _repo_entries(_load(project_path).get("repo", []), project_path)
-    want = os.path.realpath(clone)
-    matched = []
-    for name, values in entries.items():
-        path = values.get("clone.path")
-        if not path:
-            continue
-        if not os.path.isabs(path):
-            path = os.path.normpath(os.path.join(root, path))
-        if os.path.realpath(path) == want:
-            matched.append(name)
-    if len(matched) > 1:
-        raise SettingsError(
-            f"{project_path}: several [[repo]] entries match this clone "
-            f"({', '.join(matched)}): give each entry a distinct clone.path"
-        )
-    return matched[0] if matched else None
+    return match_covering(read_project(root), root, clone, project_path)
 
 
 def private(root):
@@ -567,11 +648,23 @@ def private(root):
 
     Empty when there is no root or no file. Shape and regex errors are
     SettingsError (exit 4). The host config is never read: private terms
-    live on the ops side only, so only the ops root's file counts."""
+    live on the ops side only, so only the ops root's file counts. A
+    thin wrapper over `private_from_table`: the table form holds the
+    only ``[private]`` resolution."""
     if not root:
         return Private(terms=[], patterns=[])
     project_path = os.path.join(root, PROJECT_FILE)
-    return resolve(project=_load(project_path), env={}, project_name=project_path).private
+    return private_from_table(read_project(root), project_path)
+
+
+def private_from_table(table, project_name):
+    """The ``[private]`` terms from one pre-read project table.
+
+    `table` is the `read_project` result the caller already holds, so a
+    gate that parsed the file once never reads it again for the leak
+    terms; `project_name` names the file in errors, as in `private`.
+    Shape and regex errors are SettingsError (exit 4)."""
+    return resolve(project=dict(table or {}), env={}, project_name=project_name).private
 
 
 def find_root(start):
@@ -626,6 +719,12 @@ def resolve(
         result["resources.gone_s"] = Value(_check("resources.gone_s", nested_gone, host_name), HOST)
 
     repos = project.pop("repo", [])
+    heavy_raw = project.pop("heavy", {})
+    if not isinstance(heavy_raw, dict):
+        raise SettingsError(f"{project_name}: [heavy] must be a table")
+    hygiene_raw = project.pop("hygiene", {})
+    if not isinstance(hygiene_raw, dict):
+        raise SettingsError(f"{project_name}: [hygiene] must be a table of rules")
     if "models" in project:
         _reject_models(project_name)
     private = _check_private(project.pop("private", {}), project_name)
@@ -686,6 +785,8 @@ def resolve(
         private,
         board,
         resources.check_tables(resource_tables, host_name),
+        heavy=dict(heavy_raw),
+        hygiene=dict(hygiene_raw),
         profiles={**project_profiles, **host_profiles},
         profile_committed={
             "default": profile_default,
@@ -706,8 +807,8 @@ def load(root=None, repo=None, env=None, flags=None):
     host_path = os.path.join(paths.config_dir(env), HOST_CONFIG_NAME)
     project_path = os.path.join(root, PROJECT_FILE) if root else None
     return resolve(
-        host=_load(host_path),
-        project=_load(project_path) if project_path else {},
+        host=read_host(env),
+        project=read_project(root),
         repo=repo,
         env=env,
         flags=flags,

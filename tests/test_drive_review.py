@@ -204,42 +204,58 @@ class FinishedHoldersTest(unittest.TestCase):
 
 class ResolveFinishedTest(unittest.TestCase):
     def test_a_same_pass_release_wins_with_the_known_role(self):
-        resolved = drive.resolve_finished({("app", 7): (WORKER, "worker")}, {("app", 7): WORKER})
-        self.assertEqual(resolved, {("app", 7): (WORKER, "worker")})
+        resolved = drive.resolve_finished(
+            {("app", 7): (WORKER, "worker", "ok")}, {("app", 7): WORKER}
+        )
+        self.assertEqual(resolved, {("app", 7): (WORKER, "worker", "ok")})
 
     def test_a_same_pass_release_of_an_unknown_agent_reads_as_unreviewed(self):
         resolved = drive.resolve_finished({}, {("app", 7): WORKER})
-        self.assertEqual(resolved, {("app", 7): (WORKER, None)})
+        self.assertEqual(resolved, {("app", 7): (WORKER, None, None)})
 
     def test_a_same_pass_release_supersedes_an_older_finished_entry(self):
         resolved = drive.resolve_finished(
-            {("app", 7): ("drive-host-1-10000-acme--app-7", "reviewer")},
+            {("app", 7): ("drive-host-1-10000-acme--app-7", "reviewer", "ok")},
             {("app", 7): WORKER},
         )
-        self.assertEqual(resolved, {("app", 7): (WORKER, None)})
+        self.assertEqual(resolved, {("app", 7): (WORKER, None, None)})
 
     def test_cross_pass_entries_stand_without_a_release(self):
-        finished = {("app", 7): (REVIEWER, "reviewer")}
+        finished = {("app", 7): (REVIEWER, "reviewer", "ok")}
         self.assertEqual(drive.resolve_finished(finished, {}), finished)
         self.assertEqual(drive.resolve_finished(None, None), {})
 
     def test_a_same_pass_release_keeps_the_role_through_the_ticket_resolver(self):
         resolved = drive.resolve_finished(
-            {("app", 7): (UNIT, "reviewer")},
+            {("app", 7): (UNIT, "reviewer", "ok")},
             {("app", 7): HOLDER},
             agent_states={UNIT: (FINISHED, NOW)},
             agent_tickets={UNIT: ("app", 7)},
         )
-        self.assertEqual(resolved, {("app", 7): (HOLDER, "reviewer")})
+        self.assertEqual(resolved, {("app", 7): (HOLDER, "reviewer", "ok")})
 
     def test_a_release_for_a_newer_entry_drops_the_older_role(self):
         resolved = drive.resolve_finished(
-            {("app", 7): (UNIT, "reviewer")},
+            {("app", 7): (UNIT, "reviewer", "ok")},
             {("app", 7): HOLDER},
             agent_states={UNIT_R1: (FINISHED, NOW)},
             agent_tickets={UNIT_R1: ("app", 7)},
         )
-        self.assertEqual(resolved, {("app", 7): (HOLDER, None)})
+        self.assertEqual(resolved, {("app", 7): (HOLDER, None, None)})
+
+    def test_short_cross_pass_entries_read_as_unreviewed(self):
+        self.assertEqual(
+            drive.resolve_finished({("app", 7): None}, {}),
+            {("app", 7): (None, None, None)},
+        )
+        self.assertEqual(
+            drive.resolve_finished({("app", 7): ()}, {}),
+            {("app", 7): (None, None, None)},
+        )
+        self.assertEqual(
+            drive.resolve_finished({("app", 7): (WORKER,)}, {}),
+            {("app", 7): (WORKER, None, None)},
+        )
 
 
 class FixModeTest(unittest.TestCase):
@@ -339,7 +355,7 @@ class ProductionFinishedForTest(unittest.TestCase):
         self.register_done("worker-1", "app", 7, "worker", at=1000.0)
         self.register_done("reviewer-1", "app", 7, "reviewer", at=2000.0)
         found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
-        self.assertEqual(found, {("app", 7): ("reviewer-1", "reviewer")})
+        self.assertEqual(found, {("app", 7): ("reviewer-1", "reviewer", "ok")})
 
     def test_live_entries_and_ticketless_entries_are_ignored(self):
         self.register_done("worker-1", "app", 7, "worker", at=1000.0)
@@ -347,7 +363,7 @@ class ProductionFinishedForTest(unittest.TestCase):
         registry.register("lonely-1", "muse", now=2000.0, path=self.dir)
         registry.done("lonely-1", now=2001.0, path=self.dir)
         found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
-        self.assertEqual(found, {("app", 7): ("worker-1", "worker")})
+        self.assertEqual(found, {("app", 7): ("worker-1", "worker", "ok")})
 
     def test_entries_without_a_role_read_as_unreviewed(self):
         registry.register(
@@ -359,7 +375,7 @@ class ProductionFinishedForTest(unittest.TestCase):
         )
         registry.done("old-1", now=1001.0, path=self.dir)
         found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
-        self.assertEqual(found, {("app", 7): ("old-1", "")})
+        self.assertEqual(found, {("app", 7): ("old-1", "", "ok")})
 
 
 class ProductionAgentRolesTest(unittest.TestCase):
@@ -1464,6 +1480,7 @@ class ClaimRaceTest(unittest.TestCase):
             "now": NOW,
             "stale_after": 3600.0,
             "restarts_path": self.budget,
+            "driven": {gated.project: frozenset({gated.repo})},
         }
         values.update(over)
         launcher = values["launcher"]
@@ -1484,6 +1501,29 @@ class ClaimRaceTest(unittest.TestCase):
         )
         rows, started, blocked, launched, launcher = self.launch(
             store, gated, released={}, finished={}
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].verdict, "skip")
+        self.assertEqual(rows[0].code, "claim")
+        self.assertIn("finished worker id lost", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_review_with_an_empty_finished_entry_is_skipped_without_claiming(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="review",
+            verdict="review",
+            reason="app#7: unclaimed, review slot",
+            code="",
+        )
+        rows, started, blocked, launched, launcher = self.launch(
+            store, gated, released={}, finished={("app", 7): ()}
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].verdict, "skip")
