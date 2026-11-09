@@ -653,6 +653,78 @@ class SecondCloneCase(OpsFixture):
         self.assertIn("has no [profiles.default] table", err)
         self.assertNotIn("carries a different", err)
 
+    def test_second_runtime_without_runtime_key_names_key(self):
+        code, _, _ = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "make check",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.clone,
+        )
+        self.assertEqual(code, 0)
+        target = os.path.join(self.ops, "korapy.toml")
+        with open(target, encoding="utf-8") as handle:
+            text = handle.read()
+        edited = text.replace('[profiles.default]\nruntime = "omp"\n', "[profiles.default]\n")
+        self.assertNotEqual(edited, text)
+        self.assertIn("[profiles.default]", edited)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(edited)
+        code, _, err = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "npm test",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.other,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("has no `runtime` key", err)
+        self.assertNotIn("carries a different", err)
+
+    def test_second_runtime_with_other_default_selection_names_selection(self):
+        code, _, _ = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "make check",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.clone,
+        )
+        self.assertEqual(code, 0)
+        target = os.path.join(self.ops, "korapy.toml")
+        with open(target, encoding="utf-8") as handle:
+            text = handle.read()
+        edited = text.replace('[profile]\ndefault = "default"\n', '[profile]\ndefault = "other"\n')
+        self.assertNotEqual(edited, text)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(edited)
+        code, _, err = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "npm test",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.other,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("[profile] default", err)
+        self.assertIn("'default'", err)
+        self.assertNotIn("carries a different", err)
+
 
 class ResolverErrorsCase(OpsFixture):
     """A broken ops `korapy.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""

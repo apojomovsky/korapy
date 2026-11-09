@@ -790,26 +790,57 @@ def _split_default_table(data):
     return default if isinstance(default, dict) else None
 
 
+def _split_profile_refusal(data, runtime):
+    """The converge-refusal reason for an explicit `--runtime`, if it refuses.
+
+    None when the parsed ops file already carries `runtime`: no flag, or a
+    matching `[profiles.default]` runtime plus the `[profile]` default
+    selection. Otherwise the reason the refusal names, so the message is
+    true for every cause: a missing `[profiles.default]` table, a table
+    with no `runtime` key, a `[profile]` default selection naming another
+    profile, or a runtime that differs. The split layout is append-only:
+    `init` adds `[[repo]]` entries but never rewrites the shared profile
+    tables, which other entries may already rely on.
+    """
+    if runtime is None:
+        return None
+    default = _split_default_table(data)
+    if default is None:
+        return (
+            "has no [profiles.default] table: add one "
+            f"carrying --runtime {runtime!r} by hand, init "
+            "never rewrites the shared profile tables"
+        )
+    if "runtime" not in default:
+        return (
+            "has no `runtime` key in [profiles.default]: add "
+            f"`runtime = {runtime!r}` by hand, init "
+            "never rewrites the shared profile tables"
+        )
+    profile = data.get("profile")
+    selected = profile.get("default") if isinstance(profile, dict) else None
+    if selected != profiles.DEFAULT_PROFILE_NAME:
+        return (
+            f"carries [profile] default = {selected!r} instead of "
+            f"{profiles.DEFAULT_PROFILE_NAME!r}: restore the selection by hand, init "
+            "never rewrites the shared profile tables"
+        )
+    if default.get("runtime") != runtime:
+        return (
+            "carries a different [profiles.default] runtime "
+            f"than --runtime {runtime!r}: change it by hand, init "
+            "never rewrites the shared profile tables"
+        )
+    return None
+
+
 def _split_profiles_converged(data, inputs):
     """Whether the parsed ops file already carries `inputs.runtime`.
 
-    The split layout is append-only: `init` adds `[[repo]]` entries but
-    never rewrites the shared profile tables, which other entries may
-    already rely on. No `--runtime` flag never touches them, so it always
-    reads as converged. An explicit flag must match the file's
-    `[profiles.default]` runtime plus the `[profile]` default selection;
-    anything else (including a missing table) is refused for a hand edit.
+    The reason a refusal names is resolved in one place,
+    `_split_profile_refusal`; this stays as the boolean read of it.
     """
-    runtime = inputs.runtime
-    if runtime is None:
-        return True
-    default = _split_default_table(data)
-    if default is None:
-        return False
-    if default.get("runtime") != runtime:
-        return False
-    profile = data.get("profile")
-    return isinstance(profile, dict) and profile.get("default") == profiles.DEFAULT_PROFILE_NAME
+    return _split_profile_refusal(data, inputs.runtime) is None
 
 
 def _split_toml_change(toml_target, inputs):
@@ -834,17 +865,7 @@ def _split_toml_change(toml_target, inputs):
         block = _profiles_block(inputs)
         if block:
             sys.stdout.write(block)
-        if _split_default_table(data) is None:
-            raise InitError(
-                f"{toml_target} has no [profiles.default] table: add one "
-                f"carrying --runtime {inputs.runtime!r} by hand, init "
-                "never rewrites the shared profile tables"
-            )
-        raise InitError(
-            f"{toml_target} carries a different [profiles.default] runtime "
-            f"than --runtime {inputs.runtime!r}: change it by hand, init "
-            "never rewrites the shared profile tables"
-        )
+        raise InitError(f"{toml_target} {_split_profile_refusal(data, inputs.runtime)}")
     entries = data.get("repo")
     if entries is None:
         entries = []
