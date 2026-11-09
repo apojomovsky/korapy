@@ -252,16 +252,22 @@ def _is_tracker_repo_get_with_default(node):
 
     The default-argument fallback needs no `or`: the fallback default
     already re-introduces a second resolver, so it is flagged wherever
-    it appears.
+    it appears. The key may arrive positionally or as a keyword (the
+    way `_is_tracker_repo_read` already treats `or` values): only a
+    call carrying the key beside a fallback counts, so a bare keyword
+    read with no default still passes.
     """
     if not isinstance(node, ast.Call):
         return False
     func = node.func
     if not (isinstance(func, ast.Attribute) and func.attr == "get"):
         return False
-    if not node.args or not _is_tracker_repo_const(node.args[0]):
-        return False
-    return len(node.args) > 1 or bool(node.keywords)
+    if node.args:
+        if not _is_tracker_repo_const(node.args[0]):
+            return False
+        return len(node.args) > 1 or bool(node.keywords)
+    keyed = [keyword for keyword in node.keywords if _is_tracker_repo_const(keyword.value)]
+    return bool(keyed) and len(node.keywords) > len(keyed)
 
 
 def _or_offenders(tree, name):
@@ -309,6 +315,16 @@ class ResolverGuard(unittest.TestCase):
     def test_get_with_default_argument_is_flagged(self):
         tree = ast.parse('repo = resolved.get("tracker.repo", name)\n')
         self.assertEqual(_default_offenders(tree, "snippet"), ["snippet:1"])
+        self.assertEqual(_or_offenders(tree, "snippet"), [])
+
+    def test_get_with_keyword_key_and_default_is_flagged(self):
+        tree = ast.parse('repo = resolved.get(key="tracker.repo", default=name)\n')
+        self.assertEqual(_default_offenders(tree, "snippet"), ["snippet:1"])
+        self.assertEqual(_or_offenders(tree, "snippet"), [])
+
+    def test_get_with_keyword_key_and_no_default_passes(self):
+        tree = ast.parse('repo = resolved.get(key="tracker.repo")\n')
+        self.assertEqual(_default_offenders(tree, "snippet"), [])
         self.assertEqual(_or_offenders(tree, "snippet"), [])
 
     def test_plain_reads_without_a_fallback_pass(self):
