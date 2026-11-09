@@ -11,7 +11,7 @@ Conventions: module, function and file names quoted below were
 read from the tree at design time (`github/gh.py`,
 `github/ghshim.py`, `github/gh_shim.py`, `github/forge.py`,
 `github/tracker.py`, `forge.py`, `tracker.py`, `paths.py`,
-`githubcli.py`, `mergecli.py`). Behavior not yet implemented is
+`githubcli.py`, `github/ghcli.py`, `mergecli.py`). Behavior not yet implemented is
 marked PROPOSED; everything else describes the tree as it stands.
 
 ## 0. Scope and non-goals
@@ -87,9 +87,12 @@ Safe to retry, because repeating the call converges:
 
 Not safe to retry blindly:
 
-- comment post: a repeated POST writes twice. Only the comment
-  verb retries it, and only through its list-before-post guard
-  (section 2), which makes the retry converge;
+- comment post: a repeated POST writes twice. A rate-limit
+  answer means the POST was rejected and never landed, so the
+  comment verb retries those answers bare; re-execution after
+  a timeout (the first POST may have landed) still requires
+  the `--expect` list-before-post guard (section 2), which
+  makes that retry converge;
 - repo create: a repeated create loses the same race twice.
   `ForgeExists` stays the caller's signal, not a retry;
 - the merge PUT without the pre-read pin: an unverified merge
@@ -106,13 +109,16 @@ commit it additionally checks the recorded commit's parents
 include the pinned head, reusing `_check_merge_parents`. A
 merged PR whose head moved past the pin stays `ForgeRefused`:
 someone else landed other work, and the caller must look, not
-retry.
+retry. A merged state with no recorded merge SHA (`merge_sha
+None`) fails closed: the verb refuses (or re-verifies live)
+instead of returning a SHA it cannot name.
 
 The helper serves both new verbs and the existing adapters: the
 verbs call it around their one `run`, and the adapters call it
 around theirs, so an in-process caller (the drive pass, `korapy
 merge`) waits the same way a script does. The shim keeps pacing
-agent calls as today and never sleeps: its best-effort contract
+agent calls as today and never waits until reset: it still naps
+through `acquire`, but its best-effort contract
 (a broken bucket must never break `gh`) is unchanged.
 
 ## 2. Verbs for what the scripts do
@@ -127,27 +133,31 @@ no verb. `docs/commands.md` gains the rows in the implementing
 PRs, not in this doc.
 
 PROPOSED: the verbs live in `githubcli.py`, in the existing
-`korapy github` group beside `setup` and `gh-calls`:
+`korapy github` group beside `setup`. The top-level
+`korapy gh-calls` summary (`github/ghcli.py`, wired in `cli.py`)
+stays where it is; the new verbs do not join it, so
+`docs/commands.md` rows land in the `github` section:
 
-| Verb | Interface method | Exit codes |
-| --- | --- | --- |
-| `korapy github pr-state REPO N [--json]` | `Forge.pull_request` | 0 with the state; 3 unreachable (a give-up names the reset, section 1); 4 usage |
-| `korapy github pr-merge REPO N --head SHA [--method squash\|merge]` | `Forge.merge` | 0 merged, printing the SHA (`already merged <sha>` when merge-if-not-merged fires); 1 refused; 2 another merger holds the repo lock; 3 unreachable |
-| `korapy github issue-labels REPO N [--add L \| --remove L]` | read: the item's labels; write: `Tracker.add_label` / `Tracker.remove_label` | 0; 1 rejected or refused; 3 unreachable; 4 usage (a name outside the loop-owned set, a `ValueError` today) |
-| `korapy github comment REPO N (--body T \| --body-file F) [--expect LINE]` | `Tracker.comments` then `Tracker.comment` | 0 posted, or `already posted` when `--expect` names a line the listing already holds; 3 unreachable; 4 usage |
-| `korapy github rate-limit [--json]` | `GET rate_limit` | 0 with remaining and reset per resource; 3 unreachable; never a refusal |
+| Verb | Interface method | Exit codes | Errors |
+| --- | --- | --- | --- |
+| `korapy github pr-state REPO N [--json]` | `Forge.pull_request` | 0 with the state; 3 unreachable (a give-up names the reset, section 1); 4 usage | `ForgeError` to 3; a missing PR to 1, never 3 (the provider answered) |
+| `korapy github pr-merge REPO N --head SHA [--method squash\|merge]` | `Forge.merge` | 0 merged, printing the SHA (`already merged <sha>` when merge-if-not-merged fires); 1 refused; 2 another merger holds the repo lock; 3 unreachable | `ForgeRefused` to 1; `ForgeError` to 3 |
+| `korapy github issue-labels REPO N [--add L \| --remove L]` | read: `Tracker.item` labels; write: `Tracker.add_label` / `Tracker.remove_label` | 0; 1 rejected or refused; 3 unreachable; 4 usage (a name outside the loop-owned set, a `ValueError` today) | `ValueError` to 4; `TrackerRejected` to 1; `TrackerError` to 3 |
+| `korapy github comment REPO N (--body T \| --body-file F) [--expect LINE]` | `Tracker.comments` then `Tracker.comment` | 0 posted, or `already posted` when `--expect` names a line the listing already holds; 3 unreachable; 4 usage | `TrackerError` to 3; an `--expect` hit is 0, never 1 |
+| `korapy github rate-limit [--json]` | `GET rate_limit` | 0 with remaining and reset per resource; 3 unreachable; never a refusal | any adapter failure to 3; never 1 |
 
 Notes on the table. The read half of `issue-labels` is the
 cached read of section 3; the write half invalidates it. The
-comment verb always lists live (comments are not cached), so a
-retry converges through `--expect`: ship pipelines pass the
-decision line they post, and a re-run after a timeout finds its
-own line instead of posting twice. `pr-merge` takes the same
-one-merger-per-repo lock `korapy merge` takes, so two ships
-racing one PR resolve to 0 plus 2, never to a double merge.
-Every verb retries rate-limit answers through section 1 within
-the same bound; the bound, not the verb, decides when waiting
-stops.
+comment verb always lists live (comments are not cached): a
+retry past a rate-limit answer needs no guard (the POST never
+landed), while a re-run after a timeout converges through
+`--expect`, since ship pipelines pass the decision line they
+post and find their own line instead of posting twice.
+`pr-merge` takes the same one-merger-per-repo lock `korapy
+merge` takes, so two ships racing one PR resolve to 0 plus 2,
+never to a double merge. Every verb retries rate-limit answers
+through section 1 within the same bound; the bound, not the
+verb, decides when waiting stops.
 
 ## 3. A small read cache with a time-to-live
 
@@ -157,8 +167,8 @@ while a coordinator scans a queue, the rate-limit reading on
 every retry. Each such read costs a call today.
 
 PROPOSED: a host-shared read cache for exactly three reads: PR
-state (`Forge.pull_request`), issue labels (the item's label
-names), and the rate-limit reading. One helper beside the
+state (`Forge.pull_request`), issue labels (`Tracker.item`
+label names), and the rate-limit reading. One helper beside the
 adapters, for example `github/readcache.py`, over plain files;
 one path resolver in `paths.py`, for example
 `github_cache_dir()` under `cache_dir()`, so the location is one
@@ -171,14 +181,16 @@ closed.
 Keys keep tenants apart. The file path is
 `<github_cache>/<login>/<owner>/<repo>/<verb>-<args>.json`,
 where `login` is the forge's `current_user` (so two accounts on
-one host never share entries), `owner/repo` is the tracker
-spelling (so two repositories never share entries), and `args`
-is the canonical verb arguments (number, label set requested).
+one host never share entries), `owner/repo` is the
+`Tracker.canonical_repo` spelling (`src/korapy/tracker.py`; so
+two repositories never share entries), and `args` is the
+canonical verb arguments (number, label set requested).
 `current_user` itself costs one call per process: it is memoized
 in-process and backed by a `self.json` entry with its own short
-TTL, so the common case costs nothing. No token material ever
-enters a key or a file; the login is an account name, not a
-secret.
+TTL, so the common case costs nothing. The `self.json` file is
+keyed by a hash of the token, hash only, so two accounts never
+share it. No token material ever enters a key or a file; keys
+and entries carry account names and hashes, never secrets.
 
 PROPOSED TTLs, as constants beside the helper (settings only if
 a fleet proves a kind needs tuning): PR state 60 seconds, issue
@@ -194,7 +206,10 @@ stale: `pr-merge` drops that PR's state entry after a merge;
 `ensure_labels` (setup path) drops the repo's label entries.
 Comment posts invalidate nothing, because comments are not
 cached. A delete that finds no file succeeds: invalidation is
-idempotent like the writes.
+idempotent like the writes. A delete racing a read-through
+repopulation only costs freshness within the TTL: the stale
+entry expires on its own, so the bound on a wrong read stays
+one TTL.
 
 ## 4. Batching, later
 
@@ -221,29 +236,32 @@ cooldown. The bucket's own tally then reads fuller than the
 account is.
 
 PROPOSED: the reported remaining count is the authority, and it
-reconciles downward only. Every paced REST answer carries
-rate-limit headers, and the retry path's `rate_limit` read
-carries both resources; the pacer (same state file, same lock)
-folds them in with a function shaped like
-`note_reported(resource, remaining, reset_epoch)`: tokens drop
-to the reported remaining mapped onto bucket units when that is
-lower than the tally, never rise to it when higher (a stale high
-read must not grant a burst), and a zero remaining pushes the
-cooldown to the reported reset. One resource's report never
-touches the other resource's balance: core and graphql keep
-separate sub-balances in the same file, because a REST burst
-must not drain GraphQL headroom. Mapping detail (units per
-reported point) stays in the implementing ticket; the rule here
-is only the direction: down on report, up on refill, never up
-on report.
+reconciles downward only. Paced REST calls run through
+`gh api -i`, and the seam parses `x-ratelimit-remaining` and
+`x-ratelimit-reset` out of the headers before splitting the
+body; the retry path's `rate_limit` read carries both
+resources. The pacer (same state file, same lock) folds them in
+with a function shaped like `note_reported(resource, remaining,
+reset_epoch)`: tokens drop to the reported remaining mapped
+onto bucket units when that is lower than the tally, never rise
+to it when higher (a stale high read must not grant a burst),
+and a zero remaining pushes the cooldown to the reported reset.
+One resource's report never touches the other resource's
+balance: core and graphql keep separate sub-balances in the
+same file, because a REST burst must not drain GraphQL
+headroom. Mapping detail (units per reported point) stays in
+the implementing ticket; the rule here is only the direction:
+down on report, up on refill, never up on report.
 
 Per-pass call counts, so a reviewer can price a script. A cache
 hit costs zero; misses cost what the adapter costs today:
 
 - `pr-state`: 1 REST read.
 - `pr-merge`: 3 calls for squash (pre-read, PUT, verify read),
-  4 for a merge commit (plus the parents read); 1 when
-  merge-if-not-merged short-circuits on the pre-read.
+  4 for a merge commit (plus the `GET commits/{sha}` parents
+  read in `_check_merge_parents`); 1 for squash and 2 for a
+  merge commit when merge-if-not-merged short-circuits on the
+  pre-read (the merge-commit tie re-reads the parents).
 - `issue-labels` read: 1 REST read; `--add` / `--remove`: 1
   write each, plus invalidation with no call.
 - `comment`: the listing (usually 1 page) plus 1 post; 1 page
@@ -266,14 +284,20 @@ cache. `docs/commands.md` updates ride with the verb PRs.
 1. Retry that waits: the `run_with_reset_wait` helper with
    injected clock and sleep, the `github.retry_max_wait_s`
    setting, merge-if-not-merged in `GithubForge.merge` with its
-   head-moved refusal, exit 3 with the reset time in the
-   message, and the downward-only `note_reported`
-   reconciliation in the pacer. Tests with fake `run`, clock
-   and sleep: reset read from `rate_limit` not guessed, bound
-   honored across sleep plus calls, give-up exits 3 naming the
-   reset, safe verbs retried, comment post not retried without
-   its guard, merged-at-pinned-head returns the SHA, moved head
-   refuses.
+   head-moved refusal and its merged-at-pin-but-`merge_sha
+   None` fail-closed refusal, exit 3 with the reset time in the
+   message, the `gh api -i` header capture in the seam, and the
+   downward-only `note_reported` reconciliation in the pacer.
+   New per-resource keys are read with `.get` defaults matching
+   a full bucket, so old `graphql-pacing.json` files (which
+   lack them) never trip the corrupt-state backoff. Tests with
+   fake `run`, clock and sleep: reset read from `rate_limit`
+   not guessed, bound honored across sleep plus calls, give-up
+   exits 3 naming the reset, safe verbs retried, bare comment
+   retry on rate-limit answers but `--expect` required past a
+   timeout, merged-at-pinned-head returns the SHA, `merge_sha
+   None` at the pin refuses, moved head refuses, and an old
+   state file without the new keys paces without backing off.
 2. The five verbs in `githubcli.py` with the exit codes in the
    section 2 table, the repo merger lock on `pr-merge`, the
    `--expect` guard on `comment`, and the `commands.md` rows.
