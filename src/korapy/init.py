@@ -783,6 +783,13 @@ def _flatten_entry(entry):
     return flat
 
 
+def _split_default_table(data):
+    """The parsed ops file's `[profiles.default]` table, if it holds one."""
+    tables = data.get("profiles")
+    default = tables.get("default") if isinstance(tables, dict) else None
+    return default if isinstance(default, dict) else None
+
+
 def _split_profiles_converged(data, inputs):
     """Whether the parsed ops file already carries `inputs.runtime`.
 
@@ -796,9 +803,8 @@ def _split_profiles_converged(data, inputs):
     runtime = inputs.runtime
     if runtime is None:
         return True
-    tables = data.get("profiles")
-    default = tables.get("default") if isinstance(tables, dict) else None
-    if not isinstance(default, dict):
+    default = _split_default_table(data)
+    if default is None:
         return False
     if default.get("runtime") != runtime:
         return False
@@ -828,6 +834,12 @@ def _split_toml_change(toml_target, inputs):
         block = _profiles_block(inputs)
         if block:
             sys.stdout.write(block)
+        if _split_default_table(data) is None:
+            raise InitError(
+                f"{toml_target} has no [profiles.default] table: add one "
+                f"carrying --runtime {inputs.runtime!r} by hand, init "
+                "never rewrites the shared profile tables"
+            )
         raise InitError(
             f"{toml_target} carries a different [profiles.default] runtime "
             f"than --runtime {inputs.runtime!r}: change it by hand, init "
