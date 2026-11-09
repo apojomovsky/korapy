@@ -756,6 +756,27 @@ function driveCard(drive, nowMs) {
           " is removed from the state dir.",
       ),
     );
+    if (info.frozen === true) {
+      const freezeFile =
+        typeof info.freeze_file === "string" && info.freeze_file !== ""
+          ? info.freeze_file
+          : "the drive freeze file";
+      const until =
+        Array.isArray(info.freeze_until) && info.freeze_until.length > 0
+          ? info.freeze_until.join(", ")
+          : "a hand run of `korapy freeze end`";
+      section.appendChild(
+        field(
+          "Frozen",
+          "until " + until + " merges",
+          "The loop holds for a sweeping change. It resumes when " +
+            until +
+            " merge, or when " +
+            freezeFile +
+            " drops with `korapy freeze end`.",
+        ),
+      );
+    }
   } else {
     // A missing lock reading is not reported, never a healthy idle:
     // the adjacent last-pass age is the signal when the lock is mute.
@@ -1531,6 +1552,14 @@ export function attentionItems(doc, nowMs) {
       const reason =
         item && typeof item.reason === "string" && item.reason !== "" ? item.reason : "unknown";
       items.push("ready to merge " + ref + ": " + reason);
+    }
+    for (const item of Array.isArray(panel.research) ? panel.research : []) {
+      const ref = item && item.ref !== null && item.ref !== undefined ? String(item.ref) : "no ref";
+      const findings =
+        item && typeof item.findings === "string" && item.findings !== ""
+          ? item.findings
+          : "unknown";
+      items.push("research findings " + ref + ": " + findings);
     }
   }
   for (const [section, label] of [

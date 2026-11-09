@@ -164,6 +164,7 @@ what it means. Do not edit this table by hand.
 | `drive.max_starts_per_day` | `50` | real starts one dispatch pass may launch per calendar day (plans never count) |
 | `drive.period` | `'*:0/5'` | systemd OnCalendar cadence at which the installed timer wakes a pass |
 | `drive.pulls_max_calls` | `20` | max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed) |
+| `freeze.max_age_s` | `86400` | age in seconds after which a standing freeze warns in doctor instead of silently blocking starts |
 | `git.branch` | `'{type}/{issue}-{slug}'` | branch name template |
 | `git.commits.conventional` | `True` | enforce Conventional Commits |
 | `git.worktrees` | `'.worktrees/'` | worktree root, relative to the clone |
@@ -173,6 +174,7 @@ what it means. Do not edit this table by hand.
 | `hub.stale_after_s` | `90` | seconds after the last heartbeat a host reads stale on the merged dashboard |
 | `hub.url` | `''` | address of the hub, for example http://host-1:8000 (empty means single-host) |
 | `merge.method` | `'squash'` | how korapy merge lands a PR: a squash, or a merge commit |
+| `prompts.research` | `''` | override file for the research prompt (relative to the ops root) |
 | `prompts.reviewer` | `''` | override file for the reviewer prompt (relative to the ops root) |
 | `prompts.triage` | `''` | override file for the triage prompt (relative to the ops root) |
 | `prompts.worker` | `''` | override file for the worker prompt (relative to the ops root) |

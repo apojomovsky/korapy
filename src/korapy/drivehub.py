@@ -16,6 +16,7 @@ import sys
 import time
 
 from korapy import accounts, board, drive
+from korapy import freeze
 from korapy import hub as hubmod
 from korapy import paths, projects, quota, settings, syncli, trackers, units
 
@@ -334,6 +335,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 err=sys.stderr,
                 hold_label=hold_label,
                 pause_path=drive.pause_path(),
+                freeze_path=freeze.freeze_path(),
                 projects_fn=lambda: registered,
                 agent_states=planned_states,
                 finished_for=planned_finished,
@@ -407,6 +409,25 @@ def cmd_drive(args: argparse.Namespace) -> int:
             quota_pool,
             override=quota_refresh_override,
         )
+
+        def record_research_event(project, repo, number, findings_body):
+            from korapy import coordevents
+            from korapy.coord import project_root
+
+            coordevents.record(
+                [
+                    {
+                        "kind": "research",
+                        "ref": f"{repo}#{number}",
+                        "evidence": drive.research.first_line(findings_body),
+                        "state": findings_body,
+                    }
+                ],
+                root=project_root(project),
+                kinds=[],
+                now=moment,
+            )
+
         return drive.run_pass(
             plan=False,
             store=store,
@@ -430,6 +451,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             finished_for=finished_for,
             journal_path=drive.journal_path(),
             pause_path=drive.pause_path(),
+            freeze_path=freeze.freeze_path(),
             day_path=drive.day_path(),
             max_starts=max_starts,
             hub=hub,
@@ -442,6 +464,8 @@ def cmd_drive(args: argparse.Namespace) -> int:
             reprompt_resume=drive.production_reprompt_resume(
                 registered, store=store, hold_label=hold_label, now=moment
             ),
+            comments_for=drive.research_comments_for(tracker_factory),
+            record_event=record_research_event,
         )
 
 
