@@ -320,6 +320,37 @@ class PlanBand(unittest.TestCase):
         )
         self.assertEqual(got["waits"], ["unknown reason"])
 
+    def test_empty_ticket_and_reason_read_unknown(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {},
+            "waits": [{"ticket": "", "reason": ""}],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"][0]["ticket"], "unknown ticket")
+        self.assertEqual(got["next"][0]["tickets"], ["unknown ticket"])
+        self.assertEqual(got["next"][0]["waits"], "unknown reason")
+
+    def test_prefix_only_reason_reads_unknown(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {"cap": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: ",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"][0]["ticket"], "app#7")
+        self.assertEqual(got["next"][0]["waits"], "unknown reason")
+
     def test_reason_without_ticket_prefix_reads_verbatim(self):
         drive = {
             "last_pass_at": T0 - 100,
