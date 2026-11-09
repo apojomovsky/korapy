@@ -348,14 +348,43 @@ Per-candidate gate order, cheapest first:
    and skips this check: it never
    contacts the tracker. The summary line counts the listing calls
    (`pulls calls`), so a regression is visible at once.
-4. Hold: `hold.reason` over the ticket and linked PR labels.
+4. Area lock: one lane per label path. A project opts in with the
+   `drive.area_prefix` setting (default in [`configuration.md`](configuration.md)).
+   Empty means off: a label with the prefix names an area path split
+   on `:`, so `area:ci:suite` is the child of `area:ci`. Two areas
+   overlap when their paths are equal or one is a strict prefix of
+   the other, never siblings. The check refuses `start` only (a
+   `fix` or `resume` reclassified as a fresh start counts as one)
+   when another ticket in the same project's driven set holds an
+   overlapping area: a live claim (managed or foreign) holds, as
+   does an open linked pull while `drive.area_hold_until_merged`
+   (default in [`configuration.md`](configuration.md)) keeps the lock
+   held through review, and unreadable pulls hold too, failing
+   closed, unless `drive.area_fail_open`
+   (default in [`configuration.md`](configuration.md)) reads
+   claim-held areas only during a known outage. `resume`, `fix` and `review` on a
+   claimed row bypass it, as does `research`, and an empty prefix
+   disables it. A ticket with no area label always passes. The
+   reason names the ticket, the area and the holder, and every
+   refusal lands one `area` count in the journal's
+   skipped-by-reason, so the `snapshot` drive section measures the
+   serialization cost. The claiming loop re-runs the lock for each
+   proceeding start immediately before its fresh claim (before any
+   hub grant), with the tickets this pass already claimed added as
+   synthetic holders: two tickets in overlapping areas never both
+   start in one pass, and a refused second start burns no hub
+   grant. A claim-held area releases when the claim releases; a
+   pull-held area releases when no open linked pull on another
+   ticket holds it anymore (merged or closed). A ticket that is
+   both area-blocked and held reports the area reason.
+5. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
    not started, resumed or reviewed by the loop.
-5. Admission (`admission.admit` against live state from
+6. Admission (`admission.admit` against live state from
    `launch.admission_state`): project ceiling and repo cap first, then
    the host total with the floor rule.
-6. Quota gate over the project's chains against the shared ledger. A
+7. Quota gate over the project's chains against the shared ledger. A
    refused role is a skip for that candidate only; another project's
    chains may route around the exhausted provider.
 

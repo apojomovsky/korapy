@@ -564,6 +564,7 @@ class ProductionLauncherStartTest(unittest.TestCase):
         )
         with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
+                '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "omp"\n\n'
                 '[[repo]]\nname = "app"\nclone = { path = "clones/app" }\n'
                 'tracker.repo = "acme/app"\n'
             )

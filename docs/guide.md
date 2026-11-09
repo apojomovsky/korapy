@@ -91,6 +91,8 @@ What you should see is one row per check, `ok`, `warn` (`!`) or `fail`
 ✓ resources-foreign: no foreign claims
 ✓ profiles: no profiles declared
 ✓ profile-runtimes: no profile references a runtime
+✗ profile-default: no profiles declared: a launch with no profile selection fails (exit 4)
+  fix: declare [profiles.default] with a runtime, e.g. [profiles.default] runtime = "muse", or select a default with `korapy profile set --global NAME` or committed `profile.default`
 ```
 
 `doctor` exits 0 when every row is ok or warn, 1 on a failing check,
@@ -101,6 +103,9 @@ report as one document. Read `✓` as healthy, `!` as usable but open
 `✗` as stop and run the `fix:` line. On a host where the timer is
 not installed yet, the `drive-timer` row reads warn (`not installed`)
 instead of ok; it turns ok after `korapy drive install-timer` below.
+The `profile-default` fail above is the normal first-run state for a
+project with no declared profile yet: `korapy init` (below) writes the
+`[profiles.default]` table, and the row turns ok on the next run.
 
 Know where korapy keeps things:
 
@@ -280,14 +285,17 @@ remote when unset); `tracker.variant` is `labels` or `board`. A board
 entry adds a `[repo.board]` table mapping the project board, written
 by `korapy github setup`, never by hand.
 
-Profiles select the runtime and model chains per ticket and role:
+Profiles select the runtime and model chains per ticket and role.
+Every project declares its own default (`korapy init` writes this for
+you); there is no shipped default, so a launch with no declared or
+selected profile fails fast instead of running a setup nobody chose:
 
 ```toml
 [profile]
 default = "default"
 
 [profiles.default]
-runtime = "omp"
+runtime = "muse"
 
 [profiles.default.models.default]
 chain = ["provider-a/model-x"]
@@ -500,6 +508,40 @@ starts per UTC calendar day. Resumes and plans never count toward it.
 Once the cap stops a start the pass exits 1; the counter lives in the
 state dir (`drive.starts.json`) beside the journal
 (`drive/journal.jsonl`).
+
+### Areas: one lane per label path
+
+Two tickets editing the same corner of a project should never run at
+once. Opt in per project with a label prefix in the ops root, then
+label the tickets:
+
+```toml
+[drive]
+area_prefix = "area:"
+```
+
+A ticket carrying `area:ci` names the area path `ci`; a ticket
+carrying `area:ci:suite` names the child path `ci:suite`. A parent
+area overlaps every child, and children overlap their parents, never
+their siblings: one live worker on `area:ci` holds the whole lane,
+while `area:ci:suite` and `area:ci:lint` run side by side. A ticket
+with no area label always passes the check, and a ticket with several
+area labels holds the union.
+
+A refused start names the ticket, the area and the holder:
+
+```text
+app#12: area `ci` held by app#34 (agent `drive-abc`), start refused
+```
+
+The lock releases with the claim, or with the pull request when
+`drive.area_hold_until_merged` (default true) keeps it held through
+review. A project that maps a board area column and uses area labels
+at once gets a `korapy doctor` warning: the lock reads only the
+labels. Every refusal lands one `area` count in the journal, so the
+snapshot drive section measures the cost. During a known pulls outage
+the held areas fail closed; set `drive.area_fail_open` to read
+claim-held areas only until the listing heals.
 
 ## Driving as a coordinator
 

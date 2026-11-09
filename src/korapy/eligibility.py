@@ -142,6 +142,81 @@ def merged_pull(row: TicketRow):
     return None
 
 
+def area_paths(labels, *, prefix: str) -> tuple:
+    """The area paths a label list names under `prefix`. Pure.
+
+    An area is a label with the prefix whose suffix past it is a
+    non-empty `:`-separated path with no empty segment: with prefix
+    `"area:"` the label `area:ci:suite` names the path
+    `("ci", "suite")`. Matching is exact and case sensitive, like
+    labels everywhere. A bare prefix, or a suffix carrying an empty
+    segment (for example `area::x`), names no area and is ignored.
+    An empty prefix names nothing, so the lock stays off. Only
+    labels are read: a board `area` field never counts.
+    """
+    if not prefix:
+        return ()
+    found = []
+    for label in labels or ():
+        if not isinstance(label, str) or not label.startswith(prefix):
+            continue
+        suffix = label[len(prefix) :]
+        if not suffix:
+            continue
+        parts = tuple(suffix.split(":"))
+        if any(part == "" for part in parts):
+            continue
+        found.append(parts)
+    return tuple(found)
+
+
+def _areas_overlap(first: tuple, second: tuple) -> bool:
+    """Whether two area paths overlap: equal or one a strict prefix. Pure."""
+    length = min(len(first), len(second))
+    return first[:length] == second[:length]
+
+
+def area_hold(candidate: TicketRow, rows, *, prefix: str, hold_until_merged: bool = True):
+    """The blocking area path for `candidate`, else None. Pure.
+
+    A row holds its areas while it proves live work: a non-empty
+    `agent` claim (managed or foreign), or an open linked pull when
+    `hold_until_merged` is true. Unreadable pulls (None) count as
+    PR-held when `hold_until_merged` is true, failing closed; the
+    gate's fail-open option sits above this helper. The candidate's
+    own row never blocks itself. Two areas overlap when their paths
+    are equal or one is a strict path prefix of the other, so a
+    parent-area ticket blocks every child area and a busy child
+    blocks the parent, never siblings. The returned string is the
+    candidate's blocked area, joined with the fixed `":"` separator.
+    """
+    if not prefix:
+        return None
+    candidate_areas = area_paths(candidate.labels, prefix=prefix)
+    if not candidate_areas:
+        return None
+    for holder in rows or ():
+        if holder.repo == candidate.repo and holder.number == candidate.number:
+            continue
+        holds = bool(getattr(holder, "agent", "") or "")
+        if not holds and hold_until_merged:
+            pulls = getattr(holder, "pulls", ())
+            if pulls is None:
+                holds = True
+            else:
+                try:
+                    holds = any(getattr(pull, "state", "") == "open" for pull in pulls)
+                except TypeError:
+                    holds = False
+        if not holds:
+            continue
+        for candidate_area in candidate_areas:
+            for holder_area in area_paths(getattr(holder, "labels", ()), prefix=prefix):
+                if _areas_overlap(candidate_area, holder_area):
+                    return ":".join(candidate_area)
+    return None
+
+
 @dataclass(frozen=True)
 class StartRequest:
     """One ticket the policy wants worked on, with its dispatch kind.

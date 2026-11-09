@@ -26,6 +26,7 @@ def ops_golden(name, clone_root, test_cmd="make check", branch="main"):
         "# korapy.toml, written by `korapy init`. Settings that differ\n"
         "# from the defaults live in [[repo]]; everything else is\n"
         "# commented out below with its default.\n"
+        '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "muse"\n\n'
         "[[repo]]\n"
         f'name = "{name}"\n'
         "\n"

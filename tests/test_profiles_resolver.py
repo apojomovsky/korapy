@@ -283,12 +283,27 @@ class EachLayerWinsAlone(unittest.TestCase):
         self.assertEqual(found.name, "fast")
         self.assertEqual(provenance.layer, 6)
 
-    def test_nothing_set_falls_back_to_the_builtin_default(self):
-        found, provenance = resolve(parsed("other"))
-        self.assertEqual(found, profiles.BUILTIN_DEFAULT)
+    def test_nothing_set_fails_fast_naming_the_fix(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            resolve(parsed("other"))
+        message = str(ctx.exception)
+        self.assertIn("[profiles.default]", message)
+        self.assertIn("profile.default", message)
+        self.assertIn('runtime = "muse"', message)
+
+    def test_no_declarations_at_all_fails_fast_naming_the_fix(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            resolve({})
+        message = str(ctx.exception)
+        self.assertIn("[profiles.default]", message)
+        self.assertIn("profile.default", message)
+
+    def test_a_committed_muse_default_still_resolves(self):
+        table = {"muse": profile("muse", "muse")}
+        found, provenance = resolve(table, committed={"default": "muse"})
+        self.assertEqual(found.name, "muse")
+        self.assertEqual(found.runtime, "muse")
         self.assertEqual(provenance.layer, 6)
-        self.assertEqual(provenance.layer_name, "default")
-        self.assertIn("built-in", provenance.source)
 
 
 class Precedence(unittest.TestCase):

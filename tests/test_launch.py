@@ -1191,7 +1191,7 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.system.started, [])
         self.assertEqual(self.worktrees_of("lib"), [])
 
-    def test_a_corrupt_store_with_no_profiles_still_launches(self):
+    def test_a_corrupt_store_with_no_profiles_fails_fast_without_reading_it(self):
         toml_path = os.path.join(self.root, settings.PROJECT_FILE)
         with open(toml_path, encoding="utf-8") as handle:
             text = handle.read()
@@ -1204,11 +1204,12 @@ class LaunchTest(OpsCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as handle:
             handle.write(b"not a database")
-        unit, workdir = self.start("omp")
-        self.assertEqual(unit, "korapy-agent-lib-5")
-        self.assertTrue(os.path.isdir(workdir))
+        with self.assertRaises(settings.SettingsError) as ctx:
+            self.start("omp")
+        self.assertIn("[profiles.default]", str(ctx.exception))
+        self.assertEqual(self.system.started, [])
 
-    def test_no_profiles_launches_on_the_shipped_default_runtime(self):
+    def test_no_profiles_fails_fast_naming_the_fix(self):
         toml_path = os.path.join(self.root, settings.PROJECT_FILE)
         with open(toml_path, encoding="utf-8") as handle:
             text = handle.read()
@@ -1217,16 +1218,12 @@ class LaunchTest(OpsCase):
         )
         with open(toml_path, "w", encoding="utf-8") as handle:
             handle.write(text)
-        unit, workdir = self.start("omp")
-        self.assertEqual(unit, "korapy-agent-lib-5")
-        self.assertTrue(os.path.isdir(workdir))
-        session = self.leaf("lib", 5)
-        self.assertEqual(runtimes.recorded(session), runtimes.DEFAULT_RUNTIME)
-        recorded = profiles.recorded_profile(session)
-        self.assertIsNotNone(recorded)
-        assert recorded is not None
-        self.assertEqual(recorded.name, profiles.DEFAULT_PROFILE_NAME)
-        self.assertEqual(recorded.runtime, runtimes.DEFAULT_RUNTIME)
+        with self.assertRaises(settings.SettingsError) as ctx:
+            self.start("omp")
+        message = str(ctx.exception)
+        self.assertIn("[profiles.default]", message)
+        self.assertIn("profile.default", message)
+        self.assertEqual(self.system.started, [])
 
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
@@ -1906,7 +1903,7 @@ class MuseReviewerLaunchTest(OpsCase):
 
 class ResumeTailTest(OpsCase):
     def test_resume_without_a_session_is_refused(self):
-        with self.assertRaisesRegex(launch.LaunchError, "no omp session to resume"):
+        with self.assertRaisesRegex(launch.LaunchError, "no session to resume"):
             launch.resume(
                 self.target(),
                 5,

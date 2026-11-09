@@ -678,12 +678,12 @@ def select_profile(
     re-validates the profile's options against the effective adapter's
     schema: keys from one runtime never land in another's config, and
     unknown keys fail exit 4 naming the key and the runtime. With no
-    `[profiles.*]` table declared and no flag, the layers fall through
-    to the built-in default without touching the board store. The
-    resolver runs before the caller makes anything, so a bad profile
-    fails before any worktree or unit exists. `store` is the board store
-    (or a fake with `.item`); `tracker` re-reads stale rows live, and
-    None trusts the cached row.
+    `[profiles.*]` table declared and no flag, the missing default fails
+    fast (exit 4) without touching the board store. The resolver runs
+    before the caller makes anything, so a bad profile fails before any
+    worktree or unit exists. `store` is the board store (or a fake with
+    `.item`); `tracker` re-reads stale rows live, and None trusts the
+    cached row.
     """
     pool = accounts.providers() if pool is None else pool
     parsed = profiles.validate(tgt.resolved.profiles, pool)
@@ -692,9 +692,10 @@ def select_profile(
     if selections is None:
         selections = profiles.load_selections()
     if not tgt.resolved.profiles and flag is None:
-        # No profiles declared and no flag names one: the built-in
-        # default wins without reading the board store, so a corrupt
-        # store never blocks a launch that resolves no layer from it.
+        # No profiles declared and no flag names one: the missing default
+        # fails fast (exit 4) without reading the board store, so a
+        # corrupt store never blocks a launch that resolves no layer
+        # from it.
         name, source = None, ""
         tracker = None
     elif isinstance(flag, str) and flag in parsed:
@@ -897,9 +898,9 @@ def launch(
     in the per-launch config (the flag file wins shared keys), through
     `_session_config`. The profile resolves before anything is made (no
     worktree, no unit on a bad profile); with no `[profiles.*]`
-    declaration and no flag, the layers fall through to the built-in
-    default. Every launch records the resolved profile next to the
-    runtime record, so a resume without flags reruns it.
+    declaration and no flag, the missing default fails fast (exit 4)
+    naming the fix. Every launch records the resolved profile next to
+    the runtime record, so a resume without flags reruns it.
     """
     factory = prompt if callable(prompt) else None
     if factory is None:
@@ -1217,9 +1218,7 @@ def _write_session(
 
 def _no_session(tgt, number, role, verb):
     """The refusal when the ticket holds no session of `role` to resume or tail."""
-    return LaunchError(
-        f"#{number} of {tgt.repo} has no {runtimes.DEFAULT_RUNTIME} {verb} for role {role!r}"
-    )
+    return LaunchError(f"#{number} of {tgt.repo} has no {verb} for role {role!r}")
 
 
 def resume(
@@ -1263,8 +1262,9 @@ def resume(
     winning over the new options) and chains through `_session_config`;
     any other resume keeps the recorded setup. The new adapter's resume
     handle is checked before anything is rewritten, so a refused flagged
-    resume leaves the session untouched. A lone `--runtime` without
-    any declared profile still switches the run to that runtime.
+    resume leaves the session untouched. A lone `--runtime` still needs a
+    selected profile to refine: with no declared or selected profile the
+    missing default fails fast (exit 4) the same way a launch does.
     The reviewer mode is the one the launch ran with: a resumed reviewer
     stays read-only.
     Raises LaunchError when there is no session to resume, and HeldError
