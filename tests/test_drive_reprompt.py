@@ -86,6 +86,32 @@ class FakeRemote:
         return [argv[-1] for argv in self.calls]
 
 
+class FakeLaunchResume:
+    """A `launch.resume` double honoring the hold gate like the real one."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, tgt, number, message, *, role=None, hold_reason_fn=None, **kwargs):
+        from korapy import launch
+
+        self.calls.append({"tgt": tgt, "number": number, "message": message, "role": role})
+        reason = hold_reason_fn(tgt, number) if hold_reason_fn is not None else None
+        if reason is not None:
+            raise launch.LaunchError(reason)
+        return (f"resumed-{number}", None)
+
+
+class FakeStore:
+    """A store double with fixed issue labels."""
+
+    def __init__(self, labels):
+        self.labels = list(labels)
+
+    def item(self, repo, number, now=None):
+        return SimpleNamespace(labels=list(self.labels)), None
+
+
 class FakeResume:
     """A resume double: records calls, optionally refuses or writes a record."""
 
@@ -179,7 +205,7 @@ class ReviewRecordCommandTest(unittest.TestCase):
         self.assertIn(command, message)
         self.assertIn(f"{REPO}#{NUMBER}", message)
 
-    def test_the_takeoff_hint_carries_the_builder_command(self):
+    def test_the_takeoff_hint_appends_the_reviewer_suffix_to_the_builder_command(self):
         from korapy import takeoff
 
         with tempfile.TemporaryDirectory(prefix="korapy-reprompt-hint-") as tmp:
@@ -191,7 +217,7 @@ class ReviewRecordCommandTest(unittest.TestCase):
                 check = takeoff._check_review(True, REPO, NUMBER, repo, head)
         self.assertEqual(check.status, takeoff.FAIL)
         command = prompts.review_record_command(REPO, NUMBER, head, "<change-author>")
-        self.assertIn(command, check.fix)
+        self.assertIn(f"{command} --reviewer <reviewer-id>", check.fix)
 
 
 class ParseReviewAuthorTest(unittest.TestCase):
@@ -263,6 +289,16 @@ class RepromptStepTest(unittest.TestCase):
         self.assertEqual(resume.calls, [])
         self.assertEqual(outcomes, {(REPO, NUMBER): "refused: the branch tip is unreadable"})
 
+    def test_a_raising_tip_reader_requests_no_resume_and_fails_no_pass(self):
+        def raising(argv, env=None, timeout=None):
+            raise RuntimeError("git is gone")
+
+        make_leaf(self.root, prompt=reviewer_prompt())
+        resume = FakeResume()
+        outcomes, _ = step(self.missing, resume, raising, self.root)
+        self.assertEqual(resume.calls, [])
+        self.assertEqual(outcomes, {(REPO, NUMBER): "refused: the branch tip is unreadable"})
+
     def test_a_refused_resume_keeps_the_skip_and_the_log_line(self):
         make_leaf(self.root, prompt=reviewer_prompt())
         resume = FakeResume()
@@ -287,6 +323,15 @@ class RepromptStepTest(unittest.TestCase):
 
     def test_an_unreadable_leaf_prompt_requests_no_resume(self):
         make_leaf(self.root, prompt=None)
+        resume = FakeResume()
+        outcomes, _ = step(self.missing, resume, FakeRemote([SHA_A, SHA_A, SHA_A]), self.root)
+        self.assertEqual(resume.calls, [])
+        self.assertEqual(outcomes, {(REPO, NUMBER): "refused: the reviewer prompt is unreadable"})
+
+    def test_a_non_utf8_leaf_prompt_requests_no_resume(self):
+        leaf = make_leaf(self.root, prompt=None)
+        with open(os.path.join(leaf, "prompt.md"), "wb") as handle:
+            handle.write(b"review \xff\xfe the change\n")
         resume = FakeResume()
         outcomes, _ = step(self.missing, resume, FakeRemote([SHA_A, SHA_A, SHA_A]), self.root)
         self.assertEqual(resume.calls, [])
@@ -448,6 +493,74 @@ class RepromptStepTest(unittest.TestCase):
             },
         )
 
+    def test_an_unexpected_planning_error_refuses_one_ticket_and_resumes_the_other(self):
+        make_leaf(self.root, prompt=reviewer_prompt())
+        make_leaf(self.root, number=8, prompt=reviewer_prompt())
+        reviewer8 = "blue-agent-app-8-r1"
+        missing = [(REPO, NUMBER, REVIEWER), (REPO, 8, reviewer8)]
+        resume = FakeResume()
+        remote = FakeRemote([SHA_B, SHA_B, SHA_B])
+
+        def resolve(repo, number):
+            if number == NUMBER:
+                bad = make_tgt(self.root)
+                bad.branch_template = "{type.nonexistent}/{issue}-{slug}"
+                return bad
+            return make_tgt(self.root)
+
+        out = io.StringIO()
+        outcomes = drive.reprompt_missing_reviews(
+            missing,
+            finished={
+                (REPO, NUMBER): FINISHED,
+                (REPO, 8): (reviewer8, "reviewer", "ok"),
+            },
+            reviews={},
+            titles={(REPO, NUMBER): "fix: thing", (REPO, 8): "fix: other"},
+            resolve=resolve,
+            sessions_root=self.root,
+            run=remote,
+            resume=resume,
+            out=out,
+        )
+        self.assertEqual(len(resume.calls), 1)
+        self.assertEqual(resume.calls[0][1], 8)
+        self.assertTrue(outcomes[(REPO, NUMBER)].startswith("refused: "), outcomes)
+        self.assertEqual(outcomes[(REPO, 8)], "resumed")
+
+    def test_a_raising_resolve_refuses_one_ticket_and_resumes_the_other(self):
+        make_leaf(self.root, prompt=reviewer_prompt())
+        make_leaf(self.root, number=8, prompt=reviewer_prompt())
+        reviewer8 = "blue-agent-app-8-r1"
+        missing = [(REPO, NUMBER, REVIEWER), (REPO, 8, reviewer8)]
+        resume = FakeResume()
+        remote = FakeRemote([SHA_B, SHA_B, SHA_B])
+
+        def resolve(repo, number):
+            if number == NUMBER:
+                raise AttributeError("boom in resolve")
+            return make_tgt(self.root)
+
+        out = io.StringIO()
+        outcomes = drive.reprompt_missing_reviews(
+            missing,
+            finished={
+                (REPO, NUMBER): FINISHED,
+                (REPO, 8): (reviewer8, "reviewer", "ok"),
+            },
+            reviews={},
+            titles={(REPO, NUMBER): "fix: thing", (REPO, 8): "fix: other"},
+            resolve=resolve,
+            sessions_root=self.root,
+            run=remote,
+            resume=resume,
+            out=out,
+        )
+        self.assertEqual(len(resume.calls), 1)
+        self.assertEqual(resume.calls[0][1], 8)
+        self.assertTrue(outcomes[(REPO, NUMBER)].startswith("refused: "), outcomes)
+        self.assertEqual(outcomes[(REPO, 8)], "resumed")
+
     def test_without_a_resume_seam_nothing_is_read_or_written(self):
         make_leaf(self.root, prompt=reviewer_prompt())
         remote = FakeRemote([SHA_A, SHA_A, SHA_A])
@@ -607,3 +720,113 @@ class RepromptPassTest(unittest.TestCase):
         self.assertEqual(resume.calls, [])
         self.assertEqual(remote.calls, [])
         self.assertIn("review missing", out)
+
+
+class ProductionRepromptWiringTest(unittest.TestCase):
+    """Direct tests for the production reprompt wiring.
+
+    `_reprompt_target` (the stuck owner lookup, the driven fallback,
+    every failure reading as no target) and
+    `production_reprompt_resume` (a reviewer resume over the launch
+    path with the store-backed hold check) previously ran only behind
+    a faked `reprompt_resolve` pass test, so these pin them with fakes
+    at their own seams: a fake registry, a recording `launch.target` /
+    `launch.resume` double, and a tiny store double. No network, no
+    real ops root, no live unit.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-reprompt-prod-")
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.realpath(tmp.name)
+        self.registered = [SimpleNamespace(name="blue", root=self.root)]
+        self.driven = {"blue": [REPO]}
+        self.tgt = SimpleNamespace(root=self.root, repo=REPO, clone=self.root)
+
+    def resolve_with(self, stuck_project, driven=None, short="app"):
+        target = SimpleNamespace(root=self.root, repo=REPO, clone=self.root)
+        with (
+            mock.patch.object(drive, "_local_repo", return_value=short) as local_fn,
+            mock.patch.object(drive.launch, "target", return_value=target) as target_fn,
+        ):
+            resolve = drive._reprompt_target(
+                self.registered, self.driven if driven is None else driven, stuck_project
+            )
+            return resolve(REPO, NUMBER), local_fn, target_fn, target
+
+    def test_the_stuck_owner_resolves_through_the_launch_path(self):
+        found, local_fn, target_fn, target = self.resolve_with(lambda repo, number: "blue")
+        self.assertIs(found, target)
+        local_fn.assert_called_once_with(self.root, REPO)
+        target_fn.assert_called_once_with(self.root, "app")
+
+    def test_the_driven_fallback_resolves_when_stuck_names_no_owner(self):
+        found, _, _, target = self.resolve_with(lambda repo, number: None)
+        self.assertIs(found, target)
+
+    def test_an_undriven_repo_reads_as_no_target(self):
+        found, _, target_fn, _ = self.resolve_with(lambda repo, number: None, driven={})
+        self.assertIsNone(found)
+        target_fn.assert_not_called()
+
+    def test_an_unknown_owner_reads_as_no_target(self):
+        found, _, target_fn, _ = self.resolve_with(lambda repo, number: "red")
+        self.assertIsNone(found)
+        target_fn.assert_not_called()
+
+    def test_a_settings_error_from_stuck_reads_as_no_target(self):
+        from korapy import settings
+
+        def stuck(repo, number):
+            raise settings.SettingsError("bad registry")
+
+        found, _, target_fn, _ = self.resolve_with(stuck)
+        self.assertIsNone(found)
+        target_fn.assert_not_called()
+
+    def test_a_launch_failure_reads_as_no_target(self):
+        from korapy import launch
+
+        with (
+            mock.patch.object(drive, "_local_repo", return_value="app"),
+            mock.patch.object(drive.launch, "target", side_effect=launch.LaunchError("no clone")),
+        ):
+            resolve = drive._reprompt_target(self.registered, self.driven, lambda r, n: "blue")
+            self.assertIsNone(resolve(REPO, NUMBER))
+
+    def resume_one_with(self, labels, hold_label="paused"):
+        fake = FakeLaunchResume()
+        resume_one = drive.production_reprompt_resume(
+            self.registered, store=FakeStore(labels), hold_label=hold_label, now=1234.0
+        )
+        return resume_one, fake
+
+    def test_a_free_ticket_resumes_as_reviewer(self):
+        resume_one, fake = self.resume_one_with([])
+        with mock.patch.object(drive.launch, "resume", fake):
+            unit = resume_one(REPO, NUMBER, self.tgt, "record this")
+        self.assertEqual(unit, f"resumed-{NUMBER}")
+        self.assertEqual(len(fake.calls), 1)
+        call = fake.calls[0]
+        self.assertIs(call["tgt"], self.tgt)
+        self.assertEqual(call["number"], NUMBER)
+        self.assertEqual(call["message"], "record this")
+        self.assertEqual(call["role"], "reviewer")
+
+    def test_a_held_ticket_raises_without_a_resumed_unit(self):
+        from korapy import launch
+
+        resume_one, _ = self.resume_one_with(["paused"])
+        with mock.patch.object(drive.launch, "resume", FakeLaunchResume()):
+            with self.assertRaises(launch.LaunchError):
+                resume_one(REPO, NUMBER, self.tgt, "record this")
+
+    def test_an_unknown_project_raises_without_calling_resume(self):
+        from korapy import launch
+
+        resume_one, fake = self.resume_one_with([])
+        stray = SimpleNamespace(root="/ops/nowhere", repo=REPO, clone="/ops/nowhere")
+        with mock.patch.object(drive.launch, "resume", fake):
+            with self.assertRaises(launch.LaunchError):
+                resume_one(REPO, NUMBER, stray, "record this")
+        self.assertEqual(fake.calls, [])
