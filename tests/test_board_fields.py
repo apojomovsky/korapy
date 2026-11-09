@@ -147,10 +147,10 @@ class TrackerExtraTest(unittest.TestCase):
             (
                 extra["milestone"],
                 extra["milestone_due"],
-                extra["milestone_closed"],
             ),
-            (None, None, False),
+            (None, None),
         )
+        self.assertNotIn("milestone_closed", extra)
 
     def test_rest_reads_do_not_share_one_extra_dict(self):
         from tests.test_tracker import item_payload
@@ -163,7 +163,7 @@ class TrackerExtraTest(unittest.TestCase):
         second = adapter.item("acme/app", 8)
         assert isinstance(first.extra, dict)
         assert isinstance(second.extra, dict)
-        empty = {"milestone": None, "milestone_due": None, "milestone_closed": False}
+        empty = {"milestone": None, "milestone_due": None}
         self.assertEqual((first.extra, second.extra), (empty, empty))
         self.assertIsNot(first.extra, second.extra)
 

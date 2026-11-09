@@ -727,6 +727,7 @@ class PollItemsTest(unittest.TestCase):
         found = self.poll_one(run, [], milestone=None)
         self.assertIn("milestone", found.extra)
         self.assertIsNone(found.extra["milestone"])
+        self.assertNotIn("milestone_closed", found.extra)
 
     def test_board_updated_at_is_the_max_of_both_times(self):
         run = BoardFakeRun()

@@ -571,8 +571,10 @@ class BoardReader:
 
         `milestone` is the ``(title, due_on, closed)`` facts the single
         issue read carried on the same payload (no new call); the title
-        keeps its key, and the due date and closed flag ride beside it
-        so the drive pass can order by milestone from the stored row.
+        keeps its key, and the due date rides beside it so the drive
+        pass can order by milestone from the stored row, while the
+        closed flag rides only with a title, so an unmilestoned
+        reading stores no residual flag.
         A missing milestone clears the stored one, like every concept
         the reading carries as None. Option ids resolve through the
         config's ``priority_map`` for priority and through display
@@ -596,7 +598,8 @@ class BoardReader:
         title, due, closed = milestone
         extra["milestone"] = title
         extra["milestone_due"] = due
-        extra["milestone_closed"] = closed
+        if title is not None:
+            extra["milestone_closed"] = closed
         return extra
 
 
