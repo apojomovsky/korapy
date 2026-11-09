@@ -366,7 +366,7 @@ class AreaFetchTest(unittest.TestCase):
         fake = FakeTracker()
         fake.index["app"] = {34: [reading("app", 56, kind="pr", state="open")]}
         out = io.StringIO()
-        gated, problems, _, pulls_calls, pulls_limited = drive._gate_all(
+        gated, problems, _, pulls_calls, pulls_limited, pulls_by_key, pull_errors = drive._gate_all(
             items,
             [project],
             out,
@@ -393,6 +393,9 @@ class AreaFetchTest(unittest.TestCase):
         self.assertEqual(listed, ["app"])
         self.assertEqual(pulls_calls, 1)
         self.assertFalse(pulls_limited)
+        held = pulls_by_key[("app", 34)]
+        self.assertEqual([pull.number for pull in held], [56])
+        self.assertEqual(pull_errors, {})
 
     def test_an_unreadable_holder_listing_fails_closed(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-area-fetch-"))
@@ -404,7 +407,7 @@ class AreaFetchTest(unittest.TestCase):
         fake = FakeTracker()
         fake.index_errors["api"] = "tracker down"
         out = io.StringIO()
-        gated, problems, _, _, _ = drive._gate_all(
+        gated, problems, _, _, _, pulls_by_key, pull_errors = drive._gate_all(
             items,
             [project],
             out,
@@ -425,6 +428,8 @@ class AreaFetchTest(unittest.TestCase):
         self.assertEqual(len(gated), 1)
         self.assertEqual(gated[0].code, "area")
         self.assertIn("(pulls unreadable)", gated[0].reason)
+        self.assertIsNone(pulls_by_key[("api", 34)])
+        self.assertIn("tracker down", pull_errors[("api", 34)])
 
 
 class FakeLauncher:
@@ -444,6 +449,18 @@ def gated_start(project="blue", repo="app", number=12):
         kind="start",
         verdict="start",
         reason=f"{repo}#{number}: unclaimed, fresh start",
+        code="",
+    )
+
+
+def gated_research(project="blue", repo="app", number=12):
+    return drive.Gated(
+        project=project,
+        repo=repo,
+        number=number,
+        kind="research",
+        verdict="research",
+        reason=f"{repo}#{number}: unclaimed, fresh research start",
         code="",
     )
 
@@ -489,7 +506,7 @@ class InPassAreaTest(unittest.TestCase):
         )
         self.assertEqual(started, 1)
         self.assertEqual(rows[0].verdict, "start")
-        self.assertEqual((rows[1].verdict, rows[1].code), ("skip", "area"))
+        self.assertEqual((rows[1].verdict, rows[1].code, rows[1].kind), ("skip", "area", "start"))
         self.assertRegex(
             rows[1].reason,
             r"^app#34: area `ci` held by app#12 \(agent `drive-[0-9a-f]+-12`\), "
@@ -534,6 +551,57 @@ class InPassAreaTest(unittest.TestCase):
         proposes = [call for call in fake_hub.calls if call[0] == "propose"]
         self.assertEqual(len(proposes), 1)
         self.assertEqual(proposes[0][1:3], ("app", 12))
+
+    def test_a_research_start_bypasses_the_in_pass_area_lock(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels),
+            ("blue", "app", 34): row(number=34, labels=labels, agent="drive-holder"),
+        }
+        launcher = FakeLauncher()
+        rows, started, _ = claim_loop(
+            store, [gated_research(number=12)], area_rows, launcher=launcher
+        )
+        self.assertEqual(started, 1)
+        self.assertEqual((rows[0].verdict, rows[0].code), ("research", ""))
+        self.assertEqual(rows[0].kind, "research")
+        self.assertEqual([call[2:4] for call in launcher.calls], [(12, "research")])
+        self.assertIsNotNone(store.claim_of("app", 12))
+
+    def test_a_pull_held_holder_refuses_the_second_start(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels, pulls=(pull(56, "open"),)),
+            ("blue", "app", 34): row(number=34, labels=labels),
+        }
+        launcher = FakeLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 1)
+        self.assertEqual(rows[0].verdict, "start")
+        self.assertEqual((rows[1].verdict, rows[1].code, rows[1].kind), ("skip", "area", "start"))
+        self.assertEqual(rows[1].reason, "app#34: area `ci` held by app#12 pull #56, start refused")
+        self.assertEqual([call[2] for call in launcher.calls], [12])
+        self.assertIsNone(store.claim_of("app", 34))
+
+    def test_a_missing_in_pass_row_refuses_fail_closed(self):
+        store = stored(self.db, [("app", 12, "open")])
+        self.addCleanup(store.close)
+        launcher = FakeLauncher()
+        rows, started, _ = claim_loop(store, [gated_start(number=12)], {})
+        self.assertEqual(started, 0)
+        self.assertEqual((rows[0].verdict, rows[0].code), ("skip", "area"))
+        self.assertEqual(rows[0].kind, "start")
+        self.assertEqual([call for call in launcher.calls], [])
+        self.assertIsNone(store.claim_of("app", 12))
 
 
 class AreaPlanTest(unittest.TestCase):
@@ -639,6 +707,43 @@ class AreaDoctorTest(unittest.TestCase):
 
         sites = [doctor.AreaSite(project="blue", prefix="area:", area_column=False, unreadable=1)]
         self.assertEqual(doctor._check_area_sites(sites), [])
+
+    def test_a_corrupt_journal_line_keeps_the_other_counts(self):
+        import json
+
+        from korapy import doctor
+
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-area-report-"))
+        journal = os.path.join(tmp, "journal.jsonl")
+        with open(journal, "w", encoding="utf-8") as handle:
+            handle.write("{not json}\n")
+            handle.write(
+                json.dumps(
+                    {
+                        "event": "skip",
+                        "code": "area",
+                        "project": "blue",
+                        "reason": (
+                            "app#12: area ci possibly held by app#34 "
+                            "(pulls unreadable), start refused"
+                        ),
+                    }
+                )
+                + "\n"
+            )
+        project = mock.Mock()
+        project.name = "blue"
+        project.root = tmp
+        self.enterContext(mock.patch.object(doctor.projects, "load_all", return_value=[project]))
+        self.enterContext(mock.patch.object(doctor.drive, "journal_path", return_value=journal))
+        self.enterContext(
+            mock.patch.object(doctor.settings, "load", return_value={"drive.area_prefix": "area:"})
+        )
+        self.enterContext(mock.patch.object(doctor.settings, "repo_names", return_value=[]))
+        sites = doctor.load_area_report()
+        assert sites is not None
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].unreadable, 1)
 
 
 if __name__ == "__main__":

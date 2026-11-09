@@ -2455,11 +2455,16 @@ def _gate_all(
     """Eligibility plus the section 3 gate order over every candidate.
 
     Returns (gated_rows, problems, requested, pulls_calls,
-    pulls_limited): one `Gated` per candidate in section 3 order, one
-    error line per project whose policy or quota settings failed, the
-    set of (repo, number) any project requested this pass (which the
-    stuck sweep reads for withdrawals), the GitHub calls the pulls
-    lookup spent, and whether it hit its cap. A project with no
+    pulls_limited, pulls_by_key, pull_errors): one `Gated` per
+    candidate in section 3 order, one error line per project whose
+    policy or quota settings failed, the set of (repo, number) any
+    project requested this pass (which the stuck sweep reads for
+    withdrawals), the GitHub calls the pulls lookup spent, whether it
+    hit its cap, the linked-pull map the pass read (None when the
+    pass listed nothing, so rows read empty), and the first error per
+    unreadable ticket. The claiming pass rebuilds its in-pass area
+    snapshot from the same two maps, so the gate and the re-check
+    read the same pulls. A project with no
     eligibility entry prints its logbook line to `out`. `released`
     ({(repo, number): reviewer id} freed this pass) simulates the
     post-release rows, so a plan over still-claimed rows gates what
@@ -2722,7 +2727,15 @@ def _gate_all(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
-    return gated_rows, problems, set(requested_keys), pulls_calls, pulls_limited
+    return (
+        gated_rows,
+        problems,
+        set(requested_keys),
+        pulls_calls,
+        pulls_limited,
+        pulls_by_key,
+        pull_errors,
+    )
 
 
 def _pass(
@@ -2825,7 +2838,7 @@ def _pass(
         else None
     )
     released = reviewed_claims(authors, finished, live_units=plan_live)
-    gated_rows, problems, _, pulls_calls, pulls_limited = _gate_all(
+    gated_rows, problems, _, pulls_calls, pulls_limited, _, _ = _gate_all(
         items,
         registered,
         out,
@@ -4701,7 +4714,10 @@ def _claim_and_launch(
     fresh claim (before any hub proposal), with the tickets this pass
     already claimed added as synthetic same-project holders: the
     second same-area start refuses with code `area` and its claim is
-    never minted. With none the loop claims as before.
+    never minted. Research rows bypass the re-check like they bypass
+    the gate, and a gated start missing from the snapshot refuses
+    fail-closed instead of claiming blind. With none the loop claims
+    as before.
     """
     rows: list = []
     started = 0
@@ -5234,39 +5250,51 @@ def _claim_and_launch(
         prefix, hold_until_merged, fail_open = (area_configs or {}).get(
             gated.project, ("", True, False)
         )
-        if prefix and area_rows is not None:
+        if gated.kind == "start" and prefix and area_rows is not None:
             candidate_row = area_rows.get((gated.project, gated.repo, gated.number))
-            if candidate_row is not None:
-                holders = [
-                    holder_row
-                    for (holder_project, _, _), holder_row in area_rows.items()
-                    if holder_project == gated.project
-                ]
-                holders.extend(
-                    synthetic
-                    for synthetic_project, synthetic in claimed_areas
-                    if synthetic_project == gated.project
-                )
-                refusal = area_refusal(
-                    candidate_row,
-                    holders,
-                    prefix=prefix,
-                    hold_until_merged=hold_until_merged,
-                    fail_open=fail_open,
-                )
-                if refusal is not None:
-                    rows.append(
-                        Gated(
-                            project=gated.project,
-                            repo=gated.repo,
-                            number=gated.number,
-                            kind="start",
-                            verdict="skip",
-                            reason=refusal,
-                            code="area",
-                        )
+            if candidate_row is None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: area rows changed under the pass, start refused",
+                        code="area",
                     )
-                    continue
+                )
+                continue
+            holders = [
+                holder_row
+                for (holder_project, _, _), holder_row in area_rows.items()
+                if holder_project == gated.project
+            ]
+            holders.extend(
+                synthetic
+                for synthetic_project, synthetic in claimed_areas
+                if synthetic_project == gated.project
+            )
+            refusal = area_refusal(
+                candidate_row,
+                holders,
+                prefix=prefix,
+                hold_until_merged=hold_until_merged,
+                fail_open=fail_open,
+            )
+            if refusal is not None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=refusal,
+                        code="area",
+                    )
+                )
+                continue
         agent, title, skipped = _fresh_claim(
             store,
             gated,
@@ -6093,28 +6121,30 @@ def _launching_pass(
     except (board.StoreError, sqlite3.Error) as problem:
         print(f"korapy drive: cannot read claims: {problem}", file=err)
         return finish(USAGE)
-    gated_rows, problems, eligible_keys, pulls_calls, pulls_limited = _gate_all(
-        _items,
-        registered,
-        out,
-        now=now,
-        live_set=live_set,
-        limits=limits,
-        quota_for=quota_for,
-        pool=pool,
-        ledger_data=ledger_data,
-        read_labels=read_labels,
-        hold_label=hold_label,
-        released=freed,
-        finished=finished,
-        agent_roles=agent_roles,
-        agent_states=agent_states,
-        agent_tickets=agent_tickets,
-        reviews=reviews,
-        index_for=index_for,
-        pulls_max_calls=pulls_max_calls,
-        claims_by_key=claims_by_key,
-        driven=driven,
+    gated_rows, problems, eligible_keys, pulls_calls, pulls_limited, pulls_by_key, pull_errors = (
+        _gate_all(
+            _items,
+            registered,
+            out,
+            now=now,
+            live_set=live_set,
+            limits=limits,
+            quota_for=quota_for,
+            pool=pool,
+            ledger_data=ledger_data,
+            read_labels=read_labels,
+            hold_label=hold_label,
+            released=freed,
+            finished=finished,
+            agent_roles=agent_roles,
+            agent_states=agent_states,
+            agent_tickets=agent_tickets,
+            reviews=reviews,
+            index_for=index_for,
+            pulls_max_calls=pulls_max_calls,
+            claims_by_key=claims_by_key,
+            driven=driven,
+        )
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)
     if reprompt_resume is not None:
@@ -6147,7 +6177,13 @@ def _launching_pass(
             print(f"korapy drive: {problem}", file=err)
             return finish(USAGE)
     area_configs = area_configs_for(registered)
-    area_base = _released_rows(_items, freed, claims_by_key=claims_by_key)
+    area_base = _released_rows(
+        _items,
+        freed,
+        pulls_by_key=pulls_by_key,
+        pulls_errors=pull_errors,
+        claims_by_key=claims_by_key,
+    )
     area_driven = driven if driven is not None else {}
     area_rows: dict = {}
     for project in registered:

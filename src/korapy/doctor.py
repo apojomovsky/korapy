@@ -1896,9 +1896,17 @@ def load_area_report() -> list[AreaSite] | None:
         return None
     try:
         with open(drive.journal_path(), encoding="utf-8") as handle:
-            entries = [json.loads(line) for line in handle.read().splitlines() if line.strip()]
-    except (OSError, ValueError):
-        entries = []
+            raw = handle.read().splitlines()
+    except OSError:
+        raw = []
+    entries = []
+    for line in raw:
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
     counts = unreadable_area_counts(entries)
     sites = []
     for project in registered:
