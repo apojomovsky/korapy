@@ -121,6 +121,29 @@ settings.register(
     check=_positive_calls,
 )
 
+settings.register(
+    "drive.area_prefix",
+    str,
+    "",
+    'label prefix naming ticket areas for the area lock (empty means off; for example "area:")',
+)
+
+settings.register(
+    "drive.area_hold_until_merged",
+    bool,
+    True,
+    "area lock holds through the merge window: an open linked pull "
+    "on another ticket keeps overlapping areas locked",
+)
+
+settings.register(
+    "drive.area_fail_open",
+    bool,
+    False,
+    "area lock reads claim-held areas only during a pulls outage: "
+    "unreadable linked pulls stop holding other tickets",
+)
+
 #: The lock file inside the state dir.
 LOCK_NAME = "drive.lock"
 
