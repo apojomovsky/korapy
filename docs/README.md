@@ -21,6 +21,7 @@
 | [`16-tracker-repo-resolver.md`](16-tracker-repo-resolver.md) | one tracker-repo resolver for `[[repo]]` entries: the shared helper, the doctors' delegation, and the tickets to build them |
 | [`17-loop-review-record.md`](17-loop-review-record.md) | reviewers that end with prose and no record: prompt-first checklist plus one loop resume |
 | [`18-area-locks.md`](18-area-locks.md) | area locks for the dispatch loop: no two agents in overlapping areas |
+| [`19-github-calls.md`](19-github-calls.md) | one place for every GitHub call: retry-until-reset, forge and tracker verbs, the read cache, and the tickets to build them |
 | [`guide.md`](guide.md) | the operator's guide: running korapy on one host and driving a fleet with it |
 | [`adr/`](adr/) | decision records |
 
