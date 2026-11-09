@@ -509,6 +509,40 @@ Once the cap stops a start the pass exits 1; the counter lives in the
 state dir (`drive.starts.json`) beside the journal
 (`drive/journal.jsonl`).
 
+### Areas: one lane per label path
+
+Two tickets editing the same corner of a project should never run at
+once. Opt in per project with a label prefix in the ops root, then
+label the tickets:
+
+```toml
+[drive]
+area_prefix = "area:"
+```
+
+A ticket carrying `area:ci` names the area path `ci`; a ticket
+carrying `area:ci:suite` names the child path `ci:suite`. A parent
+area overlaps every child, and children overlap their parents, never
+their siblings: one live worker on `area:ci` holds the whole lane,
+while `area:ci:suite` and `area:ci:lint` run side by side. A ticket
+with no area label always passes the check, and a ticket with several
+area labels holds the union.
+
+A refused start names the ticket, the area and the holder:
+
+```text
+app#12: area `ci` held by app#34 (agent `drive-abc`), start refused
+```
+
+The lock releases with the claim, or with the pull request when
+`drive.area_hold_until_merged` (default true) keeps it held through
+review. A project that maps a board area column and uses area labels
+at once gets a `korapy doctor` warning: the lock reads only the
+labels. Every refusal lands one `area` count in the journal, so the
+snapshot drive section measures the cost. During a known pulls outage
+the held areas fail closed; set `drive.area_fail_open` to read
+claim-held areas only until the listing heals.
+
 ## Driving as a coordinator
 
 One coordinator per project drives the loop above through a lease, a
