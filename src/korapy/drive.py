@@ -29,6 +29,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import socket
 import sqlite3
 import sys
@@ -147,6 +148,15 @@ settings.register(
     "unreadable linked pulls stop holding other tickets",
 )
 
+settings.register(
+    "eligibility.milestone_first",
+    bool,
+    False,
+    "order one project's start requests by milestone first (earliest "
+    "due date, then version title, unmilestoned and closed-milestone "
+    "last) instead of by priority alone",
+)
+
 #: The lock file inside the state dir.
 LOCK_NAME = "drive.lock"
 
@@ -244,29 +254,177 @@ class GateInput:
     wait: float = 0.0
 
 
-def order(entries: Sequence[GateInput]) -> list[GateInput]:
+#: The milestone sort component for a row without an open milestone:
+#: closed or missing milestones sort last, where priority decides.
+_MILESTONE_LAST: tuple = (2, "", ())
+
+#: A stored milestone due date counts as dated only in this shape: the
+#: full UTC timestamp the tracker sync writes. Anything else fails
+#: closed to dateless, so string compare always orders chronologically.
+_DUE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
+
+
+def _due_is_iso(due) -> bool:
+    """Whether a stored milestone due date is a real UTC timestamp. Pure.
+
+    The one check for the shape `row_milestone` normalizes on, shared
+    with the plan reasons that name a stored value failing it.
+    """
+    if not isinstance(due, str):
+        return False
+    match = _DUE_RE.fullmatch(due)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = map(int, match.groups())
+    try:
+        datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False
+    return True
+
+
+def row_milestone(row) -> tuple[str | None, str | None, bool]:
+    """``(title, due_on, closed)`` for a policy row. Pure.
+
+    The one reader for the milestone the tracker carried on the row's
+    extra, shared by the milestone sort and the plan reasons. Only a
+    non-blank title counts, and only a full ISO UTC timestamp counts
+    as dated; a missing concept, odd data, an empty title, or a due
+    date outside that shape reads as no milestone (or no due date),
+    so ordering never raises.
+    """
+    extra = getattr(row, "extra", None)
+    if not isinstance(extra, dict):
+        return None, None, False
+    title = extra.get("milestone")
+    if not isinstance(title, str) or not title.strip():
+        return None, None, False
+    due = extra.get("milestone_due")
+    if not _due_is_iso(due):
+        due = None
+    return title, due, bool(extra.get("milestone_closed"))
+
+
+def _stored_due(row):
+    """The raw stored milestone due value, even when outside ISO shape. Pure.
+
+    A diagnostic for the plan reasons: `row_milestone` normalizes a
+    bad value to no due date for the sort, and the reason names the
+    stored value through here. Missing stays missing (``None``).
+    """
+    extra = getattr(row, "extra", None)
+    if not isinstance(extra, dict):
+        return None
+    return extra.get("milestone_due")
+
+
+def _natural_key(title: str) -> tuple:
+    """A version-aware sort key for a milestone title. Pure.
+
+    Digit runs compare numerically (``v2`` before ``v10``), the rest
+    case-insensitively, so version titles order lowest first and every
+    title still orders deterministically.
+    """
+    key = []
+    for part in re.split(r"(\d+)", title, flags=re.ASCII):
+        if part.isdigit():
+            try:
+                key.append((0, int(part)))
+                continue
+            except ValueError:
+                pass
+        key.append((1, part.lower()))
+    return tuple(key)
+
+
+def milestone_sort_key(row) -> tuple:
+    """The milestone-first component for a policy row: lower orders earlier. Pure.
+
+    Open milestones with a due date come first (earliest due date,
+    ties by version title), then open milestones without one (lowest
+    version title), then closed or missing milestones last (priority
+    decides among them). `row_milestone` admits only full ISO UTC
+    timestamps as dated, so the string compare orders chronologically;
+    only a non-blank title counts, and odd data reads as no milestone,
+    so ordering never raises.
+    """
+    title, due, closed = row_milestone(row)
+    if title is None or closed:
+        return _MILESTONE_LAST
+    if due is None:
+        return (1, "", _natural_key(title))
+    return (0, due, _natural_key(title))
+
+
+def _today_key(item) -> tuple:
+    """Today's section 3 key for one candidate. Pure.
+
+    The one place resolving it: `order` sorts every candidate by this
+    first, so other projects keep today's order byte-for-byte.
+    """
+    return (
+        KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
+        -priority_rank(item.row.priority if item.row is not None else ""),
+        item.wait,
+        item.project,
+        item.request.repo
+        if item.request is not None
+        else (item.row.repo if item.row is not None else ""),
+        item.request.number
+        if item.request is not None
+        else (item.row.number if item.row is not None else 0),
+    )
+
+
+def _milestone_key(item) -> tuple:
+    """The milestone-first key for one opted-in candidate. Pure.
+
+    Required kinds still group first; then the milestone component
+    (earliest due date, then version title, unmilestoned and
+    closed-milestone last), then the priority rank, the wait, and the
+    repo and number for determinism. The project is constant inside
+    one project's re-sort, so it stays out of the key.
+    """
+    return (
+        KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
+        milestone_sort_key(item.row) if item.row is not None else _MILESTONE_LAST,
+        -priority_rank(item.row.priority if item.row is not None else ""),
+        item.wait,
+        item.request.repo
+        if item.request is not None
+        else (item.row.repo if item.row is not None else ""),
+        item.request.number
+        if item.request is not None
+        else (item.row.number if item.row is not None else 0),
+    )
+
+
+def order(entries: Sequence[GateInput], *, milestone_first=frozenset()) -> list[GateInput]:
     """The candidates in section 3 order. Pure.
 
     Required kinds first, then board priority higher first, then longest
     wait oldest first, then the project, repo and number for
     determinism. Withdrawn rows (no request) sort after every requested
     kind; missing rows sort with unknown priority and zero wait.
+    `milestone_first` names the projects whose candidates instead
+    order by milestone first (earliest due date, then version title,
+    unmilestoned and closed-milestone last) ahead of the priority rank,
+    but only among that project's own candidates: each opted-in
+    project's entries re-sort by the milestone key into the slots
+    today's order gives them, and every other candidate stays exactly
+    where today puts it. With the setting off the order is byte-identical
+    to the plain call.
     """
-    return sorted(
-        entries,
-        key=lambda item: (
-            KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
-            -priority_rank(item.row.priority if item.row is not None else ""),
-            item.wait,
-            item.project,
-            item.request.repo
-            if item.request is not None
-            else (item.row.repo if item.row is not None else ""),
-            item.request.number
-            if item.request is not None
-            else (item.row.number if item.row is not None else 0),
-        ),
-    )
+    opted = set(milestone_first or ())
+    ranked = sorted(entries, key=_today_key)
+    staged = {}
+    for project in opted:
+        group = [item for item in ranked if item.project == project]
+        if group:
+            staged[project] = iter(sorted(group, key=_milestone_key))
+    if not staged:
+        return ranked
+    return [next(staged[item.project]) if item.project in staged else item for item in ranked]
 
 
 @dataclass(frozen=True)
@@ -2434,6 +2592,27 @@ def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None, cla
     return by_key
 
 
+def milestone_first_for(registered):
+    """Per-project milestone-first opt-in: ``{name: on}``. Pure lookup.
+
+    The one resolver for the `eligibility.milestone_first` setting, so
+    the post-sort and the plan reasons never resolve it twice two ways.
+    A project whose settings fail to load is left out of the map and
+    reads as opted out, like the area configs: the same broken file
+    already fails the pass through the quota settings the main loop
+    resolves for that project, so this reader adds no second problem
+    for the same file.
+    """
+    opted = {}
+    for project in registered:
+        try:
+            resolved = settings.load(root=project.root)
+        except settings.SettingsError:
+            continue
+        opted[project.name] = resolved["eligibility.milestone_first"]
+    return opted
+
+
 def area_configs_for(registered):
     """Per-project (prefix, hold_until_merged, fail_open). Pure lookup.
 
@@ -2542,7 +2721,15 @@ def _gate_all(
     resolve through `area_configs_for`, same-project rows whose
     in-hand labels carry the prefix join the pulls fetch set (reusing
     the one listing per repository), and the gate refuses overlapping
-    starts with code `area`. Nothing is written.
+    starts with code `area`. With `eligibility.milestone_first` on for
+    a project, that project's own candidates post-sort by milestone
+    (earliest due date, then version title, unmilestoned and
+    closed-milestone last) ahead of the priority rank, while rows for
+    every other project keep today's order exactly; every gated row
+    for the opted-in project names its milestone in the reason
+    (`milestone none` for unmilestoned rows, and a bad-due note when
+    the stored due date is outside ISO shape), so `--plan` shows it.
+    Nothing is written.
     """
     if driven is None:
         driven = {}
@@ -2573,6 +2760,7 @@ def _gate_all(
         except eligibility.EligibilityError as problem:
             policy_errors[project.name] = problem
     area_configs = area_configs_for(registered)
+    milestone_projects = {name for name, on in milestone_first_for(registered).items() if on}
     if index_for is not None:
         wanted: set = set()
         for project in registered:
@@ -2712,7 +2900,7 @@ def _gate_all(
 
     stop_starts = False
     gated_rows = []
-    for candidate in order(candidates):
+    for candidate in order(candidates, milestone_first=milestone_projects):
         if candidate.request is not None and candidate.row is not None:
             holder_now = candidate.row.agent if candidate.row is not None else ""
             effective_kind = route_kind(candidate.request.kind, holder_now)
@@ -2757,6 +2945,18 @@ def _gate_all(
             area_hold_until_merged=area_hold_until_merged,
             area_fail_open=area_fail_open,
         )
+        if candidate.project in milestone_projects and candidate.row is not None:
+            title, _, closed = row_milestone(candidate.row)
+            if title is not None:
+                suffix = f"; milestone {title}"
+                if closed:
+                    suffix += " (closed)"
+                raw_due = _stored_due(candidate.row)
+                if raw_due is not None and raw_due != "" and not _due_is_iso(raw_due):
+                    suffix += f" (bad due {raw_due})"
+                verdict = replace(verdict, reason=verdict.reason + suffix)
+            else:
+                verdict = replace(verdict, reason=verdict.reason + "; milestone none")
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)

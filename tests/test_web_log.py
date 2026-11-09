@@ -13,15 +13,11 @@ beyond loopback, no real state dirs.
 import json
 import re
 import unittest
-from importlib import resources
 
 from korapy import coord
 from tests.test_serve import EVENT_ROWS, ServeCase, healthy_doc, journal_entry
 from tests.test_serve import FakeBuilder
-
-
-def web_text(name):
-    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
+from tests.test_web_dashboard_651 import web_text
 
 
 class EventsContract(ServeCase):

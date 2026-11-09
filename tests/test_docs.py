@@ -257,6 +257,7 @@ class DispatchLoopDefaults(unittest.TestCase):
             "drive.max_starts_per_day",
             "drive.period",
             "drive.pulls_max_calls",
+            "eligibility.milestone_first",
         ):
             with self.subTest(setting=key):
                 self.assertIn(f"`{key}`", flat)

@@ -17,14 +17,10 @@ import http.client
 import json
 import re
 import unittest
-from importlib import resources
 
 from korapy import snapshot
 from tests.test_serve import FakeBuilder, ServeCase, healthy_doc
-
-
-def web_text(name):
-    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
+from tests.test_web_dashboard_651 import web_text
 
 
 def js_body(text, signature):
