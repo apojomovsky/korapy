@@ -318,7 +318,21 @@ Per-candidate gate order, cheapest first:
    nothing. The skip shows in the drive journal and in the `snapshot`
    drive section's skipped-by-reason counts, where a coordinator
    sees it. Only an `ok` outcome counts: any other outcome, or no
-   review map at all, gates as before. Then the fresh-start check: a
+   review map at all, gates as before. The claiming pass then gives
+   the recordless reviewer one chance to record: it resumes that
+   reviewer session once with the exact `korapy review record`
+   command (the head pinned to the ticket branch tip read fresh from
+   the remote and revalidated before and after the resume, the
+   author pinned to the pre-takeover worker id parsed from the
+   reviewer leaf's stored prompt, the resume mark `.reprompted`
+   inside the reviewer leaf). The command text is built by the one
+   `prompts.review_record_command` builder, shared with the reviewer
+   prompt and the takeoff fix hint. A moved or unreadable tip, an
+   unreadable prompt, a missing or self-naming author, an unknown
+   reviewer session, an unwritable mark, or a refused resume all
+   fail closed to the skip; a move after the resume just proceeds,
+   and the next pass orders a fresh review of the new tip. `--plan`
+   never resumes. Then the fresh-start check: a
    `start` (including a `fix` or `resume` reclassified as one) on an
    unclaimed row with an open linked pull request skips, since the
    pull carries the ticket. The linked pulls come from the row, which
