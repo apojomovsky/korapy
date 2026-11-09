@@ -163,8 +163,10 @@ class RowPullsTest(unittest.TestCase):
     def test_row_from_item_normalizes_missing_extra(self):
         self.assertEqual(eligibility.row_from_item(item(extra=None)).extra, {})
 
-    def test_request_kinds_are_the_four_dispatch_kinds(self):
-        self.assertEqual(sorted(eligibility.KINDS), ["fix", "resume", "review", "start"])
+    def test_request_kinds_are_the_five_dispatch_kinds(self):
+        self.assertEqual(
+            sorted(eligibility.KINDS), ["fix", "research", "resume", "review", "start"]
+        )
 
 
 class MergedScopeTest(unittest.TestCase):

@@ -87,6 +87,7 @@ class FakeTracker:
         self.write_errors = {}
         self.comment_errors = {}
         self.comments_errors = {}
+        self.comment_bodies = {}
         self.posted_comments = {}
         self.label_errors = {}
         self.remove_errors = {}
@@ -167,10 +168,18 @@ class FakeTracker:
         self.posted_comments.setdefault((repo, number), []).append(body)
 
     def comments(self, repo, number):
-        """Bodies of the posted comments, oldest first; programmed errors raise."""
+        """Comment bodies, oldest first, as a tuple; programmed errors raise.
+
+        A ticket with programmed `comment_bodies` reads those (the
+        research tests preload them); otherwise the bodies posted
+        through `comment` read back (the decision tests post their
+        decision line, then list to prove idempotency).
+        """
         self.calls.append(("comments", repo, number))
         if (repo, number) in self.comments_errors:
             raise self.comments_errors[(repo, number)]
+        if (repo, number) in self.comment_bodies:
+            return tuple(self.comment_bodies[(repo, number)])
         return tuple(self.posted_comments.get((repo, number), ()))
 
     def add_label(self, repo, number, label):
@@ -530,6 +539,8 @@ class BootstrapLabelsTest(unittest.TestCase):
                 "needs-triage",
                 "needs-decision",
                 "hold",
+                "research",
+                "researched",
                 "priority:urgent",
                 "priority:high",
                 "priority:normal",

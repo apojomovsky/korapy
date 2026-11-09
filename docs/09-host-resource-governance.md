@@ -56,7 +56,7 @@ place):
    ceiling, mirroring the count floors and ceilings in `admission.py` so the
    two compose without a second mental model.
 3. **Per-agent charge.** Each launch is charged by role (worker, reviewer,
-   triage): a fixed CPU and memory cost, like a price tag, decided before
+   triage, research): a fixed CPU and memory cost, like a price tag, decided before
    anything is measured.
 
 Enforcement maps to nested slices under the user manager:
@@ -276,7 +276,16 @@ memory_mb = 2048
 [resources.role.reviewer]
 cpu_m = 500
 memory_mb = 1024
+[resources.role.research]
+cpu_m = 500
+memory_mb = 1024
 ```
+
+Every role that launches on the host needs its own
+`[resources.role.<name>]` table: while a host budget is set, a launch
+in an unpriced role is refused with exit 4, so a host that runs
+research tickets prices the `research` role above, or those tickets
+never start.
 
 There is no `[resources.instance]` table and no instance weight: with one
 korapy per machine the host budget divides directly between projects.

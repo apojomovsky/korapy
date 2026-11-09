@@ -47,7 +47,8 @@ honest-panel facts `source`, `read_failed` and `error_trimmed`),
 (per path totals or per path error), `resources` (charged and measured
 use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
 `mem_total_mb` and `mem_available_mb` the dashboard gauges divide by),
-`attention` (needs-decision questions, ready-to-merge rows and the
+`attention` (needs-decision questions, ready-to-merge rows, answered
+research findings and the
 coordinator-handled count from the event queue, `unknown` when the
 queue has no reading) and `plan` (the next starts with their named
 waits, identical waits collapsed with a count and the ticket list,

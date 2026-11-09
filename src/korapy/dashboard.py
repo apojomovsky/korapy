@@ -209,7 +209,9 @@ def attention(events):
     or the exception reading them raised. Anything else (a wrong-typed
     source or a row that is not a dict) reads `error`, never `ready`. `needs_decision` carries the
     question rows, `ready_to_merge` the held-merge rows, each with its
-    ref and one line of evidence. `coordinator_handled` counts the rows
+    ref and one line of evidence. `research` carries the answered
+    research findings, each with its ref and the finding's first line.
+    `coordinator_handled` counts the rows
     the coordinator owns (`coordinator-review`). Failing doctor rows
     are not part of this band: they need their own reader, which a
     later change adds.
@@ -219,6 +221,7 @@ def attention(events):
             "state": "unknown",
             "needs_decision": "unknown",
             "ready_to_merge": "unknown",
+            "research": "unknown",
             "coordinator_handled": "unknown",
             "items": "unknown",
         }
@@ -227,6 +230,7 @@ def attention(events):
             "state": "error",
             "needs_decision": [],
             "ready_to_merge": [],
+            "research": [],
             "coordinator_handled": 0,
             "items": [],
             "error": str(events) or repr(events),
@@ -236,12 +240,14 @@ def attention(events):
             "state": "error",
             "needs_decision": [],
             "ready_to_merge": [],
+            "research": [],
             "coordinator_handled": 0,
             "items": [],
             "error": f"attention events is {type(events).__name__}, want a list of rows",
         }
     needs = []
     merges = []
+    findings = []
     handled = 0
     for row in events:
         kind = row.get("kind")
@@ -254,14 +260,19 @@ def attention(events):
             merges.append(
                 {"ref": ref, "reason": row.get("reason") or row.get("evidence") or "unknown"}
             )
+        elif kind == "research":
+            findings.append(
+                {"ref": ref, "findings": row.get("findings") or row.get("evidence") or "unknown"}
+            )
         elif kind == "coordinator-review":
             handled += 1
     return {
         "state": "ready",
         "needs_decision": needs,
         "ready_to_merge": merges,
+        "research": findings,
         "coordinator_handled": handled,
-        "items": list(needs) + list(merges),
+        "items": list(needs) + list(merges) + list(findings),
     }
 
 

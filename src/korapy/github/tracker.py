@@ -17,7 +17,7 @@ from korapy.github.gh import (
     is_rate_limited,
     retry_after_s,
 )
-from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
+from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX, RESEARCHED
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
@@ -30,6 +30,8 @@ _BOOTSTRAP_COLORS = {
     "needs-triage": "fbca04",
     "needs-decision": "d93f0b",
     "hold": "5319e7",
+    "research": "1d76db",
+    "researched": "0e8a16",
     "priority:urgent": "b60205",
     "priority:high": "d93f0b",
     "priority:normal": "fbca04",
@@ -500,7 +502,8 @@ class GithubTracker:
         Pages until a short page ends the list, like the feed. Anything
         short of a list of ``body`` strings is a ``TrackerError``, never
         a partial list: a truncated list would read a posted decision
-        line as absent and post it twice.
+        line as absent and post it twice, or miss the Findings comment
+        the research finish looks for.
         """
         found: list[str] = []
         page = 1
@@ -527,15 +530,15 @@ class GithubTracker:
             page += 1
 
     def add_label(self, repo: str, number: int, label: str) -> None:
-        """Add the one decision label through the issues-labels endpoint.
+        """Add one loop-owned label through the issues-labels endpoint.
 
-        Only ``NEEDS_DECISION`` is accepted; there is no general label
-        write, so any other name is refused with ``ValueError`` and no
-        ``gh`` call runs. A failed call raises ``TrackerError`` through
-        ``_write_error``.
+        Only ``NEEDS_DECISION`` and ``RESEARCHED`` are accepted; there
+        is no general label write, so any other name is refused with
+        ``ValueError`` and no ``gh`` call runs. A failed call raises
+        ``TrackerError`` through ``_write_error``.
         """
-        if label != NEEDS_DECISION:
-            raise ValueError(f"refusing to add non-decision label {label!r}")
+        if label not in (NEEDS_DECISION, RESEARCHED):
+            raise ValueError(f"refusing to add non-loop label {label!r}")
         try:
             self._run(
                 [

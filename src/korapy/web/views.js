@@ -1532,6 +1532,14 @@ export function attentionItems(doc, nowMs) {
         item && typeof item.reason === "string" && item.reason !== "" ? item.reason : "unknown";
       items.push("ready to merge " + ref + ": " + reason);
     }
+    for (const item of Array.isArray(panel.research) ? panel.research : []) {
+      const ref = item && item.ref !== null && item.ref !== undefined ? String(item.ref) : "no ref";
+      const findings =
+        item && typeof item.findings === "string" && item.findings !== ""
+          ? item.findings
+          : "unknown";
+      items.push("research findings " + ref + ": " + findings);
+    }
   }
   for (const [section, label] of [
     ["fleet_header", "fleet"],

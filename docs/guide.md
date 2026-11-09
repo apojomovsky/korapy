@@ -446,7 +446,7 @@ korapy hub release REPO N --reason TEXT
 ```
 
 Workers and reviewers ride the same loop in different roles
-(`worker`, `reviewer`, `triage`). Resume and fix rounds for
+(`worker`, `reviewer`, `triage`, `research`). Resume and fix rounds for
 already-claimed tickets go before new starts, so in-flight work is not
 starved by new tickets, and review waits its turn with the starts.
 Each role keeps its own session, so resuming the worker never picks up
