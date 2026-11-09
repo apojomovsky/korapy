@@ -797,8 +797,9 @@ def _split_profile_refusal(data, runtime):
     matching `[profiles.default]` runtime plus the `[profile]` default
     selection. Otherwise the reason the refusal names, so the message is
     true for every cause: a missing `[profiles.default]` table, a table
-    with no `runtime` key, a `[profile]` default selection naming another
-    profile, or a runtime that differs. The split layout is append-only:
+    with no `runtime` key, a missing `[profile]` table, a `[profile]`
+    default selection naming another profile, or a runtime that differs.
+    The split layout is append-only:
     `init` adds `[[repo]]` entries but never rewrites the shared profile
     tables, which other entries may already rely on.
     """
@@ -818,7 +819,13 @@ def _split_profile_refusal(data, runtime):
             "never rewrites the shared profile tables"
         )
     profile = data.get("profile")
-    selected = profile.get("default") if isinstance(profile, dict) else None
+    if not isinstance(profile, dict):
+        return (
+            "has no [profile] table: add one "
+            f"carrying default = {profiles.DEFAULT_PROFILE_NAME!r} by hand, init "
+            "never rewrites the shared profile tables"
+        )
+    selected = profile.get("default")
     if selected != profiles.DEFAULT_PROFILE_NAME:
         return (
             f"carries [profile] default = {selected!r} instead of "
