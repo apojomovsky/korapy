@@ -184,6 +184,32 @@ class ClaimLaunchTest(unittest.TestCase):
         self.assertTrue(out.splitlines()[-1].startswith("pass:"))
         self.assertIn("started 1", out.splitlines()[-1])
 
+    def test_a_fresh_research_row_launches_with_the_research_kind(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker(
+            [
+                reading(
+                    repo="app", number=7, title="Title 7", labels=("research",), updated_at=1900.0
+                )
+            ]
+        )
+        launcher = FakeLauncher()
+        code, out, err = self.run_claims(
+            store, [("blue", [("app", 7, "research")])], fake, launcher
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(len(launcher.calls), 1)
+        project, repo, number, kind, agent, title, _author = launcher.calls[0]
+        self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "research"))
+        self.assertTrue(agent.startswith("drive-"))
+        self.assertEqual(title, "Title 7")
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, agent)
+        self.assertIn("research", out)
+        self.assertIn("started 1", out.splitlines()[-1])
+
     def test_mirror_drains_the_claim_write_on_the_healthy_pass(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -615,6 +641,18 @@ class ProductionLauncherStartTest(unittest.TestCase):
         self.assertEqual([entry["id"] for entry in entries], [unit])
         ticket = entries[0]["ticket"]
         self.assertEqual((ticket["repo"], ticket["number"], ticket["project"]), ("app", 7, "blue"))
+
+    def test_research_runs_a_unit_with_the_research_role(self):
+        project = projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=self.root)
+        launcher = drive.production_launcher([project])
+        agent = drive.mint_agent("acme/app", 7, host="host-1", now=2000.0)
+        unit = launcher("blue", "acme/app", 7, "research", agent, "Title 7", now=2000.0)
+        self.assertEqual(unit, "blue-agent-app-7")
+        self.assertEqual(len(self.started), 1)
+        self.assertIn(f"--unit={unit}", self.started[0])
+        entries = registry.load_all()
+        self.assertEqual([entry["id"] for entry in entries], [unit])
+        self.assertEqual(entries[0]["role"], "research")
 
 
 class OutageTest(unittest.TestCase):

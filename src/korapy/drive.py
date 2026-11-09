@@ -4887,7 +4887,9 @@ def _claim_and_launch(
     print, the start launches, whether a launch failed because the
     service manager was unreachable, and the (project, repo, number) of
     every row the launcher actually launched. `start` claims a fresh id
-    with `mint_agent` and launches a worker; `review` takes over the
+    with `mint_agent` and launches a worker, and `research` claims a
+    fresh id the same way and launches with the research prompt;
+    `review` takes over the
     finished worker's claim (release, then a fresh reviewer id) and
     launches a reviewer with the pre-takeover worker id
     as its author, releasing the claim again when the launch never
@@ -4926,9 +4928,9 @@ def _claim_and_launch(
     feed the reviewer author. With no `launcher` the pass stops after
     claiming and records that, releasing a reviewer claim again like a
     failed launch, so no row counts as launched. The day
-    cap counts `start`, `review` and fresh `fix` launches: each one
-    starts a new agent. A `resume` reuses the holder's claim and stays
-    exempt. When `start_budget` is not None, at most that many launch;
+    cap counts `start`, `research`, `review` and fresh `fix` launches:
+    each one starts a new agent. A `resume` reuses the holder's claim
+    and stays exempt. When `start_budget` is not None, at most that many launch;
     further ones become `cap` skips naming `day_cap`, and each launch
     spends one from the local budget. In hub mode (`hub` given) every
     fresh claim is proposed to the hub first and the local store
