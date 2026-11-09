@@ -102,6 +102,11 @@ EXCLUDE_LINE = ".worktrees/"
 #: sibling. A real path is never this value.
 OPS_DEFAULT = ""
 
+#: The `[profiles.default]` runtime a plain `init` writes. There is no
+#: shipped default to fall back to, so every fresh project declares its
+#: own; this is the runtime the project actually uses.
+DEFAULT_PROFILE_RUNTIME = "muse"
+
 
 class PlanInputs(NamedTuple):
     """Everything `render` needs: detection plus flag overrides."""
@@ -483,18 +488,15 @@ def _entry_values_equal(entry, name, active):
 
 
 def _profiles_block(inputs):
-    """The top-level profile tables for `inputs.runtime`, or "".
+    """The top-level profile tables for `inputs.runtime`, always written.
 
-    A `--runtime` naming the built-in default's runtime writes nothing:
-    the built-in default already runs it. Any other runtime writes a
-    `[profiles.default]` table carrying it plus the `[profile]`
-    default selection naming `default`, so the declared table wins the
-    layer-6 resolution instead of the built-in one. Model chains are
-    never written: detection does not know them.
+    Every fresh project declares its own `[profiles.default]` table plus
+    the `[profile]` default selection naming it, so its launches resolve
+    without any operator switch: there is no shipped default to fall back
+    to. A `--runtime` writes that runtime instead of the default one.
+    Model chains are never written: detection does not know them.
     """
-    runtime = inputs.runtime
-    if runtime is None or runtime == profiles.BUILTIN_DEFAULT.runtime:
-        return ""
+    runtime = inputs.runtime or DEFAULT_PROFILE_RUNTIME
     return (
         "[profile]\n"
         f"default = {json.dumps(profiles.DEFAULT_PROFILE_NAME)}\n"
@@ -507,11 +509,11 @@ def _profiles_block(inputs):
 
 def render(inputs):
     """The `korapy.toml` text for `inputs`: the settings that differ
-    from the defaults live in the single `[[repo]]` entry; a `--runtime`
-    writes the top-level `[profiles.default]` table (plus the `[profile]`
-    default selection) above it; every other registered setting is
-    commented out with its default and one-line help, grouped by prefix,
-    so the template never goes stale."""
+    from the defaults live in the single `[[repo]]` entry; the top-level
+    `[profiles.default]` table (plus the `[profile]` default selection)
+    is always written above it, carrying `--runtime` when one was given;
+    every other registered setting is commented out with its default and
+    one-line help, grouped by prefix, so the template never goes stale."""
     settings._load_providers()
     active = _active(inputs)
     lines = [
@@ -789,8 +791,7 @@ def _split_profiles_converged(data, inputs):
     already rely on. No `--runtime` flag never touches them, so it always
     reads as converged. An explicit flag must match the file's
     `[profiles.default]` runtime plus the `[profile]` default selection;
-    a missing table matches only the built-in default's runtime, which
-    needs no table at all. Anything else is refused for a hand edit.
+    anything else (including a missing table) is refused for a hand edit.
     """
     runtime = inputs.runtime
     if runtime is None:
@@ -798,7 +799,7 @@ def _split_profiles_converged(data, inputs):
     tables = data.get("profiles")
     default = tables.get("default") if isinstance(tables, dict) else None
     if not isinstance(default, dict):
-        return runtime == profiles.BUILTIN_DEFAULT.runtime
+        return False
     if default.get("runtime") != runtime:
         return False
     profile = data.get("profile")

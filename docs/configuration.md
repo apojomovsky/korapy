@@ -60,7 +60,10 @@ and the First run section of [`guide.md`](guide.md).
 A project's default profile declares its runtime and model chains in
 the same `korapy.toml`. Each chain entry names a provider from the
 pool as `provider/model`; an unknown provider is a configuration
-error (exit 4), and an id starting with `-` is refused. The per-launch
+error (exit 4), and an id starting with `-` is refused. There is no
+shipped default profile: a launch that resolves no declared or selected
+profile fails fast with exit 4 naming the `[profiles.default]` table to
+declare, instead of running a setup nobody chose. The per-launch
 overlay drops exhausted providers from each chain, so a launch routes
 around quota that is gone; when a required role has no live provider
 left, the launch is refused with exit 75. Resolution, roles, overrides
