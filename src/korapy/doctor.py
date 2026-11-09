@@ -1276,7 +1276,11 @@ def production_git(args: Sequence[str], cwd: str):
     `remote get-url` stays local; `ls-remote --symref` reaches the
     remote the same way the labels read does. Anything git cannot run
     reads as None so the caller degrades to a warn row, never a
-    traceback. Tests inject a fake.
+    traceback. Tests inject a fake. Kept separate from `syncli._git`
+    on purpose: this one runner feeds every git read in the report
+    (board sites, repo sites, default-branch lookups), while
+    `syncli._git` feeds sync, mirror and launch; sharing one would
+    couple the report seam to the sync seam.
     """
     from korapy.gitenv import clean_env
 
