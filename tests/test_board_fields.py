@@ -139,7 +139,18 @@ class TrackerExtraTest(unittest.TestCase):
         run = FakeRun()
         run.add("repos/acme/app/issues/7", item_payload(7))
         found = ghtracker.GithubTracker(run).item("acme/app", 7)
-        self.assertEqual(found.extra, {})
+        extra = found.extra
+        assert isinstance(extra, dict)
+        for concept in ("priority", "area", "pool", "board_status", "blocked_by"):
+            self.assertNotIn(concept, extra)
+        self.assertEqual(
+            (
+                extra["milestone"],
+                extra["milestone_due"],
+                extra["milestone_closed"],
+            ),
+            (None, None, False),
+        )
 
     def test_rest_reads_do_not_share_one_extra_dict(self):
         from tests.test_tracker import item_payload
@@ -150,7 +161,10 @@ class TrackerExtraTest(unittest.TestCase):
         adapter = ghtracker.GithubTracker(run)
         first = adapter.item("acme/app", 7)
         second = adapter.item("acme/app", 8)
-        self.assertEqual((first.extra, second.extra), ({}, {}))
+        assert isinstance(first.extra, dict)
+        assert isinstance(second.extra, dict)
+        empty = {"milestone": None, "milestone_due": None, "milestone_closed": False}
+        self.assertEqual((first.extra, second.extra), (empty, empty))
         self.assertIsNot(first.extra, second.extra)
 
 

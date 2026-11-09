@@ -98,23 +98,42 @@ def _fail(text):
     return iface.TrackerError(f"unusable tracker answer: {text}")
 
 
-def milestone_of(payload) -> str | None:
-    """The milestone title of an issues-endpoint object, else ``None``.
+def milestone_info_of(payload) -> tuple[str | None, str | None, bool]:
+    """The milestone facts of an issues-endpoint object: ``(title, due_on, closed)``.
 
-    A missing or null milestone reads as ``None``; anything short of a
-    title string is a ``TrackerError``, never a guess. Pure, so the
-    board reader shares it with this module's own parse.
+    A missing or null milestone reads as ``(None, None, False)``; a
+    title-less milestone, a non-string due date, or a non-string state
+    is a ``TrackerError``, never a guess. A missing due date reads as
+    ``None`` and a missing or non-closed state reads as open, so
+    title-only fixtures keep working. Pure, so the readers share it
+    with this module's own parse, and no pass spends a new call on it:
+    the facts ride the already-fetched issue payload.
     """
     if not isinstance(payload, dict):
         raise _fail(f"item is not an object: {payload!r}")
     milestone = payload.get("milestone")
     if milestone is None:
-        return None
+        return None, None, False
     if not isinstance(milestone, dict):
         raise _fail(f"bad milestone {milestone!r}")
     title = milestone.get("title")
     if not isinstance(title, str) or not title:
         raise _fail(f"bad milestone {milestone!r}")
+    due = milestone.get("due_on")
+    if due is not None and not isinstance(due, str):
+        raise _fail(f"bad milestone {milestone!r}")
+    state = milestone.get("state")
+    if state is not None and not isinstance(state, str):
+        raise _fail(f"bad milestone {milestone!r}")
+    return title, due, state == "closed"
+
+
+def milestone_of(payload) -> str | None:
+    """The milestone title of an issues-endpoint object, else ``None``.
+
+    The title half of `milestone_info_of`: one fact, one parser. Pure.
+    """
+    title, _, _ = milestone_info_of(payload)
     return title
 
 
@@ -270,6 +289,7 @@ class GithubTracker:
             raise _fail(f"bad url {url!r}")
         updated_at = _parse_updated(payload.get("updated_at"))
         merged_at = _parse_merged_at(payload)
+        milestone_title, milestone_due, milestone_closed = milestone_info_of(payload)
         return iface.TrackerItem(
             repo=repo,
             number=number,
@@ -289,9 +309,16 @@ class GithubTracker:
             else False,
             agent=field_value_of(labels, "agent"),
             status=field_value_of(labels, "status"),
-            # The REST feed carries no board concepts: an empty reading
-            # keeps the stored board extra when the store merges by key.
-            extra={},
+            # The REST feed carries no board concepts (an absent board
+            # key keeps the stored extra when the store merges by key),
+            # but the milestone rides along from the same payload: one
+            # more field on the existing listing, no new call. A missing
+            # milestone clears the stored one, like the board reader.
+            extra={
+                "milestone": milestone_title,
+                "milestone_due": milestone_due,
+                "milestone_closed": milestone_closed,
+            },
         )
 
     def _page(self, path):
@@ -330,12 +357,15 @@ class GithubTracker:
         found, _ = self.read_issue(repo, number)
         return found
 
-    def read_issue(self, repo: str, number: int) -> tuple[iface.TrackerItem, str | None]:
-        """One issue plus its milestone title, fresh from the REST endpoint.
+    def read_issue(
+        self, repo: str, number: int
+    ) -> tuple[iface.TrackerItem, tuple[str | None, str | None, bool]]:
+        """One issue plus its milestone facts, fresh from the REST endpoint.
 
-        The milestone rides along because the board reader overlays it as
-        a concept; the plain ``item`` path keeps ignoring it. A missing
-        or null milestone reads as ``None``.
+        The facts are ``(title, due_on, closed)`` for the board reader
+        to overlay as concepts; the plain ``item`` path keeps ignoring
+        them. A missing or null milestone reads as ``(None, None,
+        False)``. Same payload, same call: no new GitHub call.
         """
         try:
             payload = json.loads(self._get(f"repos/{repo}/issues/{number}"))
@@ -343,7 +373,7 @@ class GithubTracker:
             raise
         except Exception as err:
             raise _fail(f"item {repo}#{number} is not JSON: {err}") from err
-        return self._parse(repo, payload), milestone_of(payload)
+        return self._parse(repo, payload), milestone_info_of(payload)
 
     def changes(self, repo: str, cursor: str | None) -> tuple[list[iface.TrackerItem], str]:
         """Items updated since ``cursor``, and the cursor of the newest

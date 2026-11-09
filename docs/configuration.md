@@ -170,6 +170,7 @@ what it means. Do not edit this table by hand.
 | `drive.max_starts_per_day` | `50` | real starts one dispatch pass may launch per calendar day (plans never count) |
 | `drive.period` | `'*:0/5'` | systemd OnCalendar cadence at which the installed timer wakes a pass |
 | `drive.pulls_max_calls` | `20` | max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed) |
+| `eligibility.milestone_first` | `False` | order one project's start requests by milestone first (earliest due date, then version title, unmilestoned and closed-milestone last) instead of by priority alone |
 | `freeze.max_age_s` | `86400` | age in seconds after which a standing freeze warns in doctor instead of silently blocking starts |
 | `git.branch` | `'{type}/{issue}-{slug}'` | branch name template |
 | `git.commits.conventional` | `True` | enforce Conventional Commits |
