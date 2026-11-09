@@ -62,6 +62,25 @@ def with_heartbeat(text):
     return text.rstrip() + "\n\n" + HEARTBEAT + "\n"
 
 
+def review_record_command(repo, number, commit, author):
+    """The exact `korapy review record` command a reviewer runs.
+
+    One builder, one place: the reviewer prompt template, the loop's
+    reprompt message and the takeoff fix hint all carry this string,
+    and an agreement test pins the three copies, so the verdict
+    spelling cannot drift from :data:`korapy.reviewrecord.VERDICTS`
+    again. `repo`, `number`, `commit` and `author` render verbatim:
+    callers pass placeholders (`<change-author>`) or pinned values.
+    """
+    from korapy import reviewrecord
+
+    verdicts = "<" + "|".join(reviewrecord.VERDICTS) + ">"
+    return (
+        f"korapy review record {repo} {number} --commit {commit} "
+        f"--verdict {verdicts} --author {author}"
+    )
+
+
 #: The ejected override directory inside the ops root.
 PROMPTS_DIR = os.path.join(".korapy", "prompts")
 

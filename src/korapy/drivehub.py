@@ -439,6 +439,9 @@ def cmd_drive(args: argparse.Namespace) -> int:
             driven=driven,
             pool=quota_pool,
             quota_refresh_after_s=quota_refresh_after_s,
+            reprompt_resume=drive.production_reprompt_resume(
+                registered, store=store, hold_label=hold_label, now=moment
+            ),
         )
 
 

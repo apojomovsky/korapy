@@ -1,9 +1,10 @@
 # 17: reviewers that end with prose and no record
 
-Status: design, awaiting maintainer approval. No code ships with
-this doc. It decides how the loop recovers when a reviewer
-finishes with a prose verdict and never runs `korapy review
-record`. Implementation waits for approval.
+Status: approved (option 1) and implemented: the loop reorders
+the reviewer prompt checklist-first and resumes a recordless
+reviewer once. This doc decides how the loop recovers when a
+reviewer finishes with a prose verdict and never runs `korapy
+review record`.
 
 Conventions: module, function and file names quoted below were
 read from the tree at design time (`drive.py`,
@@ -117,10 +118,13 @@ the plan-time pin, the pre-resume revalidation and the
 post-resume revalidation, go through that same helper;
 `drive.py` reads no remote tip today, so the resume path
 adds no second resolver for the tip fact. When the tip
-cannot be read, or the tip moved between reads, no resume
-is spent, the skip stands, and the ticket waits for a fresh
-review of the new tip, so the one resume never burns on a
-record that cannot unblock the gate.
+cannot be read, or the tip moved between the pin and the
+pre-resume revalidation, no resume is spent, the skip
+stands, and the ticket waits for a fresh review of the new
+tip, so the one resume never burns on a record that cannot
+unblock the gate. A tip that moves after the resume already
+ran just proceeds: the mark is spent, and the next pass
+orders a fresh review of the new tip in a new reviewer leaf.
 The resume goes through the existing `launch.resume` seam
 with role reviewer (read-only preserved), so runtimes need no
 new interface (`resume_handle` already exists per runtime).
@@ -164,9 +168,11 @@ children, and `_role_leaves` still sees the same
 `<role>-<gen>` dir with its prompt; `latest_record` scans
 only `reviews/`, so it never sees the mark. The mark leaves
 with the leaf under the existing session gc proofs, and a
-resume preserves it (the prompt and config are rewritten in
-place), so the post-resume pass still reads "already
-reprompted" and never spends a second resume. The mark is
+resume preserves it (nothing on the resume path deletes the
+leaf; config is rewritten only on a flagged resume, and the
+mark file itself is never touched), so the post-resume pass
+still reads "already reprompted" and never spends a second
+resume. The mark is
 written before the resume is requested; a crash between mark
 and spawn reads as "already reprompted" and fails closed to
 today's skip. A mark that cannot be written also fails
@@ -228,7 +234,9 @@ resume requests none and keeps the skip for a fresh review;
 resume success plus a record written by the fake reviewer
 clears the skip; resume refusal keeps the skip and the log
 line; an unwritable mark keeps the skip with no resume and
-no failed pass. A fake `run` behind `push.remote_head`
+no failed pass; a tip that moves after the resume just
+proceeds with the mark spent and a fresh-review line. A
+fake `run` behind `push.remote_head`
 where the remote tip (B) differs from the plan-time pin (A),
 or cannot be read at all, requests no resume and keeps the
 skip. A production-shaped case proves the resume fires: the

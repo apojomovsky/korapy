@@ -52,6 +52,7 @@ from korapy import (
     profiles,
     projects,
     prompts,
+    push,
     quota,
     quota_ledger,
     quotacli,
@@ -1404,6 +1405,298 @@ def _review_missing(holder, newest, reviews, key) -> bool:
         and reviews is not None
         and key not in reviews
     )
+
+
+def needs_reprompt(holder, newest, reviews, key, reprompted) -> bool:
+    """Whether a recordless finished reviewer gets one resume. Pure.
+
+    The gate's skip and the reprompt decision share `_review_missing`,
+    so a ticket the gate did not skip as `review-missing` never
+    reprompts; `reprompted` is the set of (repo, number) keys with a
+    reprompt mark on file (plus any resumed earlier in the pass), and
+    a marked ticket never reprompts again. The step seeds the set
+    from the reviewer leaf's mark file, so the set and the file
+    cannot disagree: one fact, one place. Exactly one resume per
+    reviewer session is fixed loop behavior, like the existing
+    takeover rule, not operator tuning.
+    """
+    return _review_missing(holder, newest, reviews, key) and key not in (reprompted or ())
+
+
+#: The empty resume mark inside one reviewer session leaf. A file
+#: directly under the ticket root is refused: `paths._legacy_session`
+#: reads any direct child file as a legacy generation-0 session, so
+#: the mark lives inside the reviewer leaf, where neither half of
+#: `ticket_sessions` nor `latest_record` ever sees it.
+REPROMPT_MARK = ".reprompted"
+
+#: The reviewer author block's worker-id spelling, parsed back from the
+#: finished reviewer leaf's stored prompt.
+_AUTHOR_PREFIX = "written by agent `"
+
+
+def parse_review_author(text) -> str:
+    """The worker id a reviewer prompt names as the change's author. Pure.
+
+    Reads back the id `reviewer_author_block` wrote (`written by agent
+    \\`<id>\\``): the reviewer passes it as `review record --author`,
+    and the record refuses a self-review. A prompt without the block
+    names no author, so the resume is refused and the skip stands.
+    """
+    body = text if isinstance(text, str) else ""
+    start = body.find(_AUTHOR_PREFIX)
+    if start < 0:
+        return ""
+    start += len(_AUTHOR_PREFIX)
+    end = body.find("`", start)
+    if end <= start:
+        return ""
+    return body[start:end].strip()
+
+
+def reprompt_message(repo, number, commit, author) -> str:
+    """The message a review-record resume carries into the session. Pure.
+
+    The exact command comes from the one builder
+    (`prompts.review_record_command`), never a second copy, with the
+    head pinned to the ticket branch tip and the author pinned to the
+    pre-takeover worker id; the verdict is left to the reviewer.
+    """
+    command = prompts.review_record_command(repo, number, commit, author)
+    return (
+        f"Your review of {repo}#{number} finished without a review record: "
+        "a prose verdict alone is not a review. Record the commit you "
+        f"reviewed with the exact command:\n\n{command}\n\n"
+        "Run the command, then end your turn with the record path it prints."
+    )
+
+
+def _reprompt_mark(repo, number, gen, *, sessions_root=None):
+    """The resume mark path inside one reviewer session leaf."""
+    return os.path.join(
+        paths.role_session_dir(repo, number, "reviewer", gen, root=sessions_root),
+        REPROMPT_MARK,
+    )
+
+
+def _write_reprompt_mark(mark) -> bool:
+    """Write the resume mark; False when it cannot be written.
+
+    A mark that cannot be written fails closed: the skip stands, no
+    resume is requested, and the pass never reprompts without a mark.
+    """
+    try:
+        paths.atomic_write_text(mark, "")
+    except OSError:
+        return False
+    return True
+
+
+def _remote_tip(clone, branch, run):
+    """The remote tip sha of `branch`, or "" when missing or unreadable."""
+    sha, _proc = push.remote_head(clone, "origin", branch, run=run)
+    return sha
+
+
+def _reprompt_mark_for(repo, number, reviewer, *, tgt, sessions_root):
+    """(mark, None) for the finished reviewer session leaf, or (None, refusal).
+
+    Resolves the owning target, the unit prefix and the generation of
+    the finished reviewer session to the resume mark path. Any failure
+    is a `(outcome, reason)` refusal and the skip stands.
+    """
+    if tgt is None:
+        return (
+            None,
+            (
+                f"refused: {repo}#{number} has no launch target",
+                "the ticket has no launch target",
+            ),
+        )
+    try:
+        prefix = projects.unit_prefix(tgt.root, tgt.resolved)
+    except (KeyError, TypeError, AttributeError, settings.SettingsError) as err:
+        return None, (f"refused: {err}", "the unit prefix is unreadable")
+    parsed = units.parse_unit(prefix, reviewer or "")
+    if parsed is None:
+        return None, (
+            "refused: the reviewer session is unknown",
+            "the reviewer session is unknown",
+        )
+    _short, _num, gen = parsed
+    try:
+        mark = _reprompt_mark(tgt.repo, number, gen, sessions_root=sessions_root)
+    except paths.PathError as err:
+        return None, (f"refused: {err}", "the reviewer session is unknown")
+    return mark, None
+
+
+def _reprompt_one(repo, number, reviewer, *, title, tgt, mark, run):
+    """The refusal or the pinned resume plan for one recordless reviewer.
+
+    Runs the per-ticket checks and pins the head: the stored prompt's
+    author (never the same-pass capture, and never the finished
+    reviewer itself), the ticket branch, and the remote tip read
+    fresh. The mark file is re-checked here (the caller gates on
+    `needs_reprompt` against the same file first): a mark landing
+    between the two reads refuses rather than double-resuming. Any
+    failure is a `(outcome, reason)` refusal and the skip stands;
+    success is `("ok", tip, branch, message, mark)`, and the caller
+    revalidates the tip before it resumes.
+    """
+    if os.path.isfile(mark):
+        return "refused: already reprompted", "already reprompted"
+    try:
+        with open(os.path.join(os.path.dirname(mark), "prompt.md"), encoding="utf-8") as handle:
+            prompt = handle.read()
+    except OSError:
+        return "refused: the reviewer prompt is unreadable", "the reviewer prompt is unreadable"
+    author = parse_review_author(prompt)
+    if not author:
+        return (
+            "refused: the reviewer prompt names no author",
+            "the reviewer prompt names no author",
+        )
+    if author == reviewer:
+        return (
+            "refused: the author is the reviewer itself",
+            "the author is the reviewer itself",
+        )
+    try:
+        branch = worktrees.branch_for(
+            number, title or f"{repo}#{number}", template=tgt.branch_template
+        )
+    except worktrees.WorktreeError as err:
+        return f"refused: {err}", "the ticket branch is unknown"
+    tip = _remote_tip(tgt.clone, branch, run)
+    if not tip:
+        return (
+            "refused: the branch tip is unreadable",
+            "the branch tip is unreadable",
+        )
+    message = reprompt_message(repo, number, tip, author)
+    return ("ok", tip, branch, message, mark)
+
+
+def reprompt_missing_reviews(
+    missing,
+    *,
+    finished,
+    reviews,
+    titles,
+    resolve,
+    sessions_root=None,
+    run=None,
+    resume=None,
+    out=None,
+) -> dict:
+    """Resume each recordless reviewer once so it can record. Returns outcomes.
+
+    `missing` is the pass's `missing_review_records` list; `finished`
+    the newest finished entry per ticket, `reviews` its latest record
+    map, `titles` its row titles, and `resolve(repo, number)` the
+    launch target (or None when the ticket has none). The remote tip
+    reads through `push.remote_head` over `run` (None reads the host),
+    the mark lives in the reviewer leaf under `sessions_root` (None
+    reads the host default), and `resume(repo, number, tgt, message)`
+    relaunches the reviewer session. With no `resume` seam nothing is
+    read or written: the skips stand, exactly as before.
+
+    Per ticket: resolve the mark, refuse through `needs_reprompt`
+    when marked, pin the tip, revalidate it before the resume (a
+    move spends no resume), write the mark, resume through the seam
+    (a refusal keeps the skip), then revalidate after (a move just
+    proceeds: the mark is spent and the next pass orders a fresh
+    review of the new tip). Every refusal fails closed to today's
+    skip, and the pass never crashes on one ticket's cause. One line
+    per attempted ticket goes to `out`. At most three remote reads
+    per missing ticket; zero tracker or forge calls.
+    """
+    outcomes = {}
+    if resume is None:
+        return outcomes
+    stream = out if out is not None else io.StringIO()
+    reprompted = set()
+    for repo, number, reviewer in missing or ():
+        key = (repo, number)
+        newest = (finished or {}).get(key)
+        tgt = resolve(repo, number)
+        mark, refusal = _reprompt_mark_for(
+            repo, number, reviewer, tgt=tgt, sessions_root=sessions_root
+        )
+        if refusal is not None:
+            outcome, reason = refusal
+            outcomes[key] = outcome
+            print(f"{repo}#{number}: review reprompt refused ({reason}), skipped", file=stream)
+            continue
+        if os.path.isfile(mark):
+            reprompted.add(key)
+        if not needs_reprompt("", newest, reviews, key, reprompted):
+            reprompted.add(key)
+            outcomes[key] = "refused: already reprompted"
+            print(
+                f"{repo}#{number}: review reprompt refused (already reprompted), skipped",
+                file=stream,
+            )
+            continue
+        planned = _reprompt_one(
+            repo,
+            number,
+            reviewer,
+            title=(titles or {}).get(key),
+            tgt=tgt,
+            mark=mark,
+            run=run,
+        )
+        if planned[0] != "ok":
+            outcome, reason = planned
+            outcomes[key] = outcome
+            print(f"{repo}#{number}: review reprompt refused ({reason}), skipped", file=stream)
+            continue
+        _ok, tip, branch, message, mark = planned
+        again = _remote_tip(tgt.clone, branch, run)
+        if not again or again != tip:
+            outcomes[key] = "refused: the branch moved"
+            print(
+                f"{repo}#{number}: review reprompt refused (the branch moved), skipped",
+                file=stream,
+            )
+            continue
+        if not _write_reprompt_mark(mark):
+            outcomes[key] = "refused: the reprompt mark is unwritable"
+            print(
+                f"{repo}#{number}: review reprompt refused "
+                "(the reprompt mark is unwritable), skipped",
+                file=stream,
+            )
+            continue
+        try:
+            resume(repo, number, tgt, message)
+        except Exception as err:
+            outcomes[key] = f"refused: resume refused ({err})"
+            print(
+                f"{repo}#{number}: review reprompt refused (resume refused ({err})), skipped",
+                file=stream,
+            )
+            continue
+        reprompted.add(key)
+        after = _remote_tip(tgt.clone, branch, run)
+        short = reviewrecord.commit_id(tip)
+        if after and after != tip:
+            outcomes[key] = "resumed-tip-moved"
+            print(
+                f"{repo}#{number}: resumed reviewer `{reviewer}` to record commit {short}, "
+                f"but the branch moved to {reviewrecord.commit_id(after)}: "
+                "a fresh review of the new tip follows on the next pass",
+                file=stream,
+            )
+            continue
+        outcomes[key] = "resumed"
+        print(
+            f"{repo}#{number}: resumed reviewer `{reviewer}` to record commit {short}",
+            file=stream,
+        )
+    return outcomes
 
 
 def missing_review_records(finished, reviews, rows, *, driven=None) -> list:
@@ -4718,6 +5011,82 @@ def _reviewer_prompt(root, tgt, number, title, author):
     return render_prompt
 
 
+def _reprompt_target(registered, driven, stuck_project):
+    """A `reprompt_missing_reviews` target resolver over registered projects.
+
+    The owner is the stuck sweep's project lookup when it names one,
+    else the first project driving the repo; the target resolves
+    through `_local_repo` and `launch.target`, so the clone, the
+    branch template and the unit prefix agree with a fresh launch.
+    Anything unresolvable reads as no target, and the skip stands.
+    """
+    by_name = {project.name: project for project in registered}
+
+    def resolve(repo, number):
+        owner = None
+        if stuck_project is not None:
+            try:
+                owner = stuck_project(repo, number)
+            except settings.SettingsError:
+                return None
+        if owner is None:
+            for name, repos in (driven or {}).items():
+                if repo in repos:
+                    owner = name
+                    break
+        entry = by_name.get(owner) if owner else None
+        if entry is None:
+            return None
+        try:
+            short = _local_repo(entry.root, repo)
+            return launch.target(entry.root, short)
+        except (launch.LaunchError, settings.SettingsError):
+            return None
+
+    return resolve
+
+
+def production_reprompt_resume(registered, *, store, hold_label, now):
+    """A `reprompt_missing_reviews` resume over the existing launch path.
+
+    Returns `resume_one(repo, number, tgt, message)`: the unit name of
+    the resumed reviewer. The resume goes through `launch.resume`
+    with role reviewer (read-only preserved, like every reviewer
+    resume), the store-backed hold check, and the production seams;
+    a held ticket or a missing session raises before anything is
+    made, and the caller keeps the skip. `tgt` is the already-resolved
+    launch target, so this never resolves settings twice.
+    """
+
+    def resume_one(repo, number, tgt, message):
+        project = projects.for_root(tgt.root, registered)
+        if project is None:
+            raise launch.LaunchError(f"{repo}#{number}: unknown project for ops root {tgt.root!r}")
+
+        def hold_reason_fn(resume_tgt, resume_number):
+            _ = (resume_tgt, resume_number)
+            return hold.reason(_store_labels(store, now), (repo, number), (), hold_label=hold_label)
+
+        def list_fn(prefix):
+            return units.list_units(prefix, run=units.default_run)
+
+        unit, _ = launch.resume(
+            tgt,
+            number,
+            message,
+            role="reviewer",
+            hold_reason_fn=hold_reason_fn,
+            list_fn=list_fn,
+            run=units.default_run,
+            usage=disk.production_usage,
+            host_ledger_fn=host_ledger.ensure,
+            git=worktrees.git,
+        )
+        return unit
+
+    return resume_one
+
+
 def production_launcher(registered, *, store=None, hold_label=None):
     """The launch handoff over the existing launch path.
 
@@ -4848,6 +5217,10 @@ def _launching_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    reprompt_resume=None,
+    reprompt_run=None,
+    reprompt_resolve=None,
+    reprompt_sessions_root=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -5182,6 +5555,22 @@ def _launching_pass(
         driven=driven,
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)
+    if reprompt_resume is not None:
+        reprompt_missing_reviews(
+            missing_review_records(finished, reviews, _released_rows(_items, freed), driven=driven),
+            finished=finished,
+            reviews=reviews,
+            titles={(item.repo, item.number): item.title for item in _items},
+            resolve=(
+                reprompt_resolve
+                if reprompt_resolve is not None
+                else _reprompt_target(registered, driven, stuck_project)
+            ),
+            sessions_root=reprompt_sessions_root,
+            run=reprompt_run,
+            resume=reprompt_resume,
+            out=out,
+        )
     if host is None:
         try:
             configured = settings.load(root=None)["drive.agent_host"]
@@ -5402,6 +5791,10 @@ def run_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    reprompt_resume=None,
+    reprompt_run=None,
+    reprompt_resolve=None,
+    reprompt_sessions_root=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -5469,7 +5862,16 @@ def run_pass(
     the unchecked starts. `quota_refresh_after_s`
     re-reads stale quota at the start of the non-plan pass, before the
     sync, only; `--plan` never takes it, so a dry run runs no reader.
-    `quota_load_reader` builds those readers. `now` defaults to the wall
+    `quota_load_reader` builds those readers. `reprompt_resume` is the
+    review-record resume seam (`(repo, number, tgt, message) -> unit`,
+    None resumes nothing: the `review-missing` skips stand, exactly as
+    before); with it the claiming pass resumes each recordless
+    reviewer once through `reprompt_missing_reviews`, while `--plan`
+    never resumes. `reprompt_run` is the git run seam behind the
+    remote tip reads, `reprompt_resolve` the launch-target resolver
+    (None resolves over the registered projects), and
+    `reprompt_sessions_root` the sessions root holding the resume
+    marks (None reads the host default). `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
@@ -5554,6 +5956,10 @@ def run_pass(
                 driven=driven,
                 quota_refresh_after_s=quota_refresh_after_s,
                 quota_load_reader=quota_load_reader,
+                reprompt_resume=reprompt_resume,
+                reprompt_run=reprompt_run,
+                reprompt_resolve=reprompt_resolve,
+                reprompt_sessions_root=reprompt_sessions_root,
                 **args,
             )
     except LockHeld as held:
