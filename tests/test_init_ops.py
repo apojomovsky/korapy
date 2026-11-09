@@ -725,6 +725,43 @@ class SecondCloneCase(OpsFixture):
         self.assertIn("'default'", err)
         self.assertNotIn("carries a different", err)
 
+    def test_second_runtime_without_profile_table_names_absence(self):
+        code, _, _ = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "make check",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.clone,
+        )
+        self.assertEqual(code, 0)
+        target = os.path.join(self.ops, "korapy.toml")
+        with open(target, encoding="utf-8") as handle:
+            text = handle.read()
+        edited = text.replace('[profile]\ndefault = "default"\n\n', "")
+        self.assertNotEqual(edited, text)
+        self.assertNotIn("[profile]", edited.split("[profiles.default]")[0])
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(edited)
+        code, _, err = self.run_cli(
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "npm test",
+            "--runtime",
+            "omp",
+            "--no-register",
+            self.other,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("has no [profile] table", err)
+        self.assertNotIn("None", err)
+        self.assertNotIn("carries a different", err)
+
 
 class ResolverErrorsCase(OpsFixture):
     """A broken ops `korapy.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""
