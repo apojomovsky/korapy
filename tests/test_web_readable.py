@@ -24,23 +24,7 @@ from tests.test_snapshot import (
     usage,
     view,
 )
-
-
-def web_text(name):
-    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
-
-
-def function_body(source, name):
-    """The text of `function name(...)` through its closing brace line."""
-    import re
-
-    match = re.search(
-        r"(?:export )?function " + re.escape(name) + r"\(.*?^\}",
-        source,
-        re.MULTILINE | re.DOTALL,
-    )
-    assert match is not None, "no function " + name
-    return match.group(0)
+from tests.test_web_dashboard_651 import function_body, web_text
 
 
 def build_doc():

@@ -299,6 +299,76 @@ class PlanBand(unittest.TestCase):
             },
         )
 
+    def test_missing_ticket_and_reason_read_unknown(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {},
+            "waits": [{"ticket": None, "reason": None}],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(
+            got["next"][0],
+            {
+                "what": "start",
+                "ticket": "unknown ticket",
+                "tickets": ["unknown ticket"],
+                "waits": "unknown reason",
+                "count": 1,
+            },
+        )
+        self.assertEqual(got["waits"], ["unknown reason"])
+
+    def test_empty_ticket_and_reason_read_unknown(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {},
+            "waits": [{"ticket": "", "reason": ""}],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"][0]["ticket"], "unknown ticket")
+        self.assertEqual(got["next"][0]["tickets"], ["unknown ticket"])
+        self.assertEqual(got["next"][0]["waits"], "unknown reason")
+
+    def test_prefix_only_reason_reads_unknown(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {"cap": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "app#7: ",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"][0]["ticket"], "app#7")
+        self.assertEqual(got["next"][0]["waits"], "unknown reason")
+
+    def test_reason_without_ticket_prefix_reads_verbatim(self):
+        drive = {
+            "last_pass_at": T0 - 100,
+            "starts_remaining": 2,
+            "skipped_by_reason": {"cap": 1},
+            "waits": [
+                {
+                    "ticket": "app#7",
+                    "code": "cap",
+                    "reason": "day cap reached, holding new starts",
+                },
+            ],
+        }
+        got = dashboard.plan_projection(drive, T0)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["next"][0]["ticket"], "app#7")
+        self.assertEqual(got["next"][0]["waits"], "day cap reached, holding new starts")
+
     def test_identical_waits_collapse_with_a_count(self):
         drive = {
             "last_pass_at": T0 - 100,
