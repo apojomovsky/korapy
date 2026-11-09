@@ -34,7 +34,7 @@ import sqlite3
 import sys
 import time
 import unicodedata
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from korapy import (
@@ -1712,11 +1712,13 @@ def _gate_all(
     """Eligibility plus the section 3 gate order over every candidate.
 
     Returns (gated_rows, problems, requested, pulls_calls,
-    pulls_limited): one `Gated` per candidate in section 3 order, one
+    pulls_limited, by_key): one `Gated` per candidate in section 3 order, one
     error line per project whose policy or quota settings failed, the
     set of (repo, number) any project requested this pass (which the
     stuck sweep reads for withdrawals), the GitHub calls the pulls
-    lookup spent, and whether it hit its cap. A project with no
+    lookup spent, whether it hit its cap, and the rows with their
+    linked pulls the gate read (which the auto-merge step reuses, so
+    it costs no second lookup). A project with no
     eligibility entry prints its logbook line to `out`. `released`
     ({(repo, number): reviewer id} freed this pass) simulates the
     post-release rows, so a plan over still-claimed rows gates what
@@ -1935,7 +1937,7 @@ def _gate_all(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
-    return gated_rows, problems, set(requested_keys), pulls_calls, pulls_limited
+    return gated_rows, problems, set(requested_keys), pulls_calls, pulls_limited, by_key
 
 
 def _pass(
@@ -2038,7 +2040,7 @@ def _pass(
         else None
     )
     released = reviewed_claims(authors, finished, live_units=plan_live)
-    gated_rows, problems, _, pulls_calls, pulls_limited = _gate_all(
+    gated_rows, problems, _, pulls_calls, pulls_limited, _ = _gate_all(
         items,
         registered,
         out,
@@ -4706,6 +4708,133 @@ def production_launcher(registered, *, store=None, hold_label=None):
     return launch_one
 
 
+@dataclass(frozen=True)
+class MergeCandidate:
+    """One auto-merge attempt: the ticket, the forge PR, and the approved pin.
+
+    `ticket_repo` is the review record's own spelling (the short name
+    the record was written under); `forge_repo` is the store's tracker
+    spelling. `pin` is the record's commit: the merge proves the PR
+    head still equals it, refusing a malformed pin as a usage error
+    instead of crashing the pass.
+    """
+
+    project: str
+    ticket_repo: str
+    number: int
+    forge_repo: str
+    pr_number: int
+    pin: str
+
+
+@dataclass(frozen=True)
+class MergeOutcome:
+    """One auto-merge attempt, as plain data.
+
+    The merge seam returns this instead of reaching into the merge
+    verb, so the drive never imports the forge: host read paths stay
+    forge-free. `merged` with `merge_sha` reports a landing;
+    `blocked` carries one `"name: detail"` entry per failing row of
+    an evaluated merge; `error` names why the attempt itself never
+    evaluated (a refused or unreachable forge, a usage error).
+    """
+
+    merged: bool
+    merge_sha: str | None
+    blocked: tuple = ()
+    error: str = ""
+
+
+def merge_candidate(by_key, projects_for, reviews) -> MergeCandidate | None:
+    """The single auto-merge candidate. Pure.
+
+    `by_key` maps `(repo, number)` to the pass's rows with their
+    linked pulls (the same map the gate read, so no second lookup);
+    `projects_for` maps each key to its owning project (rows no
+    project requested carry none and are skipped); `reviews` maps
+    each key to its latest review record. The first sorted key with
+    an open row, exactly one open linked pull, and an approving
+    record wins; anything else is None, so selecting a candidate
+    costs zero forge calls. The merge itself re-proves every
+    criterion through the serialized merge path, including that the
+    head still equals the pin.
+    """
+    for key in sorted(by_key):
+        project = projects_for.get(key, "")
+        if not project:
+            continue
+        row = by_key[key]
+        if row.state != "open":
+            continue
+        pulls = [pull for pull in row.pulls or () if pull.state == "open"]
+        if len(pulls) != 1:
+            continue
+        record = reviews.get(key)
+        if not isinstance(record, dict) or not reviewrecord.approves(record):
+            continue
+        pin = str(record.get("commit") or "").strip().lower()
+        if not pin:
+            continue
+        ticket_repo = str(record.get("repo") or "") or row.repo
+        return MergeCandidate(project, ticket_repo, row.number, row.repo, pulls[0].number, pin)
+    return None
+
+
+#: The auto-merge setting the pass resolves per project. A repeated
+#: fact: the registry owns it under `merge.AUTO_SETTING`, and the
+#: settings test asserts the two spellings agree, so a rename cannot
+#: silently desync them. The drive keeps its own spelling because
+#: importing the merge verb would pull the forge into the host read
+#: paths (see the serve closure test).
+MERGE_AUTO_SETTING = "merge.auto"
+
+
+def _auto_merge_projects(registered, merge_auto, err) -> dict:
+    """`{project name: auto-merge on}` for this pass.
+
+    A mapping is a per-project allowlist (missing names read as
+    false); a bool applies pass-wide; None resolves each project's
+    own `merge.auto` setting, failing closed to false on an
+    unreadable config, with one line naming the project.
+    """
+    if isinstance(merge_auto, Mapping):
+        return {project.name: bool(merge_auto.get(project.name, False)) for project in registered}
+    if isinstance(merge_auto, bool):
+        return {project.name: merge_auto for project in registered}
+    auto = {}
+    for project in registered:
+        try:
+            auto[project.name] = settings.load(root=project.root)[MERGE_AUTO_SETTING]
+        except settings.SettingsError as problem:
+            print(f"korapy drive: {problem}", file=err)
+            auto[project.name] = False
+    return auto
+
+
+def _attempt_auto_merge(merge_run, candidate, err) -> None:
+    """One serialized merge attempt for the candidate. Never raises.
+
+    `merge_run` is the injected merge seam: it takes the candidate
+    and returns a `MergeOutcome` (production runs the same
+    `merge.run_merge` path as `korapy merge`, per-repo lock, full
+    rows and post-merge verify included, translating its rows and
+    its merge and forge errors into the outcome). The step logs the
+    merge, every blocking row, or the reason the attempt never
+    evaluated, and never changes the pass exit code.
+    """
+    ref = f"{candidate.forge_repo}#{candidate.pr_number}"
+    ticket = f"{candidate.ticket_repo}#{candidate.number}"
+    outcome = merge_run(candidate)
+    if outcome.merged:
+        print(f"korapy drive: merged {ref} for {ticket} at {outcome.merge_sha}", file=err)
+        return
+    if outcome.error:
+        print(f"korapy drive: cannot merge {ref} for {ticket}: {outcome.error}", file=err)
+        return
+    blocking = "; ".join(outcome.blocked)
+    print(f"korapy drive: not merged {ref} for {ticket}: {blocking or 'no blocking row'}", file=err)
+
+
 def _launching_pass(
     store,
     out,
@@ -4749,8 +4878,10 @@ def _launching_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    merge_run=None,
+    merge_auto=None,
 ) -> int:
-    """One claiming pass: sync, release, gate, claim, launch, mirror, print.
+    """One claiming pass: sync, release, gate, claim, launch, merge, mirror, print.
 
     Reviewed-claim release and orphan recovery run on store, registry
     and unit state right after the sync, so freed rows gate as unclaimed
@@ -4813,7 +4944,21 @@ def _launching_pass(
     `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
     setting) caps the listing calls. A capped pass prints "pulls
     lookup limited" and refuses the unchecked starts; the summary line
-    counts the listing calls.
+    counts the listing calls. `merge_run` (None merges nothing) feeds
+    the auto-merge step: after the mirror drain, the pass attempts at
+    most one merge for the first candidate the gate's rows already
+    name (an open row with exactly one open linked pull and an
+    approving record), and logs the merge, every blocking row, or the
+    reason the attempt never evaluated, without changing the exit
+    code. The seam takes the candidate and returns a `MergeOutcome`;
+    it owns the serialized merge path and its errors, so the drive
+    never imports the forge and host read paths stay forge-free.
+    Candidate selection reads no forge data, so a pass with no
+    candidate costs zero GitHub calls. `merge_auto` (None resolves
+    each project's own `merge.auto` setting, failing closed on
+    unreadable config; a bool applies pass-wide; a mapping is a
+    per-project allowlist) is the kill switch: false keeps today's
+    report-ready behavior and merges nothing.
     """
     events: list[dict] = []
     released = 0
@@ -5054,7 +5199,7 @@ def _launching_pass(
         )
     else:
         reviews = None
-    gated_rows, problems, eligible_keys, pulls_calls, pulls_limited = _gate_all(
+    gated_rows, problems, eligible_keys, pulls_calls, pulls_limited, rows_by_key = _gate_all(
         _items,
         registered,
         out,
@@ -5216,6 +5361,15 @@ def _launching_pass(
             return finish(USAGE, started=started, skipped=skipped)
         for line in outcome.errors:
             print(f"korapy drive: {line}", file=err)
+    if merge_run is not None:
+        projects_for = {}
+        for gated in final_rows:
+            projects_for.setdefault((gated.repo, gated.number), gated.project)
+        candidate = merge_candidate(rows_by_key, projects_for, reviews or {})
+        if candidate is not None:
+            auto = _auto_merge_projects(registered, merge_auto, err)
+            if auto.get(candidate.project, False):
+                _attempt_auto_merge(merge_run, candidate, err)
     table = [
         Candidate(
             project=gated.project,
@@ -5297,8 +5451,10 @@ def run_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    merge_run=None,
+    merge_auto=None,
 ) -> int:
-    """One pass: gate and print, or sync, claim, launch, mirror and print.
+    """One pass: gate and print, or sync, claim, launch, merge, mirror and print.
 
     `--plan` holds no lock and writes nothing: no sync, orphan or
     finished release, hub contact, claim, mirror, launch, restart,
@@ -5364,7 +5520,14 @@ def run_pass(
     the unchecked starts. `quota_refresh_after_s`
     re-reads stale quota at the start of the non-plan pass, before the
     sync, only; `--plan` never takes it, so a dry run runs no reader.
-    `quota_load_reader` builds those readers. `now` defaults to the wall
+    `quota_load_reader` builds those readers. `merge_run` (None merges
+    nothing; it takes the candidate and returns a `MergeOutcome`,
+    owning the serialized merge path and its errors) and `merge_auto`
+    (None resolves each project's own `merge.auto` setting, a bool
+    applies pass-wide, a mapping is a per-project allowlist) feed the
+    auto-merge step of the non-plan pass, which attempts at most one
+    merge and logs the outcome; `--plan` never takes it, so a
+    dry run contacts no forge. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
@@ -5449,6 +5612,8 @@ def run_pass(
                 driven=driven,
                 quota_refresh_after_s=quota_refresh_after_s,
                 quota_load_reader=quota_load_reader,
+                merge_run=merge_run,
+                merge_auto=merge_auto,
                 **args,
             )
     except LockHeld as held:

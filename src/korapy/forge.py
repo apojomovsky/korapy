@@ -64,6 +64,28 @@ class PullRequest(NamedTuple):
     # explicitly; the adapter leaves the default and reports the live
     # count through `pending_checks` instead.
     checks_pending: int = 0
+    # The PR body text, for the objectives check. The adapter fills it
+    # from the same single-PR read (never a second call); a missing or
+    # null body reads as empty and the objectives row fails closed.
+    # Fakes set it explicitly.
+    body: str = ""
+
+
+class ReviewThreads(NamedTuple):
+    """One PR's review threads and review decision, as plain data.
+
+    `unresolved` counts threads whose resolved state reads false;
+    `unknown` counts threads whose state could not be read, plus one
+    when the listing was truncated past the first page (the remainder
+    is unproven). `change_requested` is True when the forge reports an
+    unanswered change request, False when it reports none, and None
+    when the decision itself is unreadable. The merge gate fails
+    closed on any nonzero `unknown` and on a None decision.
+    """
+
+    unresolved: int
+    unknown: int
+    change_requested: bool | None
 
 
 class Forge(Protocol):
@@ -125,6 +147,31 @@ class Forge(Protocol):
         ``ForgeError`` when the forge is unreachable or answers
         something unusable. A separate, optional read: it only
         decorates a pending checks row and never changes the verdict."""
+        ...
+
+    def review_threads(self, repo: str, number: int) -> ReviewThreads:
+        """One PR's review threads and review decision, as plain data.
+
+        One read, taken only when a merge is evaluated: the drive
+        never pays it per pass or per ticket, only inside a merge
+        attempt. Raises ``ForgeError`` when the forge is unreachable,
+        the PR is missing, or the answer is unusable; unreadable
+        thread states and a truncated listing count as ``unknown``
+        (never as resolved), and an unreadable decision reads as
+        None, so the caller fails closed. Only the adapters know
+        provider shapes; everything else takes this object.
+        """
+        ...
+
+    def changed_files(self, repo: str, number: int) -> tuple[str, ...]:
+        """The paths one PR touches, oldest first, as plain data.
+
+        One paged listing, taken only when a merge is evaluated, for
+        the tests-in-place row. Raises ``ForgeError`` when the forge
+        is unreachable, the PR is missing, or the answer is unusable;
+        an empty answer reads as no files (never as tested), so the
+        caller fails closed. Only the adapters know provider shapes.
+        """
         ...
 
     def pr_index(self, repo: str) -> dict[str, str]:

@@ -264,7 +264,7 @@ class ClaimScopeTest(OwnReposCase):
         )
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(
-            drive, "_gate_all", return_value=([gated], [], [(WEB, 9)], 0, False)
+            drive, "_gate_all", return_value=([gated], [], [(WEB, 9)], 0, False, {})
         ):
             code = self.run_pass(
                 store,

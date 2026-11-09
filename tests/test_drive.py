@@ -525,7 +525,7 @@ class PullsLookupPassTest(unittest.TestCase):
                 side_effect=settings.SettingsError("bad pulls budget"),
             ),
         ):
-            gated, problems, _, pulls_calls, pulls_limited = drive._gate_all(
+            gated, problems, _, pulls_calls, pulls_limited, _ = drive._gate_all(
                 items,
                 [project],
                 out,
@@ -646,7 +646,7 @@ class BrokenPolicyIsolationTest(unittest.TestCase):
         none = project_named("none")
         fake = FakeTracker()
         out = io.StringIO()
-        gated, problems, _requested, pulls_calls, pulls_limited = drive._gate_all(
+        gated, problems, _requested, pulls_calls, pulls_limited, _ = drive._gate_all(
             store.items(),
             [good, bad, none],
             out,
@@ -716,7 +716,7 @@ class PolicyLoadOnceTest(unittest.TestCase):
         project = project_named("blue", policy_path + ":eligible")
         fake = FakeTracker()
         out = io.StringIO()
-        gated, problems, _requested, _calls, _limited = drive._gate_all(
+        gated, problems, _requested, _calls, _limited, _ = drive._gate_all(
             store.items(),
             [project],
             out,
@@ -747,7 +747,7 @@ class NoEntrySkipLineTest(unittest.TestCase):
 
         project = project_named("blue")
         out = io.StringIO()
-        gated, problems, _requested, _calls, _limited = drive._gate_all(
+        gated, problems, _requested, _calls, _limited, _ = drive._gate_all(
             [],
             [project],
             out,

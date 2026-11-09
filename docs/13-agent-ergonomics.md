@@ -249,7 +249,7 @@ No new verb, no report sidecar file: a second artifact beside the
 record would split the one fact (the review's verdict) into two
 places that can disagree.
 
-### 5.4 `korapy merge` (PROPOSED)
+### 5.4 `korapy merge` (exists)
 
 Purpose: merge one pull request after proving it is mergeable,
 serially, with every precondition reported as data. The forge-side
@@ -260,16 +260,25 @@ Arguments: `REPO PR --head SHA [--method squash|merge] [--skip CHECK]
 `PR` the pull request number. `--head` is required: the exact head
 SHA the caller approved. `--method` is `squash` or `merge` and
 defaults to the `merge.method` project setting (`squash`); anything
-else is exit 4. `--skip` names only `checks`, with the same
+else is exit 4. Past the identity rows the gate also proves
+readiness: no unresolved review thread and no unanswered change
+request (one threads read), a body linking the ticket with the
+review findings settled, and a diff touching a test file,
+touching only documentation, or carrying the `no-tests` label.
+`--skip` names only `checks`, with the same
 recording rule as the gate (section 6); the default is no skips.
-Naming `lock`, `open`, `head`, `review` or `fork` is exit 4:
+Naming `lock`, `open`, `head`, `review`, `comments`,
+`objectives`, `tests` or `fork` is exit 4:
 those checks establish what is being merged, and skipping
 identity is not a policy choice (mirroring takeoff, section
 5.5). `--wait` polls the forge while the `checks` row is pending
 until it leaves pending, any row fails, or `--timeout` (default
 ten minutes) lands; a `--timeout` without `--wait` is exit 4.
 The wait never holds the per-repo lock: a real merge re-reads
-under the lock after the wait settles.
+under the lock after the wait settles. Polls evaluate the
+pre-readiness rows only, so a long wait costs no threads or files
+read per poll; the returned evaluation is always a fresh full
+read.
 
 JSON shape (`--json`): the precondition verdict plus the outcome:
 
@@ -279,6 +288,9 @@ JSON shape (`--json`): the precondition verdict plus the outcome:
  "checks": [{"name": "open", "status": "ok", "detail": "PR is open"},
    {"name": "head", "status": "ok", "detail": "head is abc123"},
    {"name": "review", "status": "ok", "detail": "approved by agent-9"},
+   {"name": "comments", "status": "ok", "detail": "no unresolved threads"},
+   {"name": "objectives", "status": "ok", "detail": "body links #12"},
+   {"name": "tests", "status": "ok", "detail": "touches a test file"},
    {"name": "checks", "status": "ok", "detail": "5 green"}],
  "skipped": [], "merged": true, "merge_sha": "789abc..."}
 ```
@@ -293,13 +305,17 @@ held by another merger, 3 the forge is unreachable, 4 usage or
 configuration error. Exit 2 reuses the public race meaning, so
 retry loops treat it like the drive lock.
 
-State read: one fresh forge PR read (state, head SHA, check
-statuses, fork flag), the head-pinned check-runs read for the
-pending count (section 8), the review record via
+State read: one fresh forge PR read (state, head SHA, body,
+check statuses, fork flag), the head-pinned check-runs read for
+the pending count (section 8), one review-threads read and one
+changed-files listing (section 8, only for a full evaluation),
+the review record via
 `mergeup.find_record` (the same reader takeoff uses, so both
 gates agree), and the per-repo merge lock. No local worktree
 state: the merge runs forge-side, so a coordinator needs no
-clone.
+clone. An unreadable threads or files read fails its row with
+the reason named instead of raising, so `--plan` reports it
+beside every other row.
 
 Read-only twin: `--plan`. It reports every precondition row and
 the lock state (`free` or `held`) without taking the lock and
@@ -380,6 +396,22 @@ or a gate said no, 2 another pass holds the lock (retry later), 3
 unreachable, 4 usage or configuration, 75 no free slot (retry
 later). Section 10 shows the loop: 2 and 75 sleep and retry, 0
 and 1 stop, anything else aborts loudly.
+
+Agentic merge: after the mirror drain, the pass attempts at most
+one merge for the first candidate its rows already name (an open
+row with exactly one open linked pull and an approving record),
+through an injected merge seam that runs the same serialized
+`merge.run_merge` path as `korapy merge` (section 5.4), and logs
+the merge, every blocking row, or the reason the attempt never
+evaluated. The seam takes the candidate and returns a plain
+outcome; it owns the merge verb and its errors, so the drive
+never imports the forge and host read paths stay forge-free
+(section 8). Candidate selection reads no forge data, so a pass
+with no candidate costs zero GitHub calls; the attempt itself
+costs the merge path's reads. `merge.auto` (default true) is the
+kill switch: false keeps today's report-ready behavior and
+merges nothing. A merge never changes the pass exit code.
+`--plan` never attempts a merge and contacts no forge.
 
 ## 6. The gate: config, skips, reporting
 
@@ -462,7 +494,21 @@ PRs to the same repo never merge concurrently.
    inherited across a clean merge-up. A block or a missing record
    refuses. This is the same reader takeoff uses, so the merge
    gate and the takeoff gate cannot disagree.
-5. `checks`: the forge's check statuses on the head (the verdict
+5. `comments`: no unresolved review thread and no unanswered
+   change request, from the one review-threads read (section 8).
+   Any unknown thread state, an unreadable decision, or an
+   unreadable read fails closed with the reason named.
+6. `objectives`: the PR body links the ticket (`Closes #N` when
+   its acceptance is met, `Refs #N` for a partial win; either
+   keyword links, the same link takeoff accepts) and the
+   approving record carries no finding still wanting a fix round
+   (graded against the shared fix-round default, so an ungradable
+   finding fails closed).
+7. `tests`: the diff touches a test file (the same test path
+   the prose gate uses), touches only Markdown documentation, or
+   carries the `no-tests` label. An empty or unreadable listing
+   fails closed with the reason named.
+8. `checks`: the forge's check statuses on the head (the verdict
    from the fresh `pull_request()`, per section 8). Three states:
    `ok` when green, `pending` while still running (a wait, not a
    failure: the detail says to wait and carries no fix advice), and
@@ -475,7 +521,7 @@ PRs to the same repo never merge concurrently.
    waits out a refusal. The row reports the one checks
    precondition, not a count of provider checks; a separate count
    read only decorates the pending detail (section 8).
-6. `fork`: the PR is not from a fork. Fork merges refuse with
+9. `fork`: the PR is not from a fork. Fork merges refuse with
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
 
@@ -498,10 +544,13 @@ naming `merge.method`, and the row appears in no other case.
 ### 7.3 How it refuses, and what it never does
 
 Refusals are exit 1 with the failing row named; the document
-reports every row so the caller knows how far the PR got. The
+reports every row so the caller knows how far the PR got, and
+`--plan` shows them all, never stopping at the first. The
 verb never:
 
 - merges without `--head` (an unpinned merge is a usage error);
+- merges with any criterion unknown or unread (a failed or
+  unreadable read blocks the merge with the reason named);
 - merges a closed, merged, or fork PR;
 - force-pushes, deletes a branch, or rewrites history (no
   `--force` flag exists and none is added);
@@ -514,14 +563,18 @@ verb never:
 
 ## 8. The forge seam for merge
 
-The merge verdict comes from two reads. The first is the fresh
-PR fetch, which carries state, head SHA, the checks verdict, the
-fork flag and the merge SHA, so the gate reads those
-consistently. The second is the head-pinned check-runs fetch,
-which carries only the running count. The head can move between
-the two reads, so the count can describe a different head than
-the verdict: that is why the count only decorates a pending row
-and never changes a verdict.
+The merge verdict comes from four reads. The first is the fresh
+PR fetch, which carries state, head SHA, body, the checks
+verdict, the fork flag and the merge SHA, so the gate reads
+those consistently. The second is the head-pinned check-runs
+fetch, which carries only the running count. The head can move
+between the two reads, so the count can describe a different
+head than the verdict: that is why the count only decorates a
+pending row and never changes a verdict. The third is the one
+review-threads read (resolved state is GraphQL-only); the
+fourth is the changed-files listing. Both run only for a full
+evaluation, never once per wait poll, and only when a merge is
+evaluated, so the drive pays no per-pass cost for them.
 
 `PullRequest` carries the verdict from the PR fetch:
 
@@ -532,7 +585,9 @@ and never changes a verdict.
   default and the verb reads the live count separately (below);
 - `merge_sha: str | None`: the merge commit SHA once the PR
   state is `merged`, else None. The verify step ties this SHA to
-  the pinned head.
+  the pinned head;
+- `body: str`: the PR body text, for the objectives row. A
+  missing or null body reads as empty and the row fails closed.
 
 The running count is a separate, optional read that can only
 decorate a pending row, never change a verdict:
@@ -551,6 +606,23 @@ decorate a pending row, never change a verdict:
   count (the head moved between the two reads) still only
   decorates the pending detail, so it can neither settle a wait
   nor fail a gate.
+
+The readiness rows come from two more reads, both taken only
+when a merge is evaluated:
+
+- `review_threads(repo, number) -> ReviewThreads`: the PR's
+  review threads and review decision as plain data
+  (`unresolved`, `unknown`, `change_requested`, where an
+  unreadable decision reads as None). One GraphQL query
+  fetches unresolved states beside the decision; the REST
+  budget cannot answer resolved state. Unreadable thread
+  states and a truncated page count as `unknown`, never as
+  resolved, so the comments row fails closed.
+- `changed_files(repo, number) -> tuple[str, ...]`: the paths
+  the PR touches, oldest first, from the paged files listing.
+  A missing or malformed page is a `ForgeError`, never a
+  partial listing, and an empty answer reads as no files, so
+  the tests row fails closed.
 
 Only the adapters know the provider shape; everything else takes
 the `Forge` object.
@@ -584,7 +656,7 @@ recorded verdict.
 | `wait` | Core (exists) | Every coordinator waits; one reader, no policy. |
 | `events` list and follow | Core (PROPOSED) | Views over open state; no policy in a listing. |
 | Review-report reader | Core already (`review show --json`) | The verdict is a core fact; the prose stays in sessions. |
-| `merge` | Core (PROPOSED) | Every project merges the same way; policy stays in preconditions and skips. |
+| `merge` | Core (exists) | Every project merges the same way; policy stays in preconditions and skips. |
 | Gate runner | Core (`takeoff`, plus PROPOSED `--skip` and `--plan`) | Core runs the list and reports; the list contents are project config. |
 | Privacy checks, model policy, review wording | Project | Policy, not mechanism; lives in `checks.takeoff` commands and prompts. |
 | Retry timing and backoff | Project | Exit codes are the contract; sleep intervals are caller policy. |

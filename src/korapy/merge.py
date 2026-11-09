@@ -8,8 +8,13 @@ Checks, in gate order: `lock` (the per-repo lock is free), `open`
 (the forge reports the PR open), `head` (the forge head equals the
 pinned `--head`), `review` (the same `mergeup.find_record` reader
 takeoff uses, so both gates agree, including inheritance across a
-clean merge-up), `checks` (the forge check statuses are green; the
-only waivable row: `pending` while they are still running, with
+clean merge-up), `comments` (no unresolved review thread and no
+unanswered change request, from one threads read), `objectives`
+(the PR body links the ticket and the approving record's findings
+are settled: no fix round wanted), `tests` (the diff touches a test
+file, touches only documentation, or carries the `no-tests`
+label), `checks` (the forge check statuses are green; the only
+waivable row: `pending` while they are still running, with
 the running count, a wait message and no fix advice), `fork` (the
 PR is not from a fork;
 a maintainer merges those by hand).
@@ -40,7 +45,8 @@ import time
 from collections.abc import Callable
 from typing import NamedTuple
 
-from korapy import forge as iface, mergeup, paths, reviewrecord, settings
+from korapy import forge as iface, mergeup, paths, prose, reviewrecord, settings
+from korapy.github import gh
 
 #: The version stamped on every `--json` document.
 SCHEMA_VERSION = 1
@@ -76,6 +82,19 @@ settings.register(
     check=_check_method,
 )
 
+#: The setting naming whether the drive pass merges a ready PR.
+#: One fact, one place: the drive's merge step is the only reader of
+#: the resolved value.
+AUTO_SETTING = "merge.auto"
+
+settings.register(
+    AUTO_SETTING,
+    bool,
+    True,
+    "the drive pass merges a pull request that meets every readiness criterion; "
+    "false only reports readiness, never merges",
+)
+
 
 def resolve_method(*, flag=None, resolved=None):
     """The effective merge method: the one place that decides it.
@@ -96,13 +115,28 @@ def resolve_method(*, flag=None, resolved=None):
 
 
 #: The precondition rows, in gate order.
-CHECK_NAMES = ("lock", "open", "head", "review", "checks", "fork")
+CHECK_NAMES = (
+    "lock",
+    "open",
+    "head",
+    "review",
+    "comments",
+    "objectives",
+    "tests",
+    "checks",
+    "fork",
+)
 
 #: The only check `--skip` may waive.
 SKIPPABLE = ("checks",)
 
 #: The identity checks no flag may waive: they establish what is merged.
 IDENTITY = ("lock", "open", "head", "review", "fork")
+
+#: The PR label waiving the tests row. A constant, not a setting: one
+#: fact, one place, and the drive's eligibility never consults it (the
+#: merge row reads the PR's own labels).
+TESTS_WAIVER_LABEL = "no-tests"
 
 #: Row statuses: a precondition holds, is not yet met, refuses, or
 #: was waived by name. `pending` is a wait, not a failure: the detail
@@ -294,14 +328,18 @@ def _lock_free(path: str) -> bool:
     return not held
 
 
-def _check_review(ticket_repo: str, ticket_number: int, head: str, base: str, cwd: str) -> Check:
-    """The head carries an approving review record (takeoff's lookup)."""
-    record, found = mergeup.find_record(
+def _review_lookup(ticket_repo: str, ticket_number: int, head: str, base: str, cwd: str):
+    """`(record, found)` for the head, through the takeoff-shared lookup."""
+    return mergeup.find_record(
         lambda commit: reviewrecord.read_record(ticket_repo, ticket_number, commit),
         head,
         base,
         cwd,
     )
+
+
+def _check_review(ticket_repo: str, ticket_number: int, record, found, head: str) -> Check:
+    """The head carries an approving review record (takeoff's lookup)."""
     short = reviewrecord.commit_id(head)
     if record is None:
         return Check(
@@ -327,6 +365,125 @@ def _check_review(ticket_repo: str, ticket_number: int, head: str, base: str, cw
     return Check("review", OK_S, f"approved by {reviewer}")
 
 
+def _check_comments(threads, error: str) -> Check:
+    """No unresolved review thread and no unanswered change request.
+
+    Pure over the one threads read. `None` (an unreadable read, with
+    its reason) and any unknown state fail closed: no path merges
+    with a criterion unread.
+    """
+    if threads is None:
+        return Check(
+            "comments", FAIL, f"the review threads are unreadable: {error or 'unknown error'}"
+        )
+    if threads.unknown:
+        return Check(
+            "comments",
+            FAIL,
+            f"{threads.unknown} review thread(s) have an unreadable state: "
+            "resolve them on the PR and re-read",
+        )
+    if threads.unresolved:
+        return Check(
+            "comments",
+            FAIL,
+            f"{threads.unresolved} unresolved review thread(s): resolve them on the PR",
+        )
+    if threads.change_requested is None:
+        return Check(
+            "comments",
+            FAIL,
+            "the review decision is unreadable: re-read the PR",
+        )
+    if threads.change_requested:
+        return Check(
+            "comments",
+            FAIL,
+            "an unanswered change request stands: answer it with a new commit",
+        )
+    return Check("comments", OK_S, "no unresolved threads and no unanswered change request")
+
+
+def _check_objectives(body, ticket_number: int, record) -> Check:
+    """The body links the ticket and the record's findings are settled.
+
+    Pure over the PR body and the approving review record. A missing
+    or blocking record fails; so does any finding still wanting a fix
+    round (graded against the shared fix-round default, so ungradable
+    findings fail closed), and a body that never links the ticket.
+    Either keyword links: `Closes #N` (acceptance met) or `Refs #N`
+    (a partial win), the same link takeoff accepts.
+    """
+    if record is None:
+        return Check(
+            "objectives",
+            FAIL,
+            "no approving review record: objectives need an approve or "
+            "approve-with-findings record with every finding filed or fixed",
+        )
+    if not reviewrecord.approves(record):
+        return Check(
+            "objectives",
+            FAIL,
+            "the review record is a block: objectives need an approve or "
+            "approve-with-findings record with every finding filed or fixed",
+        )
+    if reviewrecord.fix_wanted(record):
+        return Check(
+            "objectives",
+            FAIL,
+            f"the {record.get('verdict')} record still wants a fix round: "
+            "answer its findings with a new commit and a fresh review",
+        )
+    if ticket_number not in gh.body_linked_issue_numbers(body or ""):
+        return Check(
+            "objectives",
+            FAIL,
+            f"the PR body does not link #{ticket_number}: start it with "
+            f"`Closes #{ticket_number}` (or `Refs #{ticket_number}` for a partial win)",
+        )
+    return Check(
+        "objectives",
+        OK_S,
+        f"the body links #{ticket_number} and the {record.get('verdict')} "
+        "record's findings are settled",
+    )
+
+
+def _is_docs_path(path) -> bool:
+    """Whether a changed path is documentation: a Markdown file."""
+    return str(path or "").lower().endswith(".md")
+
+
+def _check_tests(files, error: str, labels) -> Check:
+    """The diff touches a test file, is docs-only, or is waived.
+
+    Pure over the changed paths and the PR labels. `None` (an
+    unreadable listing, with its reason) and an empty listing fail
+    closed: no path merges with an unproven diff.
+    """
+    if files is None:
+        return Check("tests", FAIL, f"the changed files are unreadable: {error or 'unknown error'}")
+    if not files:
+        return Check(
+            "tests",
+            FAIL,
+            "the forge lists no changed files: cannot prove a test was touched",
+        )
+    if any(prose.is_test_path(path) for path in files):
+        return Check("tests", OK_S, "the diff touches a test file")
+    if all(_is_docs_path(path) for path in files):
+        return Check("tests", OK_S, "the diff touches only documentation")
+    if TESTS_WAIVER_LABEL in (labels or ()):
+        return Check("tests", OK_S, f"waived by the {TESTS_WAIVER_LABEL!r} label")
+    return Check(
+        "tests",
+        FAIL,
+        "the diff touches no test file: add a test, restrict the diff to "
+        f"documentation, or label the PR {TESTS_WAIVER_LABEL!r}",
+    )
+
+
 def _evaluate(
     ticket_repo: str,
     ticket_number: int,
@@ -336,12 +493,24 @@ def _evaluate(
     cwd: str,
     lock_detail: str,
     pending: int | None = None,
+    *,
+    threads=None,
+    threads_error: str = "",
+    files=None,
+    files_error: str = "",
+    full: bool = True,
 ) -> list[Check]:
     """Every precondition row for a fresh PR read, in gate order.
 
     `pending` decorates a pending checks row only: the running count
     from the separate `pending_checks` read, or `None` when that read
-    failed or never ran. It never changes the verdict.
+    failed or never ran. It never changes the verdict. `threads` and
+    `files` carry the one threads read and the one files listing (or
+    `None` each with its reason when that read failed); with
+    `full=False` the three readiness rows are omitted instead, for
+    the wait loop's polls, and the final evaluation always reads
+    them. `--plan` always evaluates full, so it shows every row and
+    never stops at the first.
     """
     checks = [Check("lock", OK_S, lock_detail)]
     if pr.state == iface.OPEN:
@@ -359,7 +528,12 @@ def _evaluate(
                 f"commit {reviewrecord.commit_id(head)} is no longer the tip",
             )
         )
-    checks.append(_check_review(ticket_repo, ticket_number, head, pr.base_sha, cwd))
+    record, found = _review_lookup(ticket_repo, ticket_number, head, pr.base_sha, cwd)
+    checks.append(_check_review(ticket_repo, ticket_number, record, found, head))
+    if full:
+        checks.append(_check_comments(threads, threads_error))
+        checks.append(_check_objectives(pr.body, ticket_number, record))
+        checks.append(_check_tests(files, files_error, pr.labels))
     if "checks" in skip_set:
         checks.append(Check("checks", SKIPPED, "skipped by --skip checks"))
     elif pr.checks_state == "passing":
@@ -460,19 +634,52 @@ def _read_and_evaluate(
     skip_set: frozenset[str],
     cwd: str,
     lock_detail: str,
+    *,
+    full: bool = True,
 ) -> list[Check]:
     """One PR read plus its rows, fetching the pending count only then.
 
     The count read runs only when the verdict is pending; passing,
     failing, and skipped rows never trigger it, and other verbs that
-    read the PR never pay for it.
+    read the PR never pay for it. The threads and files reads run
+    only for a full evaluation: one of each per merge attempt at
+    most, never one per wait poll. An unreadable threads or files
+    read becomes a failing row naming the reason, never a raised
+    error, so `--plan` reports it beside every other row.
     """
     pr = forge.pull_request(repo, number)
     if pr.checks_state == "pending" and "checks" not in skip_set:
         pending = _pending_count(forge, repo, pr.head_sha)
     else:
         pending = None
-    return _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail, pending)
+    threads = None
+    threads_error = ""
+    files = None
+    files_error = ""
+    if full:
+        try:
+            threads = forge.review_threads(repo, number)
+        except iface.ForgeError as err:
+            threads_error = str(err)
+        try:
+            files = forge.changed_files(repo, number)
+        except iface.ForgeError as err:
+            files_error = str(err)
+    return _evaluate(
+        ticket_repo,
+        ticket_number,
+        pr,
+        head,
+        skip_set,
+        cwd,
+        lock_detail,
+        pending,
+        threads=threads,
+        threads_error=threads_error,
+        files=files,
+        files_error=files_error,
+        full=full,
+    )
 
 
 def _poll_until_settled(
@@ -500,6 +707,10 @@ def _poll_until_settled(
     pending evaluation. PR-read outages raise through the seam, never
     swallowed into a verdict; a failed pending-count read degrades to
     the count-less pending message.
+
+    Polls evaluate the pre-readiness rows only, so a long wait costs
+    no threads or files read per poll; the one returned evaluation is
+    always a fresh full read, so its readiness rows are current.
     """
     start = clock()
     while True:
@@ -508,13 +719,25 @@ def _poll_until_settled(
         else:
             lock_detail = held_detail
         checks = _read_and_evaluate(
-            forge, ticket_repo, ticket_number, repo, number, head, skip_set, cwd, lock_detail
+            forge,
+            ticket_repo,
+            ticket_number,
+            repo,
+            number,
+            head,
+            skip_set,
+            cwd,
+            lock_detail,
+            full=False,
         )
         if _status(checks, "checks") != PENDING or _failed(checks):
-            return checks
+            break
         if clock() - start >= timeout:
-            return checks
+            break
         sleep(poll_s)
+    return _read_and_evaluate(
+        forge, ticket_repo, ticket_number, repo, number, head, skip_set, cwd, lock_detail
+    )
 
 
 def run_merge(

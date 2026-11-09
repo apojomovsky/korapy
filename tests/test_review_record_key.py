@@ -448,7 +448,16 @@ class MergeCliKeyTest(unittest.TestCase):
         }
         base.update(overrides)
         fake = FakeForge(
-            pulls=[make_pr(repo=TRACKER, number=7, base_sha=self.base, head_sha=self.head)]
+            pulls=[
+                make_pr(
+                    repo=TRACKER,
+                    number=7,
+                    base_sha=self.base,
+                    head_sha=self.head,
+                    body="Closes #1",
+                )
+            ],
+            files={(TRACKER, 7): ("tests/test_review_record_key.py",)},
         )
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -706,7 +715,16 @@ class MergeMethodKeyTest(unittest.TestCase):
 
     def test_the_tracker_spelling_honors_the_entry_merge_method(self):
         fake = FakeForge(
-            pulls=[make_pr(repo=TRACKER, number=7, base_sha=self.base, head_sha=self.head)]
+            pulls=[
+                make_pr(
+                    repo=TRACKER,
+                    number=7,
+                    base_sha=self.base,
+                    head_sha=self.head,
+                    body="Closes #1",
+                )
+            ],
+            files={(TRACKER, 7): ("tests/test_review_record_key.py",)},
         )
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):

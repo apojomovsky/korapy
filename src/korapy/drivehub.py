@@ -16,8 +16,12 @@ import sys
 import time
 
 from korapy import accounts, board, drive
+from korapy import forge as forgeiface
 from korapy import hub as hubmod
+from korapy import merge
 from korapy import paths, projects, quota, settings, syncli, trackers, units
+from korapy.github import forge as ghforge
+from korapy.github.gh import paced_run
 
 
 class HubMode:
@@ -242,6 +246,35 @@ def hub_mode_for(resolved: settings.Resolved, *, token_path):
     return HubMode(client, str(resolved["hub.host_id"] or "").strip())
 
 
+def merge_candidate_run(candidate, forge) -> drive.MergeOutcome:
+    """One auto-merge attempt through the serialized merge path.
+
+    The drive owns the candidate and the outcome; this adapter owns
+    the merge verb and its errors, so the drive never imports the
+    forge. A landing becomes a merged outcome, a refused evaluation
+    becomes its blocking rows, and a refused or unreachable forge (or
+    a usage error) becomes the error: the pass logs each and never
+    fails on any of them.
+    """
+    try:
+        result = merge.run_merge(
+            candidate.ticket_repo,
+            candidate.number,
+            candidate.forge_repo,
+            candidate.pr_number,
+            head_sha=candidate.pin,
+            forge=forge,
+        )
+    except (merge.MergeError, forgeiface.ForgeError) as problem:
+        return drive.MergeOutcome(merged=False, merge_sha=None, error=str(problem))
+    if result.merged:
+        return drive.MergeOutcome(merged=True, merge_sha=result.merge_sha)
+    blocked = tuple(
+        f"{check.name}: {check.detail}" for check in result.checks if check.status != "ok"
+    )
+    return drive.MergeOutcome(merged=False, merge_sha=None, blocked=blocked)
+
+
 def cmd_drive(args: argparse.Namespace) -> int:
     """Run one dispatch pass over the board store (the `drive` verb)."""
     if getattr(args, "drive_verb", None) == "install-timer":
@@ -407,6 +440,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             quota_pool,
             override=quota_refresh_override,
         )
+        forge = ghforge.GithubForge(paced_run)
         return drive.run_pass(
             plan=False,
             store=store,
@@ -439,6 +473,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             driven=driven,
             pool=quota_pool,
             quota_refresh_after_s=quota_refresh_after_s,
+            merge_run=lambda candidate: merge_candidate_run(candidate, forge),
         )
 
 
