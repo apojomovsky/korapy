@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import time
+from typing import Any
 
 from korapy import board, paths, settings, sync
 from korapy import tracker as iface
@@ -71,8 +72,35 @@ def _operators(configured, tracker_repo):
     return kept or [tracker_repo.split("/")[0]]
 
 
-def _tracker_repo(root, name, resolved, git):
-    """`(owner/name, None)` for one repo entry, or `(None, problem)`."""
+#: Sentinel for `tracker_repo`'s `origin`: absent means the helper
+#: runs `get-url` itself; a present value (even an empty one) is the
+#: caller's already-read origin, parsed without a second spawn.
+_UNSET: Any = object()
+
+
+def _parse_origin(origin, *, name, path):
+    """`(owner/name, None)` for an already-read origin URL, or `(None, problem)`."""
+    url = origin if isinstance(origin, str) else ""
+    repo = ghforge.repo_from_remote_url(url)
+    if repo is None:
+        return None, f"[[repo]] {name}: no owner/name in the origin remote of {path}"
+    return repo, None
+
+
+def tracker_repo(root, name, resolved, git, *, origin=_UNSET):
+    """`(owner/name, None)` for one repo entry, or `(None, problem)`.
+
+    The one resolver for which tracker repo a `[[repo]]` entry feeds:
+    sync, mirror, the dispatch pass, launch and both doctors build
+    from here, so the five agree on one spelling. Explicit
+    `tracker.repo` is validated with `ghforge.is_repo_name` and never
+    spawns git; otherwise `clone.path` (absent: a problem naming the
+    entry) resolves against the root and the origin reads through
+    `ghforge.origin_repo` (unparsable: a problem naming the path).
+    Callers that already ran `get-url` pass the read URL as `origin`
+    (one spawn per repo, no window where two reads disagree); both
+    spellings share the parse-and-validate core above.
+    """
     explicit = resolved["tracker.repo"]
     if explicit:
         if not ghforge.is_repo_name(explicit):
@@ -82,6 +110,8 @@ def _tracker_repo(root, name, resolved, git):
     if not clone:
         return None, f"[[repo]] {name} sets neither tracker.repo nor clone.path"
     path = clone if os.path.isabs(clone) else os.path.join(root, clone)
+    if origin is not _UNSET:
+        return _parse_origin(origin, name=name, path=path)
     repo = ghforge.origin_repo(path, git)
     if repo is None:
         return None, f"[[repo]] {name}: no owner/name in the origin remote of {path}"
@@ -121,12 +151,12 @@ def repo_operators(root, names, git, *, project=None, host=None, env=None):
                 )
         except settings.SettingsError as problem:
             return None, str(problem)
-        tracker_repo, problem = _tracker_repo(root, name, resolved, git)
+        repo, problem = tracker_repo(root, name, resolved, git)
         if problem is not None:
             return None, problem
         entries[name] = (
-            tracker_repo,
-            _operators(resolved["tracker.operators"], tracker_repo),
+            repo,
+            _operators(resolved["tracker.operators"], repo),
         )
     return entries, None
 

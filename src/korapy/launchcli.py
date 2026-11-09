@@ -318,7 +318,7 @@ def cmd_resume(args, seams: Seams) -> int:
     from korapy import syncli
 
     tgt = _target(args)
-    tracker_repo, problem = syncli._tracker_repo(tgt.root, tgt.repo, tgt.resolved, worktrees.git)
+    tracker_repo, problem = syncli.tracker_repo(tgt.root, tgt.repo, tgt.resolved, worktrees.git)
     if problem is not None:
         raise launch.LaunchError(problem)
     labels_fn = seams.labels_fn

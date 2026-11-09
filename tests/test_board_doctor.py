@@ -98,6 +98,10 @@ def tempdir():
     return tempfile.mkdtemp(prefix="korapy-boarddoctor-")
 
 
+def no_git(args, cwd):
+    raise AssertionError(f"no git call for an explicit tracker.repo: {args}")
+
+
 def check(sites, *, snap=None, refs=(), fetch=None, store_dir=None, board_items=None, now=None):
     """``check_sites`` with fakes: snapshot ``snap``, membership ``refs``."""
     if fetch is None:
@@ -804,7 +808,9 @@ class DriftRowTest(unittest.TestCase):
                 '[repo.tracker]\nrepo = "example/demo"\nvariant = "board"\n'
                 '[repo.board]\nproject_owner = "example"\nproject_number = 3\n'
             )
-        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(
+            root, env={"KORAPY_CONFIG": config_dir}, git=no_git
+        )
         self.assertIsNone(error)
         self.assertEqual(len(sites), 1)
         self.assertEqual(sites[0].drift_max_age_s, 600)
@@ -821,6 +827,7 @@ class DriftRowTest(unittest.TestCase):
         sites, error = boarddoctor.sites_from_settings(
             root,
             env={"KORAPY_CONFIG": config_dir, "KORAPY_BOARD_DRIFT_MAX_AGE_S": "900"},
+            git=no_git,
         )
         self.assertIsNone(error)
         self.assertEqual(sites[0].drift_max_age_s, 900)
@@ -1021,7 +1028,9 @@ class SitesFromSettings(unittest.TestCase):
             '[[repo]]\nname = "plain"\n'
             '[repo.tracker]\nrepo = "example/plain"\n',
         )
-        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(
+            root, env={"KORAPY_CONFIG": config_dir}, git=no_git
+        )
         self.assertIsNone(error)
         self.assertEqual(len(sites), 1)
         self.assertEqual(sites[0].repo, "example/demo")
@@ -1040,7 +1049,9 @@ class SitesFromSettings(unittest.TestCase):
             '[repo.tracker]\nrepo = "example/plain"\n'
             '[repo.board]\nproject_owner = "example"\nproject_number = 3\n',
         )
-        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(
+            root, env={"KORAPY_CONFIG": config_dir}, git=no_git
+        )
         self.assertIsNone(error)
         self.assertEqual(len(sites), 1)
         self.assertEqual(sites[0].repo, "example/plain")
@@ -1051,7 +1062,9 @@ class SitesFromSettings(unittest.TestCase):
         root = tempdir()
         config_dir = tempdir()
         self.write(root, '[[repo]]\nname = "app"\n[repo.board]\nproject_number = 3\n')
-        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(
+            root, env={"KORAPY_CONFIG": config_dir}, git=no_git
+        )
         self.assertEqual(sites, [])
         self.assertIsNotNone(error)
         self.assertIn("app", error or "")
