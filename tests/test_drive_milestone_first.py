@@ -417,9 +417,38 @@ class MilestoneSyncTest(unittest.TestCase):
         self.assertEqual(found[0].extra["milestone_due"], DUE_EARLY)
         self.assertIs(found[0].extra["milestone_closed"], False)
         self.assertEqual([item.extra["milestone_due"] for item in found], [DUE_EARLY, None])
-        # An unmilestoned row carries no closed flag at all: the flag
-        # rides only with a title, so no residual False is stored.
-        self.assertNotIn("milestone_closed", found[1].extra)
+        # An unmilestoned row carries an explicit None flag: the flag
+        # rides only with a title, and the None lets the store merge
+        # drop a stale stored flag instead of keeping it.
+        self.assertIsNone(found[1].extra["milestone_closed"])
+
+    def test_removed_milestone_clears_the_stored_closed_flag(self):
+        # A row that loses its milestone must not keep a stale
+        # milestone_closed: True: the reading carries None, and the
+        # store merge drops the key.
+        run = FakeRun()
+        path = (
+            "repos/acme/app/issues?state=all&sort=updated"
+            f"&direction=asc&per_page={ghtracker.PER_PAGE}"
+        )
+        run.add(
+            path,
+            [
+                item_payload(
+                    1,
+                    milestone={"title": "M1", "due_on": DUE_EARLY, "state": "closed"},
+                ),
+                item_payload(2),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(run)
+        found = {item.number: item for item in adapter.items("acme/app")}
+        self.assertIs(found[1].extra["milestone_closed"], True)
+        stored = dict(found[1].extra)
+        merged = board.merge_extra(stored, found[2].extra)
+        self.assertNotIn("milestone_closed", merged)
+        self.assertNotIn("milestone", merged)
+        self.assertNotIn("milestone_due", merged)
 
 
 def milestone_project(tmp, name="blue", milestone_first=True):

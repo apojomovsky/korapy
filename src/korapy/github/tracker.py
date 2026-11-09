@@ -318,12 +318,13 @@ class GithubTracker:
             # but the milestone rides along from the same payload: one
             # more field on the existing listing, no new call. A missing
             # milestone clears the stored one, like the board reader,
-            # and the closed flag rides only with a title, so an
-            # unmilestoned reading stores no residual flag.
+            # and the closed flag rides only with a title: an
+            # unmilestoned reading carries an explicit None so the
+            # merge drops a stale stored flag instead of keeping it.
             extra={
                 "milestone": milestone_title,
                 "milestone_due": milestone_due,
-                **({"milestone_closed": milestone_closed} if milestone_title is not None else {}),
+                "milestone_closed": milestone_closed if milestone_title is not None else None,
             },
         )
 
