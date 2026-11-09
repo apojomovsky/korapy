@@ -64,8 +64,11 @@ process ever sleeps in a test.
 
 The wait is bounded. PROPOSED: one setting
 `github.retry_max_wait_s`, default 1800 seconds, resolved like
-every other setting and read in exactly one place. Sleep plus
-calls count against it. Past the bound the verb gives up with
+every other setting and read in exactly one place. The bound is
+wall-clock around `run`, measured through the injected `now`, so
+it includes pacer `acquire` naps (each retried call runs
+`paced_run`, whose `acquire` can nap up to `GRAPHQL_MAX_WAIT_S`)
+as well as the reset sleeps and the calls themselves. Past the bound the verb gives up with
 exit 3 (GitHub unreachable), and the message names the reset
 time, for example `rate limited until 2026-01-02T03:04:05Z;
 giving up after 1800s`. A give-up is never a bare exit 1: exit 1
@@ -143,7 +146,7 @@ stays where it is; the new verbs do not join it, so
 | `korapy github pr-state REPO N [--json]` | `Forge.pull_request` | 0 with the state; 3 unreachable (a give-up names the reset, section 1); 4 usage | `ForgeError` to 3; a missing PR to 1, never 3 (the provider answered) |
 | `korapy github pr-merge REPO N --head SHA [--method squash\|merge]` | `Forge.merge` | 0 merged, printing the SHA (`already merged <sha>` when merge-if-not-merged fires); 1 refused; 2 another merger holds the repo lock; 3 unreachable | `ForgeRefused` to 1; `ForgeError` to 3 |
 | `korapy github issue-labels REPO N [--add L \| --remove L]` | read: `Tracker.item` labels; write: `Tracker.add_label` / `Tracker.remove_label` | 0; 1 rejected or refused; 3 unreachable; 4 usage (a name outside the loop-owned set, a `ValueError` today) | `ValueError` to 4; `TrackerRejected` to 1; `TrackerError` to 3 |
-| `korapy github comment REPO N (--body T \| --body-file F) [--expect LINE]` | `Tracker.comments` then `Tracker.comment` | 0 posted, or `already posted` when `--expect` names a line the listing already holds; 3 unreachable; 4 usage | `TrackerError` to 3; an `--expect` hit is 0, never 1 |
+| `korapy github comment REPO N (--body T \| --body-file F) [--expect LINE]` | `Tracker.comments` then `Tracker.comment` | 0 posted, or `already posted` when `--expect` names a line the listing already holds; 1 refused; 3 unreachable; 4 usage | `TrackerRejected` to 1; other `TrackerError` to 3; an `--expect` hit is 0, never 1 |
 | `korapy github rate-limit [--json]` | `GET rate_limit` | 0 with remaining and reset per resource; 3 unreachable; never a refusal | any adapter failure to 3; never 1 |
 
 Notes on the table. The read half of `issue-labels` is the
@@ -187,14 +190,16 @@ two repositories never share entries), and `args` is the
 canonical verb arguments (number, label set requested).
 `current_user` itself costs one call per process: it is memoized
 in-process and backed by a `self.json` entry with its own short
-TTL, so the common case costs nothing. The `self.json` file is
+TTL (`SELF_TTL_S`, 300 seconds, beside the other three), so the
+common case costs nothing. The `self.json` file is
 keyed by a hash of the token, hash only, so two accounts never
 share it. No token material ever enters a key or a file; keys
 and entries carry account names and hashes, never secrets.
 
 PROPOSED TTLs, as constants beside the helper (settings only if
 a fleet proves a kind needs tuning): PR state 60 seconds, issue
-labels 300 seconds, rate-limit 60 seconds. The merge gate and
+labels 300 seconds, rate-limit 60 seconds, login memo 300 seconds
+(`SELF_TTL_S`). The merge gate and
 every other deciding path keep reading live: the cache serves
 polling scripts and queue scans, never a merge precondition, a
 claim, or a takeoff row. A design that cached a decision read
@@ -292,7 +297,8 @@ cache. `docs/commands.md` updates ride with the verb PRs.
    a full bucket, so old `graphql-pacing.json` files (which
    lack them) never trip the corrupt-state backoff. Tests with
    fake `run`, clock and sleep: reset read from `rate_limit`
-   not guessed, bound honored across sleep plus calls, give-up
+   not guessed, bound honored as wall-clock around `run` (reset
+   sleeps, calls, and pacer naps), give-up
    exits 3 naming the reset, safe verbs retried, bare comment
    retry on rate-limit answers but `--expect` required past a
    timeout, merged-at-pinned-head returns the SHA, `merge_sha
