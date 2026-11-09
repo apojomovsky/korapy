@@ -569,10 +569,16 @@ class BoardReader:
     def _concepts(self, selects, texts, milestone):
         """Board values plus the milestone as the reading's ``extra``.
 
-        Option ids resolve through the config's ``priority_map`` for
-        priority and through display names for the other columns; an
-        option id the map no longer names leaves the concept absent, so
-        the merge keeps the stored value.
+        `milestone` is the ``(title, due_on, closed)`` facts the single
+        issue read carried on the same payload (no new call); the title
+        keeps its key, and the due date and closed flag ride beside it
+        so the drive pass can order by milestone from the stored row.
+        A missing milestone clears the stored one, like every concept
+        the reading carries as None. Option ids resolve through the
+        config's ``priority_map`` for priority and through display
+        names for the other columns; an option id the map no longer
+        names leaves the concept absent, so the merge keeps the stored
+        value.
         """
         extra = {}
         if "board_status" in selects:
@@ -587,7 +593,10 @@ class BoardReader:
             extra["pool"] = selects["pool"][1]
         if "blocked_by" in texts:
             extra["blocked_by"] = parse_blocked_by(texts["blocked_by"])
-        extra["milestone"] = milestone
+        title, due, closed = milestone
+        extra["milestone"] = title
+        extra["milestone_due"] = due
+        extra["milestone_closed"] = closed
         return extra
 
 

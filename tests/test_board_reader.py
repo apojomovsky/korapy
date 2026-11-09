@@ -142,6 +142,11 @@ def milestone_field_value(title="M1"):
     }
 
 
+#: The stored extra keys one milestone occupies, so concept filters
+#: can skip the whole family instead of naming one key.
+_MILESTONE_KEYS = ("milestone", "milestone_due", "milestone_closed")
+
+
 def pull_request_field_value(number=9):
     return {
         "__typename": "ProjectV2ItemFieldPullRequestValue",
@@ -706,6 +711,17 @@ class PollItemsTest(unittest.TestCase):
         found = self.poll_one(run, [], milestone={"title": "M1"})
         self.assertEqual(found.extra["milestone"], "M1")
 
+    def test_milestone_due_and_state_ride_along(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [],
+            milestone={"title": "M1", "due_on": "2026-11-30T00:00:00Z", "state": "closed"},
+        )
+        self.assertEqual(found.extra["milestone"], "M1")
+        self.assertEqual(found.extra["milestone_due"], "2026-11-30T00:00:00Z")
+        self.assertIs(found.extra["milestone_closed"], True)
+
     def test_missing_milestone_clears_the_concept(self):
         run = BoardFakeRun()
         found = self.poll_one(run, [], milestone=None)
@@ -792,7 +808,7 @@ class PollItemsTest(unittest.TestCase):
     def test_unknown_field_ids_are_ignored(self):
         run = BoardFakeRun()
         found = self.poll_one(run, [text_value("F_other", "Other", "x")])
-        self.assertEqual({k: v for k, v in found.extra.items() if k != "milestone"}, {})
+        self.assertEqual({k: v for k, v in found.extra.items() if k not in _MILESTONE_KEYS}, {})
 
     def test_extra_dicts_are_not_shared(self):
         run = BoardFakeRun()
@@ -849,7 +865,7 @@ class UnmappedKindsTest(unittest.TestCase):
         )
         self.assertEqual(found.agent, "agent-1")
         self.assertEqual(found.extra["priority"], "urgent")
-        self.assertEqual({k for k in found.extra if k != "milestone"}, {"priority"})
+        self.assertEqual({k for k in found.extra if k not in _MILESTONE_KEYS}, {"priority"})
 
     def test_date_value_on_a_mapped_field_id_is_skipped(self):
         run = BoardFakeRun()
@@ -861,7 +877,7 @@ class UnmappedKindsTest(unittest.TestCase):
         found = self.poll_one(run, unmapped_values())
         self.assertEqual(found.agent, "")
         self.assertEqual(found.status, "")
-        self.assertEqual({k for k in found.extra if k != "milestone"}, set())
+        self.assertEqual({k for k in found.extra if k not in _MILESTONE_KEYS}, set())
 
     def test_malformed_values_of_mapped_kinds_still_fail_closed(self):
         field = {"__typename": "ProjectV2SingleSelectField", "id": "F_prio", "name": "Priority"}
