@@ -79,8 +79,10 @@ def eligible(rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]: ..
 `repo`, `number`, `title`, `labels`, `priority`, `state`, `agent`,
 `status`, `external`, and linked pull requests with their check and
 review state as data. `StartRequest` names `repo`, `number` and `kind`
-(`start`, `resume`, `review`, `fix`) and may carry a project-local
-weight used only to order within that project.
+(`start`, `resume`, `review`, `fix`, `research`) and may carry a project-local
+weight used only to order within that project. `research` is a
+research question (see section 5): it claims and launches like
+`start`, but finishes as a Findings comment.
 
 The policy module lives in the project's own ops root, beside
 `korapy.toml`: the registration above loads `blue_policy.py` from
@@ -152,7 +154,7 @@ registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
-`blocked_by` and no `blocked` label), and with no open linked pull
+`blocked_by` and no `blocked` label), not already `researched`, and with no open linked pull
 request and no linked pull merged since the claim start (by merge
 time, falling back to the last-update time when the listing carries
 no merge time), claimed or not: in-flight rows stay requested
@@ -160,7 +162,8 @@ so the loop never withdraws them by omission, while a ticket whose
 work landed during its claim stays withdrawn so no new round starts
 on landed work. A pull merged before the claim start reads as
 landed-before-this-round, so a reopened ticket picked up again still
-selects. Weight is the board priority rank,
+selects. A research ticket is selected like
+any other, but asks for kind `research` (see section 5). Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
@@ -604,6 +607,54 @@ re-check below.
   ticket with a live unit keeps its claim instead, whatever the
   eligibility says. A failed decision write keeps the claim for a
   later pass.
+
+Research tickets: some tickets are questions, not changes, and finish
+as a written finding with no pull request. A ticket carrying the
+`research` label starts with the research worker prompt (read-only on
+the repository, writes no commits, posts one comment on the ticket
+whose first line starts with `Findings`). Eligibility selects research
+tickets like any other, but asks for kind `research` (`basic` maps the
+label; `researched` rows are never selected, since answering twice is
+not work). The kind claims and launches exactly like `start` and
+counts toward the same caps; the launch runs the `research` role
+prompt, overridable as `prompts.research` like the other roles.
+
+The loop treats a research ticket as done when its Findings comment
+exists. Done detection is one pure function over the ticket's
+comments (`research.findings`): the first comment whose first line
+starts with `Findings`. The first Findings comment on the ticket
+wins across re-runs: comment bodies carry no authorship or timestamp
+to scope the verdict to the current holder's run. The comments are
+the only new GitHub reads the research finish adds: one
+`Tracker.comments` read per finished research ticket, in the pass
+that already lists its pulls. A rate-limited comments read stops the
+pass with exit 3, like any other tracker outage, instead of settling
+blind. Orphan recovery never releases a claimed research row whose
+finished registry entry names the research role behind the current
+holder, whatever its age: the verdict settles through its comments,
+so the claim survives until the settlement reads them. After the
+orphan recovery, the pass settles each such row: with findings, it
+adds `researched` through the label seam and releases the claim (the
+agent and status clears flow through the mirror as usual); without
+findings, it releases bare, so the ticket is startable again instead
+of waiting on a reviewer that never comes. A failed label write keeps
+the claim for a later pass, never released unlabeled; unreadable
+comments keep it too. A row with a live unit keeps its claim whatever
+the comments say.
+
+A settled research ticket never takes a reviewer: the gate refuses a
+`review` requested on a research row, a finished research holder
+never takes over as one, and the research rows skip both linked-pull
+checks (in the gate and in `basic`, which selects research rows with
+unreadable or open pulls), so the finish never waits for a pull
+request. A finding addressed to the maintainer is reported as an
+attention item on the dashboard (a `research` event in the driving
+project's queue, carrying the finding's first line) until
+acknowledged: re-reporting an acked finding does not reopen it. The
+event goes to the settlement's driving project, resolved where the
+project context still exists; when two projects drive one repository,
+the first sorted project wins. A stuck research worker restarts with
+the research prompt, like any other start.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 

@@ -409,6 +409,25 @@ def cmd_drive(args: argparse.Namespace) -> int:
             quota_pool,
             override=quota_refresh_override,
         )
+
+        def record_research_event(project, repo, number, findings_body):
+            from korapy import coordevents
+            from korapy.coord import project_root
+
+            coordevents.record(
+                [
+                    {
+                        "kind": "research",
+                        "ref": f"{repo}#{number}",
+                        "evidence": drive.research.first_line(findings_body),
+                        "state": findings_body,
+                    }
+                ],
+                root=project_root(project),
+                kinds=[],
+                now=moment,
+            )
+
         return drive.run_pass(
             plan=False,
             store=store,
@@ -442,6 +461,8 @@ def cmd_drive(args: argparse.Namespace) -> int:
             driven=driven,
             pool=quota_pool,
             quota_refresh_after_s=quota_refresh_after_s,
+            comments_for=drive.research_comments_for(tracker_factory),
+            record_event=record_research_event,
         )
 
 
