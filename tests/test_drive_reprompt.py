@@ -528,6 +528,39 @@ class RepromptStepTest(unittest.TestCase):
         self.assertTrue(outcomes[(REPO, NUMBER)].startswith("refused: "), outcomes)
         self.assertEqual(outcomes[(REPO, 8)], "resumed")
 
+    def test_a_raising_resolve_refuses_one_ticket_and_resumes_the_other(self):
+        make_leaf(self.root, prompt=reviewer_prompt())
+        make_leaf(self.root, number=8, prompt=reviewer_prompt())
+        reviewer8 = "blue-agent-app-8-r1"
+        missing = [(REPO, NUMBER, REVIEWER), (REPO, 8, reviewer8)]
+        resume = FakeResume()
+        remote = FakeRemote([SHA_B, SHA_B, SHA_B])
+
+        def resolve(repo, number):
+            if number == NUMBER:
+                raise AttributeError("boom in resolve")
+            return make_tgt(self.root)
+
+        out = io.StringIO()
+        outcomes = drive.reprompt_missing_reviews(
+            missing,
+            finished={
+                (REPO, NUMBER): FINISHED,
+                (REPO, 8): (reviewer8, "reviewer", "ok"),
+            },
+            reviews={},
+            titles={(REPO, NUMBER): "fix: thing", (REPO, 8): "fix: other"},
+            resolve=resolve,
+            sessions_root=self.root,
+            run=remote,
+            resume=resume,
+            out=out,
+        )
+        self.assertEqual(len(resume.calls), 1)
+        self.assertEqual(resume.calls[0][1], 8)
+        self.assertTrue(outcomes[(REPO, NUMBER)].startswith("refused: "), outcomes)
+        self.assertEqual(outcomes[(REPO, 8)], "resumed")
+
     def test_without_a_resume_seam_nothing_is_read_or_written(self):
         make_leaf(self.root, prompt=reviewer_prompt())
         remote = FakeRemote([SHA_A, SHA_A, SHA_A])

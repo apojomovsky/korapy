@@ -1799,10 +1799,21 @@ def reprompt_missing_reviews(
     for repo, number, reviewer in missing or ():
         key = (repo, number)
         newest = (finished or {}).get(key)
-        tgt = resolve(repo, number)
-        mark, refusal = _reprompt_mark_for(
-            repo, number, reviewer, tgt=tgt, sessions_root=sessions_root
-        )
+        try:
+            tgt = resolve(repo, number)
+            mark, refusal = _reprompt_mark_for(
+                repo, number, reviewer, tgt=tgt, sessions_root=sessions_root
+            )
+        except Exception as err:
+            # Fail closed for this ticket only: an unexpected resolve
+            # or mark error (beyond the refusals `_reprompt_mark_for`
+            # returns) never aborts the pass for the tickets behind it.
+            outcomes[key] = f"refused: reprompt refused ({err})"
+            print(
+                f"{repo}#{number}: review reprompt refused (reprompt refused ({err})), skipped",
+                file=stream,
+            )
+            continue
         if refusal is not None:
             outcome, reason = refusal
             outcomes[key] = outcome
