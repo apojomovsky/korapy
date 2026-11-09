@@ -203,27 +203,50 @@ class ExitCode(unittest.TestCase):
         self.assertEqual(doctor.exit_code(checks), 1)
 
 
-class BuiltinFallback(unittest.TestCase):
-    def test_falling_to_builtin_while_profiles_are_declared_warns(self):
+class MissingDefault(unittest.TestCase):
+    def test_no_usable_default_fails_with_the_fix_line(self):
         fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
         checks = check(state(parsed=fast), [dep("omp")])
         rows = by_name(checks)
-        self.assertEqual(rows["profile-default"].status, "warn")
-        self.assertIn("built-in", rows["profile-default"].detail)
-        self.assertTrue(rows["profile-default"].fix)
-        self.assertEqual(doctor.exit_code(checks), 0)
+        self.assertEqual(rows["profile-default"].status, "fail")
+        self.assertIn("[profiles.default]", rows["profile-default"].fix)
+        self.assertIn("profile.default", rows["profile-default"].fix)
+        self.assertIn('runtime = "muse"', rows["profile-default"].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
 
-    def test_a_declared_default_carries_no_fallback_note(self):
+    def test_no_declarations_at_all_fail_with_the_fix_line(self):
+        checks = check(state(), [dep("muse"), dep("omp")])
+        rows = by_name(checks)
+        self.assertEqual(rows["profile-default"].status, "fail")
+        self.assertIn("[profiles.default]", rows["profile-default"].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_a_show_failure_and_the_doctor_agree(self):
+        fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
+        with self.assertRaises(profiles.ProfileError) as ctx:
+            profiles.resolve(
+                fast,
+                profiles.empty_selections(),
+                repo="example",
+                role="worker",
+                number=12,
+                now=T0,
+            )
+        self.assertIn("[profiles.default]", str(ctx.exception))
+        checks = check(state(parsed=fast), [dep("omp")])
+        self.assertEqual(by_name(checks)["profile-default"].status, "fail")
+
+    def test_a_declared_default_carries_no_missing_default_row(self):
         checks = check(state(parsed=declared()), [dep("muse"), dep("omp")])
         self.assertNotIn("profile-default", by_name(checks))
 
-    def test_a_selected_default_carries_no_fallback_note(self):
+    def test_a_selected_default_carries_no_missing_default_row(self):
         fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
         selections = profiles.Selections(default="fast")
         checks = check(state(parsed=fast, selections=selections), [dep("omp")])
         self.assertNotIn("profile-default", by_name(checks))
 
-    def test_a_committed_default_carries_no_fallback_note(self):
+    def test_a_committed_default_carries_no_missing_default_row(self):
         fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
         checks = check(
             state(
@@ -234,13 +257,9 @@ class BuiltinFallback(unittest.TestCase):
         )
         self.assertNotIn("profile-default", by_name(checks))
 
-    def test_no_selections_reading_with_declarations_carries_no_fallback_note(self):
+    def test_no_selections_reading_with_declarations_carries_no_missing_default_row(self):
         fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
         checks = check(state(parsed=fast, selections=None), [dep("omp")])
-        self.assertNotIn("profile-default", by_name(checks))
-
-    def test_no_declarations_carry_no_fallback_note(self):
-        checks = check(state(), [dep("muse"), dep("omp")])
         self.assertNotIn("profile-default", by_name(checks))
 
 

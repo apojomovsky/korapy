@@ -68,6 +68,21 @@ class Check(NamedTuple):
     fix: str
 
 
+class AreaSite(NamedTuple):
+    """One project's area-lock readings for the doctor rows.
+
+    `prefix` is the resolved `drive.area_prefix` (empty means the lock
+    is off); `area_column` whether any of the project's repos maps the
+    board `area` column; `unreadable` how many `(pulls unreadable)`
+    area refusals the journal holds for the project.
+    """
+
+    project: str
+    prefix: str
+    area_column: bool
+    unreadable: int
+
+
 class HubProbe(NamedTuple):
     """The hub version probe, gathered once by production, carried as data.
 
@@ -200,6 +215,10 @@ class Env(NamedTuple):
     #: reading, and then the ok row stays generic; a bad entry is
     #: already a failing row through `project_problems`.
     project_policies: Sequence[tuple[str, str, str | None]] | None = None
+    #: Per-project area-lock readings, gathered once by production.
+    #: None means the caller has no reading, and then the report
+    #: carries no `area:*` rows.
+    area_sites: Sequence[AreaSite] | None = None
     #: The freeze reading: the dict `freeze.freeze_view` returns, the
     #: exception reading it raised, or None. None means the caller has
     #: no reading, and then the report carries no freeze row.
@@ -387,6 +406,45 @@ def _check_drive_projects(
             "",
         )
     ]
+
+
+def _check_area_sites(sites: Sequence[AreaSite] | None) -> list[Check]:
+    """Area-lock warnings: label/board clashes and outage stalls.
+
+    None means the caller has no reading: no rows. A project opted in
+    (non-empty prefix) that also maps the board `area` column warns:
+    the lock reads only the labels and the board field never counts.
+    A project with two or more `(pulls unreadable)` area refusals in
+    the journal warns: the lock is serializing on an outage, and
+    `drive.area_fail_open` is the escape hatch during a known outage.
+    """
+    if sites is None:
+        return []
+    found = []
+    for site in sites:
+        if site.prefix and site.area_column:
+            found.append(
+                Check(
+                    f"area:{site.project}",
+                    "warn",
+                    f"project {site.project} maps a board area column and uses "
+                    "area labels: the lock reads only the labels",
+                    "remove the area_column mapping or stop using area: labels, "
+                    "then run `korapy doctor` again",
+                )
+            )
+        if site.prefix and site.unreadable >= 2:
+            found.append(
+                Check(
+                    f"area:{site.project}",
+                    "warn",
+                    f"project {site.project} shows {site.unreadable} area refusals "
+                    "with (pulls unreadable): the lock is serializing on an outage",
+                    "set drive.area_fail_open during a known outage, then run "
+                    "`korapy doctor` again",
+                )
+            )
+    return found
 
 
 def _check_readers(errors: Sequence[tuple[str, str, str]]) -> list[Check]:
@@ -986,16 +1044,17 @@ def _check_profile_shadows(state: ProfileState) -> list[Check]:
 
 
 def _check_profile_default(state: ProfileState) -> list[Check]:
-    """The `profile-default` note: a launch with no selection would use
-    the built-in default while profiles are declared.
+    """The `profile-default` row: a launch with no selection would fail.
 
-    Warns only when declarations validate, at least one profile is
-    declared, no `[profiles.default]` table exists, and no layer-6
-    selection (local or committed) names a default: then an unselected
-    launch silently runs the built-in runtime instead of a declared
-    setup. A warn, never a fail: the launch path resolves the same way.
+    There is no shipped default, so the launch fails fast (exit 4) naming
+    the fix, and the doctor fails the same way: the operator sees the
+    refusal here instead of at launch time. Fails when declarations
+    validate yet no layer-6 value stands: no `[profiles.default]` table,
+    no local default and no committed default. A fail, never a warn: the
+    launch path resolves the same way through `profiles.resolve`. With no
+    profiles declared at all every launch fails, so that fails too.
     """
-    if state.error is not None or not state.parsed:
+    if state.error is not None:
         return []
     if profiles.declared_default(state.parsed) is not None:
         return []
@@ -1007,19 +1066,14 @@ def _check_profile_default(state: ProfileState) -> list[Check]:
         return []
     if selections is None:
         return []
-    count = len(state.parsed)
-    return [
-        Check(
-            "profile-default",
-            "warn",
-            f"{count} declared profile(s) but no default selected: "
-            "a launch with no profile selection uses the built-in default "
-            f"(runtime {profiles.BUILTIN_DEFAULT.runtime})",
-            "declare [profiles.default] with a runtime, or select a default "
-            "(`korapy profile set --global NAME` or committed `profile.default`), "
-            "then run `korapy doctor` again",
+    if state.parsed:
+        detail = (
+            f"{len(state.parsed)} declared profile(s) but no default selected: "
+            "a launch with no profile selection fails (exit 4)"
         )
-    ]
+    else:
+        detail = "no profiles declared: a launch with no profile selection fails (exit 4)"
+    return [Check("profile-default", "fail", detail, profiles.MISSING_DEFAULT_FIX)]
 
 
 def check_profiles(state: ProfileState, dep_results) -> list[Check]:
@@ -1028,9 +1082,9 @@ def check_profiles(state: ProfileState, dep_results) -> list[Check]:
     Pure over the readings in `state`: declarations validate, every
     selection, pin, override and committed default names a declared
     profile, every referenced runtime resolves, an expired override
-    fails until reset, and an unselected default over declared profiles
-    warns. Unknown runtime, missing binary and expiry fail; a shadowed
-    name is a note.
+    fails until reset, and a missing default over declared profiles (or
+    over none at all) fails naming the fix. Unknown runtime, missing
+    binary, expiry and a missing default fail; a shadowed name is a note.
     """
     if state.error is not None:
         return [
@@ -1057,6 +1111,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_drive_timer(env.timer_state),
         *_check_drive_projects(env.project_problems, env.project_policies),
+        *_check_area_sites(env.area_sites),
         *check_freeze(env.freeze_view, env.freeze_max_age_s),
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
@@ -1814,6 +1869,77 @@ def load_project_report() -> tuple[list[str], list[tuple[str, str, str | None]] 
     return problems, list(sources)
 
 
+def unreadable_area_counts(entries) -> dict:
+    """Per-project `(pulls unreadable)` area skip counts. Pure.
+
+    Reads parsed journal entries, so the caller owns the file read:
+    only `skip` events with code `area` naming the outage count.
+    """
+    counts: dict = {}
+    for entry in entries or ():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") != "skip" or entry.get("code") != "area":
+            continue
+        if "(pulls unreadable)" not in str(entry.get("reason", "")):
+            continue
+        project = entry.get("project") or ""
+        counts[project] = counts.get(project, 0) + 1
+    return counts
+
+
+def load_area_report() -> list[AreaSite] | None:
+    """Per-project area-lock readings for the live report, or None.
+
+    A project opted in (non-empty `drive.area_prefix`) reports whether
+    any of its repos maps the board `area` column, plus its
+    `(pulls unreadable)` area skip count from the live journal (0 when
+    the journal is missing or unreadable). Every fallible gathering
+    degrades to report data, never a traceback. Only the CLI calls
+    this; tests inject AreaSite data instead.
+    """
+    try:
+        registered = projects.load_all()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError):
+        return None
+    try:
+        with open(drive.journal_path(), encoding="utf-8") as handle:
+            raw = handle.read().splitlines()
+    except OSError:
+        raw = []
+    entries = []
+    for line in raw:
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except ValueError:
+            continue
+    counts = unreadable_area_counts(entries)
+    sites = []
+    for project in registered:
+        try:
+            resolved = settings.load(root=project.root)
+        except settings.SettingsError:
+            continue
+        prefix = resolved["drive.area_prefix"]
+        column = False
+        try:
+            names = settings.repo_names(project.root)
+        except settings.SettingsError:
+            names = []
+        for name in names:
+            try:
+                entry = settings.load(root=project.root, repo=name)
+            except settings.SettingsError:
+                continue
+            if entry.board is not None and entry.board.area_column:
+                column = True
+                break
+        sites.append(AreaSite(project.name, prefix, column, counts.get(project.name, 0)))
+    return sites
+
+
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
@@ -2138,6 +2264,7 @@ def production_env() -> Env:
         push_probe=push_probe,
     )
     project_problems, project_policies = load_project_report()
+    area_sites = load_area_report()
     timer_state = load_timer_state()
     try:
         freeze_max_age_s = (
@@ -2178,6 +2305,7 @@ def production_env() -> Env:
         repo_sites=repo_sites,
         project_problems=project_problems,
         project_policies=project_policies,
+        area_sites=area_sites,
         timer_state=timer_state,
         freeze_view=load_freeze_view(resolved),
         freeze_max_age_s=freeze_max_age_s,

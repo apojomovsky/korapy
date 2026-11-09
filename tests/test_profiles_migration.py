@@ -2,8 +2,9 @@
 
 The old `[models.*]` tables and `agents.runtime` are gone: a korapy.toml
 still carrying them fails fast with SettingsError (exit 4) naming the new
-`[profiles.*]` keys. Every launch resolves one profile; the pre-profiles
-path is gone, so a config with no declarations runs the built-in default.
+`[profiles.*]` keys. Every launch resolves one declared profile; the
+pre-profiles path is gone, so a config with no declarations fails fast
+naming the `[profiles.default]` table to declare.
 """
 
 import os
@@ -63,22 +64,23 @@ class OldKeysFail(unittest.TestCase):
 
 
 class SinglePath(unittest.TestCase):
-    def test_an_empty_declaration_still_selects_the_builtin_default(self):
+    def test_an_empty_declaration_fails_fast_naming_the_fix(self):
         tgt = FakeTarget(resolved=resolve(project={}))
-        found = launch.select_profile(
-            tgt,
-            7,
-            role="worker",
-            selections=profiles.empty_selections(),
-            store=FakeStore(),
-            tracker=None,
-            pool=pool("provider-a"),
-            ledger={"readings": {}, "marks": {}},
-            now=1000.0,
-        )
-        self.assertIsNotNone(found)
-        self.assertEqual(found.profile, profiles.BUILTIN_DEFAULT)
-        self.assertEqual(found.runtime, profiles.BUILTIN_DEFAULT.runtime)
+        with self.assertRaises(settings.SettingsError) as ctx:
+            launch.select_profile(
+                tgt,
+                7,
+                role="worker",
+                selections=profiles.empty_selections(),
+                store=FakeStore(),
+                tracker=None,
+                pool=pool("provider-a"),
+                ledger={"readings": {}, "marks": {}},
+                now=1000.0,
+            )
+        message = str(ctx.exception)
+        self.assertIn("[profiles.default]", message)
+        self.assertIn("profile.default", message)
 
 
 class DriveQuotaFromProfiles(unittest.TestCase):

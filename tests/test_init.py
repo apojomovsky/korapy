@@ -309,6 +309,9 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.area_fail_open = false  # area lock reads claim-held areas only during a pulls outage: unreadable linked pulls stop holding other tickets
+# drive.area_hold_until_merged = true  # area lock holds through the merge window: an open linked pull on another ticket keeps overlapping areas locked
+# drive.area_prefix = ""  # label prefix naming ticket areas for the area lock (empty means off; for example "area:")
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
@@ -389,13 +392,26 @@ path = "."
 
 """
 
-GOLDEN_EMPTY = HEAD % ("empty", "make check") + TAIL
-GOLDEN_PYUV = HEAD % ("pyuv", "uv run python -m unittest") + TAIL
-GOLDEN_PYPLAIN = HEAD % ("pyplain", "uv run pytest") + TAIL
-GOLDEN_NODE = HEAD % ("node", "npm test") + TAIL
-GOLDEN_RUSTY = HEAD % ("rusty", "cargo test") + TAIL
-GOLDEN_GOPHER = HEAD % ("gopher", "go test ./...") + TAIL
-GOLDEN_DOCSY = HEAD % ("docsy", "make test") + TAIL
+DEFAULT_PROFILES = """[profile]
+default = "default"
+
+[profiles.default]
+runtime = "muse"
+
+"""
+
+
+def _with_default_profiles(rendered):
+    return rendered.replace("[[repo]]\nname =", DEFAULT_PROFILES + "[[repo]]\nname =", 1)
+
+
+GOLDEN_EMPTY = _with_default_profiles(HEAD % ("empty", "make check")) + TAIL
+GOLDEN_PYUV = _with_default_profiles(HEAD % ("pyuv", "uv run python -m unittest")) + TAIL
+GOLDEN_PYPLAIN = _with_default_profiles(HEAD % ("pyplain", "uv run pytest")) + TAIL
+GOLDEN_NODE = _with_default_profiles(HEAD % ("node", "npm test")) + TAIL
+GOLDEN_RUSTY = _with_default_profiles(HEAD % ("rusty", "cargo test")) + TAIL
+GOLDEN_GOPHER = _with_default_profiles(HEAD % ("gopher", "go test ./...")) + TAIL
+GOLDEN_DOCSY = _with_default_profiles(HEAD % ("docsy", "make test")) + TAIL
 
 GOLDEN_FLAGS = """# korapy.toml, written by `korapy init`. Settings that differ
 # from the defaults live in [[repo]]; everything else is
@@ -457,6 +473,9 @@ commits.conventional = false
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.area_fail_open = false  # area lock reads claim-held areas only during a pulls outage: unreadable linked pulls stop holding other tickets
+# drive.area_hold_until_merged = true  # area lock holds through the merge window: an open linked pull on another ticket keeps overlapping areas locked
+# drive.area_prefix = ""  # label prefix naming ticket areas for the area lock (empty means off; for example "area:")
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
@@ -769,16 +788,27 @@ class FlagsCase(Fixture):
         self.assertEqual(resolved["board.ready"], "triage")
         self.assertIs(resolved["git.commits.conventional"], False)
 
-    def test_a_builtin_runtime_writes_no_profiles_table(self):
+    def test_a_plain_init_writes_the_muse_default_profile(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        with open(self.target(), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn('[profiles.default]\nruntime = "muse"\n', text)
+        self.assertIn('[profile]\ndefault = "default"\n', text)
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
+        resolved = settings.load(root=self.root, repo=self.name, env=env)
+        self.assertEqual(resolved.profiles["default"]["runtime"], "muse")
+        self.assertEqual(resolved.profile_committed["default"], "default")
+
+    def test_an_explicit_omp_runtime_writes_its_own_default_table(self):
         code, _, _ = self.run_cli("--test-cmd", "make check", "--runtime", "omp", self.root)
         self.assertEqual(code, 0)
         with open(self.target(), encoding="utf-8") as handle:
             text = handle.read()
-        self.assertNotIn("[profiles", text)
-        self.assertNotIn("[profile]", text)
+        self.assertIn('[profiles.default]\nruntime = "omp"\n', text)
         env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
-        self.assertEqual(resolved.profiles, {})
+        self.assertEqual(resolved.profiles["default"]["runtime"], "omp")
 
     def test_yes_is_a_no_op(self):
         code, _, _ = self.run_cli("--yes", "--test-cmd", "make check", self.root)

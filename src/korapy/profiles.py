@@ -34,6 +34,18 @@ from korapy import accounts, models, paths, runtimes, settings
 #: The profile used when nothing else selects one.
 DEFAULT_PROFILE_NAME = "default"
 
+#: The fix line shared by the resolver and the doctor when no profile is
+#: selected: there is no shipped default to fall back to, so a launch that
+#: resolves no declared or selected profile fails fast (exit 4) naming the
+#: `[profiles.default]` table to declare (with a one-line example) and the
+#: two ways to select a default instead.
+MISSING_DEFAULT_FIX = (
+    "declare [profiles.default] with a runtime, "
+    'e.g. [profiles.default] runtime = "muse", '
+    "or select a default with `korapy profile set --global NAME` "
+    "or committed `profile.default`"
+)
+
 #: Profile names are label-safe on purpose, so a ticket label can carry one.
 _NAME = re.compile(r"[a-z0-9-]+")
 
@@ -59,11 +71,9 @@ class Profile:
     options: dict = field(default_factory=dict)
 
 
-#: The shipped default setup. Lower layers fall back to it, so resolution
-#: always succeeds; it carries no chains or options of its own. The runtime
-#: comes from `runtimes.DEFAULT_RUNTIME`: one fact, one place, so the
-#: cutover changes no default.
-BUILTIN_DEFAULT = Profile(name=DEFAULT_PROFILE_NAME, runtime=runtimes.DEFAULT_RUNTIME)
+#: There is no shipped default profile: a launch that resolves no declared
+#: or selected profile fails fast (exit 4) with `MISSING_DEFAULT_FIX`
+#: instead of running a setup nobody chose.
 
 
 def _want_type(entry):
@@ -226,9 +236,9 @@ def declared_default(parsed: Mapping[str, Profile]) -> Profile | None:
     """The declared `[profiles.default]`, or None when none is declared.
 
     The one resolver for the profile named `default`: the declared table
-    wins, and only an undeclared name falls through to `BUILTIN_DEFAULT`
-    at layer 6. Every reader of the default goes through here, so the
-    resolver, `show` and the launch path agree with `list`.
+    wins, and an undeclared name resolves no default at all (there is no
+    shipped fallback). Every reader of the default goes through here, so
+    the resolver, `show`, the doctor and the launch path agree with `list`.
     """
     found = parsed.get(DEFAULT_PROFILE_NAME)
     if isinstance(found, Profile):
@@ -836,9 +846,9 @@ def explain(
     elif declared_default(parsed) is not None:
         values.append((6, "default", "declared [profiles.default]", DEFAULT_PROFILE_NAME, "value"))
     else:
-        values.append((6, "default", "built-in default", None, "builtin"))
+        values.append((6, "default", "", None, "absent"))
     winner = next(
-        (index for index, entry in enumerate(values) if entry[4] in ("value", "builtin")),
+        (index for index, entry in enumerate(values) if entry[4] == "value"),
         None,
     )
     chain = []
@@ -876,12 +886,13 @@ def resolve(
     Layer 1 is the `--profile` flag; 2 the ticket assignment (the tracker
     value, else the local pin); 3 the live temporary override; 4 and 5 the
     project and role selections (local beats committed); 6 the default
-    (local, else committed, else the declared `[profiles.default]` table,
-    else the built-in). Every reader goes through here, so local always
-    wins and provenance always names the layer and source. A winning
-    unknown name fails with ProfileError (exit 4); only the winner is
-    looked up, so a shadowed dangling selection waits for the doctor
-    instead of breaking unrelated launches.
+    (local, else committed, else the declared `[profiles.default]` table).
+    There is no shipped fallback: when no layer selects a profile the
+    launch fails with ProfileError (exit 4) naming the fix. Every reader
+    goes through here, so local always wins and provenance always names
+    the layer and source. A winning unknown name fails with ProfileError
+    (exit 4); only the winner is looked up, so a shadowed dangling
+    selection waits for the doctor instead of breaking unrelated launches.
     """
     chain = explain(
         parsed,
@@ -896,13 +907,10 @@ def resolve(
         committed=committed,
         selections_source=selections_source,
     )
-    winner = next(entry for entry in chain if entry.state == "selected")
-    if winner.profile is None:
-        return BUILTIN_DEFAULT, Provenance(
-            layer=6,
-            layer_name="default",
-            source="built-in default",
-            profile=BUILTIN_DEFAULT.name,
+    winner = next((entry for entry in chain if entry.state == "selected"), None)
+    if winner is None or winner.profile is None:
+        raise ProfileError(
+            f"no profile selected for {repo}#{number} (role {role!r}): {MISSING_DEFAULT_FIX}"
         )
     found = lookup(parsed, winner.profile)
     until = None
