@@ -333,6 +333,7 @@ TAIL = """# Defaults: uncomment to override.
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [merge]
+# merge.auto = true  # the drive pass merges a pull request that meets every readiness criterion; false only reports readiness, never merges
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
@@ -495,6 +496,7 @@ commits.conventional = false
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [merge]
+# merge.auto = true  # the drive pass merges a pull request that meets every readiness criterion; false only reports readiness, never merges
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]

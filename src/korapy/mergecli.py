@@ -10,13 +10,18 @@ uses the same lookup takeoff uses, so both gates agree. The forge repo
 and PR number name what is merged; `--head` pins the exact head the
 caller approved. The method is `--method` when given, else the
 `merge.method` project setting (a squash by default, or a merge
-commit). `--skip` waives only `checks`; `--plan` reports the rows
-without taking the lock and without merging. A `pending` checks row
-blocks with exit 1 but reports `pending` (a wait, with no fix
-advice) instead of `fail`. `--wait` polls the forge until the
-checks row leaves pending, any row fails, or `--timeout` (default
-ten minutes) lands, so a coordinator waits instead of polling
-itself; a `--timeout` without `--wait` is exit 4.
+commit). Past the identity rows the gate also proves readiness:
+no unresolved review thread and no unanswered change request, a
+body linking the ticket with the review findings settled, and a
+diff touching a test file, touching only documentation, or carrying
+the `no-tests` label. `--skip` waives only `checks`; `--plan`
+reports every row without taking the lock and without merging. A
+`pending` checks row blocks with exit 1 but reports `pending` (a
+wait, with no fix advice) instead of `fail`. `--wait` polls the
+forge until the checks row leaves pending, any row fails, or
+`--timeout` (default ten minutes) lands, so a coordinator waits
+instead of polling itself; a `--timeout` without `--wait` is
+exit 4.
 
 Exit codes: 0 merged (under `--plan`: mergeable), 1 a precondition
 failed or is still pending, the merge was refused, or the forge or
@@ -200,7 +205,8 @@ def add_parser(sub) -> None:
         default=[],
         metavar="CHECK",
         help="waive one policy check and record the skip (repeatable): "
-        "only checks; lock, open, head, review and fork cannot be skipped",
+        "only checks; lock, open, head, review, comments, objectives, "
+        "tests and fork cannot be skipped",
     )
     p.add_argument("--json", action="store_true", help="print the stable document")
     p.add_argument(

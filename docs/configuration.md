@@ -179,6 +179,7 @@ what it means. Do not edit this table by hand.
 | `hub.lease_ttl_s` | `90` | seconds a hub claim grant stays valid |
 | `hub.stale_after_s` | `90` | seconds after the last heartbeat a host reads stale on the merged dashboard |
 | `hub.url` | `''` | address of the hub, for example http://host-1:8000 (empty means single-host) |
+| `merge.auto` | `True` | the drive pass merges a pull request that meets every readiness criterion; false only reports readiness, never merges |
 | `merge.method` | `'squash'` | how korapy merge lands a PR: a squash, or a merge commit |
 | `prompts.research` | `''` | override file for the research prompt (relative to the ops root) |
 | `prompts.reviewer` | `''` | override file for the reviewer prompt (relative to the ops root) |

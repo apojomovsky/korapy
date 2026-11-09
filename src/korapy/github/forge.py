@@ -6,8 +6,10 @@ stdout, raises on failure); production passes ``korapy.github.gh``'s
 runner, tests pass a fake. Nothing here imports ``gh``: the seam stays
 a plain callable so a fake needs no subprocess.
 
-Reads use the REST API only. The host's GraphQL budget is shared with
-other tools and is not spent on reads the REST budget serves.
+Reads use the REST API only, except one: the review-threads read,
+which the REST budget cannot answer (resolved state is GraphQL-only),
+goes through one GraphQL query and the shared GraphQL bucket, only
+when a merge is evaluated.
 """
 
 import json
@@ -161,6 +163,11 @@ def _parse_pull(payload, number):
     author = user.get("login") if isinstance(user, dict) else None
     if not isinstance(author, str) or not author:
         raise _shape(f"PR {number} has no author login")
+    body = payload.get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise _shape(f"PR {number} has a malformed body")
     labels = payload.get("labels")
     if labels is None:
         names: list[str] = []
@@ -191,6 +198,7 @@ def _parse_pull(payload, number):
         labels=tuple(names),
         checks_state=_checks_state(payload, number),
         merge_sha=_merge_sha(payload, number, state),
+        body=body,
     )
 
 
@@ -253,12 +261,100 @@ def _is_merge_refused(err):
     return _MERGE_REFUSED_RE.search(str(err)) is not None
 
 
+#: One query for the merge gate's comments row: the PR's review
+#: threads (resolved state is GraphQL-only) beside its review
+#: decision, first page only. A truncated listing reads as unknown
+#: downstream, never as resolved.
+_THREADS_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewDecision
+      reviewThreads(first: 100) {
+        nodes { isResolved }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}"""
+
+
+def _parse_threads(data, number):
+    """A GraphQL threads answer to a ``ReviewThreads``. Fail-closed.
+
+    The envelope must hold the PR; a missing PR is ``ForgeError``
+    like a missing REST read. Unreadable per-thread states and a
+    truncated page count as ``unknown`` (never resolved); only
+    ``CHANGES_REQUESTED`` reads as a change request, quiet decisions
+    (``APPROVED``, ``REVIEW_REQUIRED``, or none reported) read as
+    none, and anything else unparsable reads as unknown.
+    """
+    if not isinstance(data, dict):
+        raise _shape(f"PR {number} threads answer is not an object")
+    repository = data.get("repository")
+    if not isinstance(repository, dict):
+        raise _shape(f"PR {number} threads answer has no repository")
+    pr = repository.get("pullRequest")
+    if pr is None:
+        raise forge.ForgeError(f"no such PR: {number}")
+    if not isinstance(pr, dict):
+        raise _shape(f"PR {number} threads answer is not an object")
+    decision = pr.get("reviewDecision")
+    if decision == "CHANGES_REQUESTED":
+        change_requested: bool | None = True
+    elif decision in ("APPROVED", "REVIEW_REQUIRED", None):
+        change_requested = False
+    elif isinstance(decision, str):
+        change_requested = None
+    else:
+        raise _shape(f"PR {number} has an unusable review decision {decision!r}")
+    threads = pr.get("reviewThreads")
+    if not isinstance(threads, dict):
+        raise _shape(f"PR {number} has no review threads")
+    nodes = threads.get("nodes")
+    if not isinstance(nodes, list):
+        raise _shape(f"PR {number} review threads are not a list")
+    page = threads.get("pageInfo")
+    if not isinstance(page, dict) or not isinstance(page.get("hasNextPage"), bool):
+        raise _shape(f"PR {number} review threads have no page info")
+    unresolved = 0
+    unknown = 0
+    for node in nodes:
+        resolved = node.get("isResolved") if isinstance(node, dict) else None
+        if resolved is True:
+            continue
+        if resolved is False:
+            unresolved += 1
+        else:
+            unknown += 1
+    if page["hasNextPage"]:
+        unknown += 1
+    return forge.ReviewThreads(unresolved, unknown, change_requested)
+
+
+def _parse_changed_file(item, number):
+    """One changed-file entry to its path, else ``ForgeError``."""
+    if not isinstance(item, dict):
+        raise _shape(f"PR {number} changed file is not an object: {item!r}")
+    name = item.get("filename")
+    if not isinstance(name, str) or not name:
+        raise _shape(f"PR {number} changed file has no filename: {item!r}")
+    return name
+
+
 class GithubForge:
     """``korapy.forge.Forge`` over ``gh api`` REST calls."""
 
-    def __init__(self, run):
-        """``run(args)`` returns stdout and raises when ``gh`` fails."""
+    def __init__(self, run, pacer=None, graphql_run=None):
+        """``run(args)`` returns stdout and raises when ``gh`` fails.
+
+        ``pacer`` meters the one GraphQL read (the review threads);
+        None reads the machine-wide bucket. ``graphql_run`` runs that
+        read (``gh.run`` by default, so the host shim paces it by its
+        arguments); tests inject a fake alongside the pacer.
+        """
         self._run = run
+        self._pacer = pacer
+        self._graphql_run = gh.run if graphql_run is None else graphql_run
 
     def current_user(self) -> str:
         try:
@@ -380,6 +476,61 @@ class GithubForge:
         except Exception as err:
             raise forge.ForgeError(f"unusable check runs on {head}: {err}") from err
         return _pending_checks(payload, head)
+
+    def review_threads(self, repo: str, number: int) -> forge.ReviewThreads:
+        """One PR's review threads and review decision, as plain data.
+
+        One GraphQL read (resolved state is GraphQL-only), taken only
+        when a merge is evaluated. The shared GraphQL bucket meters
+        it; rate-limit text maps like any other read.
+        """
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        owner, name = repo.split("/", 1)
+        try:
+            data = gh.graphql(
+                _THREADS_QUERY,
+                run=self._graphql_run,
+                pacer=self._pacer,
+                owner=owner,
+                name=name,
+                number=number,
+            )
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"forge unreachable: {err}") from err
+        return _parse_threads(data, number)
+
+    def changed_files(self, repo: str, number: int) -> tuple[str, ...]:
+        """The paths one PR touches, oldest first, as plain data.
+
+        Pages ``pulls/{n}/files`` until a short page ends the list. A
+        missing or malformed page is a ``ForgeError``, never a partial
+        listing: a truncated diff would read tested files as absent
+        and block a ready merge, or worse, read an untested diff as
+        covered.
+        """
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        names: list[str] = []
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._get(f"repos/{repo}/pulls/{number}/files?per_page={PER_PAGE}&page={page}")
+                )
+            except forge.ForgeError:
+                raise
+            except Exception as err:
+                raise forge.ForgeError(f"unusable changed files for PR {number}: {err}") from err
+            if not isinstance(payload, list):
+                raise _shape(f"PR {number} changed files page {page} is not a list")
+            for item in payload:
+                names.append(_parse_changed_file(item, number))
+            if len(payload) < PER_PAGE:
+                return tuple(names)
+            page += 1
 
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
         """Merge PR ``number`` pinned to ``head_sha`` with ``method``.
