@@ -322,6 +322,45 @@ def _skip(candidate, kind, code, reason) -> Gated:
     )
 
 
+def area_refusal(candidate, holders, *, prefix, hold_until_merged=True, fail_open=False):
+    """The area skip reason for a start candidate, else None. Pure.
+
+    `candidate` is the candidate's row and `holders` every row in the
+    same project's driven set, both already read: no tracker, forge,
+    clock or settings access inside. A live claim (managed or foreign)
+    holds, as does an open linked pull while `hold_until_merged`;
+    unreadable pulls (None) hold too, failing closed, unless
+    `fail_open` reads claim-held areas only. The candidate's own row
+    never blocks itself. An empty prefix disables the lock. The reason
+    names the ticket, the area and the holder, so the `--plan` table
+    and the journal read the same words.
+    """
+    if not prefix:
+        return None
+    for holder in holders or ():
+        if holder.repo == candidate.repo and holder.number == candidate.number:
+            continue
+        seen = holder
+        if fail_open and getattr(holder, "pulls", ()) is None:
+            seen = replace(holder, pulls=())
+        area = eligibility.area_hold(
+            candidate, [seen], prefix=prefix, hold_until_merged=hold_until_merged
+        )
+        if area is None:
+            continue
+        ref = f"{candidate.repo}#{candidate.number}"
+        other = f"{holder.repo}#{holder.number}"
+        if getattr(holder, "agent", ""):
+            return f"{ref}: area `{area}` held by {other} (agent `{holder.agent}`), start refused"
+        if getattr(holder, "pulls", ()) is None:
+            return f"{ref}: area {area} possibly held by {other} (pulls unreadable), start refused"
+        opened = [pull for pull in holder.pulls or () if getattr(pull, "state", "") == "open"]
+        if opened:
+            return f"{ref}: area `{area}` held by {other} pull #{opened[0].number}, start refused"
+        return f"{ref}: area `{area}` held by {other}, start refused"
+    return None
+
+
 def gate(
     candidate,
     *,
@@ -338,6 +377,10 @@ def gate(
     agent_tickets=None,
     reviews=None,
     fix_threshold=None,
+    area_rows=(),
+    area_prefix="",
+    area_hold_until_merged=True,
+    area_fail_open=False,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -380,7 +423,15 @@ def gate(
     per repository when the rows were built) is refused: the pull, not
     a new worker, carries the ticket. The row pulls are the one
     linked-pull source the policies read too, so the two never
-    disagree and the check costs no second lookup. A fix or
+    disagree and the check costs no second lookup. Directly after it
+    the area lock refuses kind `start` only (a fix or resume
+    reclassified as a fresh start on an unclaimed row counts as a
+    start) when another ticket in the same project's driven set holds
+    an overlapping label area: a live claim holds, as does an open
+    linked pull while `area_hold_until_merged`, and unreadable pulls
+    hold too, failing closed, unless `area_fail_open` reads claim-held
+    areas only. Claimed resume, fix and review rounds bypass it, and an
+    empty `area_prefix` disables it. A fix or
     resume behind a reviewer holder (from `agent_roles`, resolved to
     its registry entry by ticket through the one resolver, since a
     drive-id holder never names a unit-name entry) skips with the
@@ -530,6 +581,17 @@ def gate(
                 "row",
                 f"{ref}: pull #{opened[0].number} is open, not a fresh start, skipped",
             )
+
+    if kind == "start" and area_prefix:
+        refusal = area_refusal(
+            row,
+            area_rows or (),
+            prefix=area_prefix,
+            hold_until_merged=area_hold_until_merged,
+            fail_open=area_fail_open,
+        )
+        if refusal is not None:
+            return _skip(candidate, kind, "area", refusal)
 
     held = hold.reason(
         read_labels,
@@ -1791,6 +1853,31 @@ def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None, cla
     return by_key
 
 
+def area_configs_for(registered):
+    """Per-project (prefix, hold_until_merged, fail_open). Pure lookup.
+
+    The one resolver both `_gate_all` (gate params, extended fetch
+    set) and the claiming pass (in-pass re-check) read through, so a
+    project setting never resolves twice two ways. A project whose
+    settings fail to load is left out of the map and reads as opted
+    out: the same broken file already fails the pass through the quota
+    settings the main loop resolves for that project, so this reader
+    adds no second problem for the same file.
+    """
+    configs = {}
+    for project in registered:
+        try:
+            resolved = settings.load(root=project.root)
+        except settings.SettingsError:
+            continue
+        configs[project.name] = (
+            resolved["drive.area_prefix"],
+            resolved["drive.area_hold_until_merged"],
+            resolved["drive.area_fail_open"],
+        )
+    return configs
+
+
 def _gate_all(
     items,
     registered,
@@ -1864,7 +1951,11 @@ def _gate_all(
     foreign rows it ignored. Each resolving policy loads once per
     pass: the pulls-less pre-pass and the main loop share the loaded
     policies, so a policy's top-level code runs once per pass.
-    Nothing is written.
+    With a non-empty `drive.area_prefix` a project's lock options
+    resolve through `area_configs_for`, same-project rows whose
+    in-hand labels carry the prefix join the pulls fetch set (reusing
+    the one listing per repository), and the gate refuses overlapping
+    starts with code `area`. Nothing is written.
     """
     if driven is None:
         driven = {}
@@ -1894,6 +1985,7 @@ def _gate_all(
             )
         except eligibility.EligibilityError as problem:
             policy_errors[project.name] = problem
+    area_configs = area_configs_for(registered)
     if index_for is not None:
         wanted: set = set()
         for project in registered:
@@ -1912,6 +2004,19 @@ def _gate_all(
             for key in wanted
             if key[0] in union and pulls_check_needed(pre_by_key.get(key), hold_label=hold_label)
         }
+        if any(prefix for prefix, _, _ in area_configs.values()):
+            for project in registered:
+                prefix = area_configs.get(project.name, ("", True, False))[0]
+                if not prefix:
+                    continue
+                allowed = set(driven.get(project.name, ()))
+                for key, area_row in pre_by_key.items():
+                    if key[0] not in allowed:
+                        continue
+                    if area_row.state != "open" or area_row.external:
+                        continue
+                    if eligibility.area_paths(area_row.labels, prefix=prefix):
+                        fetch_keys.add(key)
         if fetch_keys:
             if pulls_max_calls is None:
                 try:
@@ -1941,6 +2046,7 @@ def _gate_all(
         claims_by_key=claims_by_key,
     )
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
+    area_rows_by_project: dict = {}
     candidates = []
     for project in registered:
         allowed = set(driven.get(project.name, ()))
@@ -1966,11 +2072,13 @@ def _gate_all(
                 file=out,
             )
             continue
+        project_rows = eligibility.rows_from_items(
+            shown, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
+        )
+        area_rows_by_project[project.name] = project_rows
         try:
             requests = policy.eligible(
-                eligibility.rows_from_items(
-                    shown, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
-                ),
+                project_rows,
                 now=now,
             )
         except eligibility.EligibilityError as problem:
@@ -2038,6 +2146,9 @@ def _gate_all(
                     )
                 )
                 continue
+        area_prefix, area_hold_until_merged, area_fail_open = area_configs.get(
+            candidate.project, ("", True, False)
+        )
         verdict = gate(
             candidate,
             read_labels=read_labels,
@@ -2053,6 +2164,10 @@ def _gate_all(
             agent_tickets=agent_tickets,
             reviews=reviews,
             fix_threshold=fix_threshold,
+            area_rows=area_rows_by_project.get(candidate.project, ()),
+            area_prefix=area_prefix,
+            area_hold_until_merged=area_hold_until_merged,
+            area_fail_open=area_fail_open,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -3929,6 +4044,8 @@ def _claim_and_launch(
     events=None,
     hub=None,
     driven,
+    area_rows=None,
+    area_configs=None,
 ):
     """Claim each proceeding candidate, launch each claim.
 
@@ -3989,11 +4106,20 @@ def _claim_and_launch(
     proceeding row for a repo its project does not drive raises
     `ForeignRepoError` (exit 4, naming the repo) instead of claiming
     or starting, in case a future caller bypasses the filter.
+    `area_rows` ({(project, repo, number): row} over the pass rows
+    snapshot) and `area_configs` ({project: (prefix,
+    hold_until_merged, fail_open)} through `area_configs_for`) re-run
+    the area lock for each proceeding start immediately before its
+    fresh claim (before any hub proposal), with the tickets this pass
+    already claimed added as synthetic same-project holders: the
+    second same-area start refuses with code `area` and its claim is
+    never minted. With none the loop claims as before.
     """
     rows: list = []
     started = 0
     blocked = False
     launched: set = set()
+    claimed_areas: list = []
     if driven is None:
         driven = {}
     budgets = load_restarts(restarts_path) if restarts_path is not None else {}
@@ -4517,6 +4643,42 @@ def _claim_and_launch(
                 )
             )
             continue
+        prefix, hold_until_merged, fail_open = (area_configs or {}).get(
+            gated.project, ("", True, False)
+        )
+        if prefix and area_rows is not None:
+            candidate_row = area_rows.get((gated.project, gated.repo, gated.number))
+            if candidate_row is not None:
+                holders = [
+                    holder_row
+                    for (holder_project, _, _), holder_row in area_rows.items()
+                    if holder_project == gated.project
+                ]
+                holders.extend(
+                    synthetic
+                    for synthetic_project, synthetic in claimed_areas
+                    if synthetic_project == gated.project
+                )
+                refusal = area_refusal(
+                    candidate_row,
+                    holders,
+                    prefix=prefix,
+                    hold_until_merged=hold_until_merged,
+                    fail_open=fail_open,
+                )
+                if refusal is not None:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind="start",
+                            verdict="skip",
+                            reason=refusal,
+                            code="area",
+                        )
+                    )
+                    continue
         agent, title, skipped = _fresh_claim(
             store,
             gated,
@@ -4530,6 +4692,9 @@ def _claim_and_launch(
         if skipped is not None:
             rows.append(skipped)
             continue
+        base = (area_rows or {}).get((gated.project, gated.repo, gated.number))
+        if base is not None and prefix:
+            claimed_areas.append((gated.project, replace(base, agent=agent, pulls=())))
         if launcher is None:
             rows.append(
                 Gated(
@@ -5218,6 +5383,15 @@ def _launching_pass(
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=err)
             return finish(USAGE)
+    area_configs = area_configs_for(registered)
+    area_base = _released_rows(_items, freed, claims_by_key=claims_by_key)
+    area_driven = driven if driven is not None else {}
+    area_rows: dict = {}
+    for project in registered:
+        allowed = set(area_driven.get(project.name, ()))
+        for (repo, number), area_row in area_base.items():
+            if repo in allowed:
+                area_rows[(project.name, repo, number)] = area_row
     try:
         final_rows, started, blocked, launched = _claim_and_launch(
             store,
@@ -5242,6 +5416,8 @@ def _launching_pass(
             events=events if journal_path is not None else None,
             hub=hub,
             driven=driven,
+            area_rows=area_rows,
+            area_configs=area_configs,
         )
     except HubConfigError as problem:
         print(f"korapy drive: {problem}", file=err)
