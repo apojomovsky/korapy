@@ -44,6 +44,7 @@ from korapy import (
     boardsweep,
     disk,
     eligibility,
+    freeze,
     hold,
     host_ledger,
     launch,
@@ -764,15 +765,55 @@ def log_event(path, event):
     paths.atomic_write_text(path, "".join(line + "\n" for line in live))
 
 
-def pause_reason(path):
-    """The pause file's first line, None when the file is absent."""
+def pause_reason(path, freeze_path=None):
+    """The effective pause reason: the pause file, else the freeze, else None.
+
+    One resolver for every reader: the dispatch pass, the snapshot and
+    the dashboard all ask here, so a freeze holds the same pause with
+    no second flag. The operator pause wins when both stand.
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
     except FileNotFoundError:
-        return None
-    first = text.splitlines()[0].strip() if text.splitlines() else ""
-    return first if first else "paused by operator"
+        pass
+    else:
+        first = text.splitlines()[0].strip() if text.splitlines() else ""
+        return first if first else "paused by operator"
+    if freeze_path is not None:
+        return freeze.active_reason(freeze_path)
+    return None
+
+
+def _freeze_item_state(tracker_factory):
+    """Item states through the pass's tracker factory, for the until gate."""
+
+    def item_state(repo, number):
+        return tracker_factory(repo).item(repo, number).state
+
+    return item_state
+
+
+def _release_freeze(freeze_path, pause_path, tracker_factory, out):
+    """End a freeze whose until tickets all read merged. True when released.
+
+    Read-only when no freeze stands, when it names no gate, or when no
+    tracker factory can check the gate: then the pause holds. A merged
+    gate removes the freeze (and the pause it owns); the pass then
+    re-reads the pause file, so an operator pause still holds it.
+    An unreadable or half-removed freeze keeps the pause, so the next
+    pass retries instead of starting on broken state.
+    """
+    try:
+        record = freeze.read_freeze(freeze_path)
+    except freeze.FreezeError:
+        return False
+    if record is None or not record["until"] or tracker_factory is None:
+        return False
+    if not freeze.try_release(freeze_path, pause_path, _freeze_item_state(tracker_factory)):
+        return False
+    print(f"freeze ended: {', '.join(record['until'])} merged, resuming", file=out)
+    return True
 
 
 def read_day_count(path, today):
@@ -823,12 +864,16 @@ def check_lock(path):
     return False
 
 
-def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_path):
+def drive_status(
+    *, now, max_starts, journal_path, pause_path, freeze_path=None, day_path, lock_path
+):
     """The `snapshot` drive section from host state (pure reads).
 
     Raises JournalError when the journal is missing or corrupt, so the
     section reports a section error instead of crashing. A missing day
-    counter reads as zero starts; a corrupt one raises too.
+    counter reads as zero starts; a corrupt one raises too. A corrupt
+    freeze file never raises here: the section reports it as an
+    unreadable freeze holding the pause, so the dashboard names it.
     """
     try:
         with open(journal_path, encoding="utf-8") as handle:
@@ -884,7 +929,25 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
             )
     today = _day_string(now)
     used = read_day_count(day_path, today)
-    reason = pause_reason(pause_path)
+    frozen = False
+    freeze_until: list = []
+    freeze_error = None
+    try:
+        reason = pause_reason(pause_path, freeze_path)
+        if freeze_path is not None:
+            record = freeze.read_freeze(freeze_path)
+            if record is not None:
+                frozen = True
+                freeze_until = list(record["until"])
+    except freeze.FreezeError as err:
+        frozen = True
+        freeze_error = str(err)
+        try:
+            reason = pause_reason(pause_path)
+        except OSError:
+            reason = None
+        if reason is None:
+            reason = f"freeze unreadable: {err}"
     return {
         "last_pass_at": tail[0]["at"],
         "last_exit": end["exit"] if end is not None else None,
@@ -892,6 +955,10 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
         "paused": reason is not None,
         "pause_reason": reason,
         "pause_file": PAUSE_NAME,
+        "frozen": frozen,
+        "freeze_until": freeze_until,
+        "freeze_file": freeze.FREEZE_NAME,
+        "freeze_error": freeze_error,
         "starts_today": used,
         "starts_remaining": max(0, max_starts - used),
         "max_starts_per_day": max_starts,
@@ -5698,6 +5765,7 @@ def run_pass(
     finished_for=None,
     journal_path=None,
     pause_path=None,
+    freeze_path=None,
     day_path=None,
     max_starts=None,
     hub_epoch_of=None,
@@ -5760,8 +5828,12 @@ def run_pass(
     readiness resolve holders through: a claim's holder id never names
     its unit-name entry. The plan pass reads it too, so `--plan`
     prints the same reviewer-holder skips. When `pause_path` names an
-    existing pause file, either pass reports it and exits 1, starting
-    nothing. When `journal_path` is set, the non-plan pass journals its
+    existing pause file, or `freeze_path` a standing freeze, either
+    pass reports it and exits 1, starting nothing; the non-plan pass
+    first ends a freeze whose until tickets all read merged, through
+    `tracker_factory`, and then runs; a pause file the freeze did not
+    own still holds the pass. A plan never releases, so a dry
+    run changes nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
     `max_starts` are set, starts beyond the day's budget become `cap`
     skips and the pass ends with exit 1. `review_reader`
@@ -5798,13 +5870,24 @@ def run_pass(
     moment = time.time() if now is None else now
     if pause_path is not None:
         try:
-            reason = pause_reason(pause_path)
-        except OSError as problem:
+            reason = pause_reason(pause_path, freeze_path)
+        except (OSError, freeze.FreezeError) as problem:
             print(f"korapy drive: cannot read the pause file: {problem}", file=err)
             return USAGE
         if reason is not None:
-            print(f"korapy drive: paused: {reason}", file=err)
-            return NO
+            if (
+                not plan
+                and freeze_path is not None
+                and _release_freeze(freeze_path, pause_path, tracker_factory, out)
+            ):
+                try:
+                    reason = pause_reason(pause_path)
+                except (OSError, freeze.FreezeError) as problem:
+                    print(f"korapy drive: cannot read the pause file: {problem}", file=err)
+                    return USAGE
+            if reason is not None:
+                print(f"korapy drive: paused: {reason}", file=err)
+                return NO
     args = {
         "now": moment,
         "projects_fn": projects_fn,
