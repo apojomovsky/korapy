@@ -986,16 +986,17 @@ def _check_profile_shadows(state: ProfileState) -> list[Check]:
 
 
 def _check_profile_default(state: ProfileState) -> list[Check]:
-    """The `profile-default` note: a launch with no selection would use
-    the built-in default while profiles are declared.
+    """The `profile-default` row: a launch with no selection would fail.
 
-    Warns only when declarations validate, at least one profile is
-    declared, no `[profiles.default]` table exists, and no layer-6
-    selection (local or committed) names a default: then an unselected
-    launch silently runs the built-in runtime instead of a declared
-    setup. A warn, never a fail: the launch path resolves the same way.
+    There is no shipped default, so the launch fails fast (exit 4) naming
+    the fix, and the doctor fails the same way: the operator sees the
+    refusal here instead of at launch time. Fails when declarations
+    validate yet no layer-6 value stands: no `[profiles.default]` table,
+    no local default and no committed default. A fail, never a warn: the
+    launch path resolves the same way through `profiles.resolve`. With no
+    profiles declared at all every launch fails, so that fails too.
     """
-    if state.error is not None or not state.parsed:
+    if state.error is not None:
         return []
     if profiles.declared_default(state.parsed) is not None:
         return []
@@ -1007,19 +1008,14 @@ def _check_profile_default(state: ProfileState) -> list[Check]:
         return []
     if selections is None:
         return []
-    count = len(state.parsed)
-    return [
-        Check(
-            "profile-default",
-            "warn",
-            f"{count} declared profile(s) but no default selected: "
-            "a launch with no profile selection uses the built-in default "
-            f"(runtime {profiles.BUILTIN_DEFAULT.runtime})",
-            "declare [profiles.default] with a runtime, or select a default "
-            "(`korapy profile set --global NAME` or committed `profile.default`), "
-            "then run `korapy doctor` again",
+    if state.parsed:
+        detail = (
+            f"{len(state.parsed)} declared profile(s) but no default selected: "
+            "a launch with no profile selection fails (exit 4)"
         )
-    ]
+    else:
+        detail = "no profiles declared: a launch with no profile selection fails (exit 4)"
+    return [Check("profile-default", "fail", detail, profiles.MISSING_DEFAULT_FIX)]
 
 
 def check_profiles(state: ProfileState, dep_results) -> list[Check]:
@@ -1028,9 +1024,9 @@ def check_profiles(state: ProfileState, dep_results) -> list[Check]:
     Pure over the readings in `state`: declarations validate, every
     selection, pin, override and committed default names a declared
     profile, every referenced runtime resolves, an expired override
-    fails until reset, and an unselected default over declared profiles
-    warns. Unknown runtime, missing binary and expiry fail; a shadowed
-    name is a note.
+    fails until reset, and a missing default over declared profiles (or
+    over none at all) fails naming the fix. Unknown runtime, missing
+    binary, expiry and a missing default fail; a shadowed name is a note.
     """
     if state.error is not None:
         return [

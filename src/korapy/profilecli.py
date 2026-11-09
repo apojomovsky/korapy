@@ -80,7 +80,7 @@ def render_list(rows, json_mode: bool = False) -> str:
         return "no profiles declared\n"
     lines = []
     for row in rows:
-        head = f"{row['name']}: runtime={row['runtime']} from {row['source'] or 'built-in'}"
+        head = f"{row['name']}: runtime={row['runtime']} from {row['source'] or 'unknown'}"
         if row["shadowed"] is not None:
             head += f" (shadows {row['shadowed']})"
         lines.append(head)
@@ -159,8 +159,6 @@ def _layer_line(entry) -> str:
     head = f"  {entry['layer']} {entry['name']}:"
     if entry["state"] == "absent":
         return f"{head} absent"
-    if entry["profile"] is None:
-        return f"{head} (built-in default) [{entry['state']}] from {entry['source']}"
     line = f"{head} {entry['profile']!r} [{entry['state']}]"
     if entry["source"]:
         line += f" from {entry['source']}"

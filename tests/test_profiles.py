@@ -232,25 +232,21 @@ class BuiltinDefault(unittest.TestCase):
         parsed = profiles.validate({"slim": raw_profile("omp")}, ["provider-a"])
         self.assertIsNone(profiles.declared_default(types.MappingProxyType(dict(parsed))))
 
-    def test_the_builtin_default_keeps_the_shipped_default_runtime(self):
-        self.assertEqual(profiles.DEFAULT_PROFILE_NAME, "default")
-        self.assertEqual(profiles.BUILTIN_DEFAULT.name, "default")
-        self.assertEqual(profiles.BUILTIN_DEFAULT.runtime, runtimes.DEFAULT_RUNTIME)
-        self.assertIn(profiles.BUILTIN_DEFAULT.runtime, runtimes.NAMES)
+    def test_the_missing_default_fix_names_the_declaration_and_an_example(self):
+        self.assertIn("[profiles.default]", profiles.MISSING_DEFAULT_FIX)
+        self.assertIn("profile.default", profiles.MISSING_DEFAULT_FIX)
+        self.assertIn('runtime = "muse"', profiles.MISSING_DEFAULT_FIX)
 
-    def test_the_builtin_default_validates_cleanly(self):
+    def test_a_declared_muse_table_validates_cleanly(self):
         raw = {
-            profiles.BUILTIN_DEFAULT.name: {
-                "runtime": profiles.BUILTIN_DEFAULT.runtime,
-                "models": {
-                    role: {"chain": list(chain)}
-                    for role, chain in profiles.BUILTIN_DEFAULT.models.items()
-                },
-                "options": dict(profiles.BUILTIN_DEFAULT.options),
+            "default": {
+                "runtime": "muse",
+                "models": {"default": {"chain": ["provider-a/model-x"]}},
+                "options": {},
             }
         }
         parsed = profiles.validate(raw, ["provider-a", "provider-b"])
-        self.assertEqual(parsed["default"], profiles.BUILTIN_DEFAULT)
+        self.assertEqual(parsed["default"].runtime, "muse")
 
 
 class AdapterSchemas(unittest.TestCase):

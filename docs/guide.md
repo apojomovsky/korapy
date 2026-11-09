@@ -91,6 +91,8 @@ What you should see is one row per check, `ok`, `warn` (`!`) or `fail`
 ✓ resources-foreign: no foreign claims
 ✓ profiles: no profiles declared
 ✓ profile-runtimes: no profile references a runtime
+✗ profile-default: no profiles declared: a launch with no profile selection fails (exit 4)
+  fix: declare [profiles.default] with a runtime, e.g. [profiles.default] runtime = "muse", or select a default with `korapy profile set --global NAME` or committed `profile.default`
 ```
 
 `doctor` exits 0 when every row is ok or warn, 1 on a failing check,
@@ -101,6 +103,9 @@ report as one document. Read `✓` as healthy, `!` as usable but open
 `✗` as stop and run the `fix:` line. On a host where the timer is
 not installed yet, the `drive-timer` row reads warn (`not installed`)
 instead of ok; it turns ok after `korapy drive install-timer` below.
+The `profile-default` fail above is the normal first-run state for a
+project with no declared profile yet: `korapy init` (below) writes the
+`[profiles.default]` table, and the row turns ok on the next run.
 
 Know where korapy keeps things:
 
@@ -280,14 +285,17 @@ remote when unset); `tracker.variant` is `labels` or `board`. A board
 entry adds a `[repo.board]` table mapping the project board, written
 by `korapy github setup`, never by hand.
 
-Profiles select the runtime and model chains per ticket and role:
+Profiles select the runtime and model chains per ticket and role.
+Every project declares its own default (`korapy init` writes this for
+you); there is no shipped default, so a launch with no declared or
+selected profile fails fast instead of running a setup nobody chose:
 
 ```toml
 [profile]
 default = "default"
 
 [profiles.default]
-runtime = "omp"
+runtime = "muse"
 
 [profiles.default.models.default]
 chain = ["provider-a/model-x"]

@@ -134,11 +134,14 @@ each adapter's `options_schema()` for options. Every reader of
 profiles goes through it; a launch that resolves an invalid profile
 fails with exit 4 before anything is made (no worktree, no unit).
 
-The built-in `default` profile is defined once, hardcoded in
-`profiles.py`: the shipped default setup (runtime `omp` with no chains
-or options of its own, per `runtimes.DEFAULT_RUNTIME`: one fact, one
-place). Layer 6 falls back to it only when no `[profiles.default]`
-table is declared, so resolution always succeeds.
+There is no shipped default profile, on purpose. A config with no
+declared or selected profile fails fast at resolution (exit 4) naming
+the `[profiles.default]` table to declare, instead of running a setup
+nobody chose: a silent fallback would launch workers on the wrong
+runtime (and the wrong quota) with no warning, which is exactly the
+failure this rule removes. `runtimes.DEFAULT_RUNTIME` stays only as the
+recorded-runtime fallback for sessions launched before recording, never
+as a launch fallback.
 
 ## 2. Scopes and precedence
 
@@ -153,7 +156,7 @@ layer, and provenance always names both the layer and the source.
 | 3 | temp | temporary override with `until` (section 4) | local |
 | 4 | project | local per-project selection; else the repo's committed default | local wins, committed fallback |
 | 5 | role | local per-role selection; else the committed per-role default | local wins, committed fallback |
-| 6 | default | local `profile.default`; else the committed default; else the declared `[profiles.default]`; else the built-in `default` | local wins, committed fallback |
+| 6 | default | local `profile.default`; else the committed default; else the declared `[profiles.default]`; else fail (exit 4, no shipped default) | local wins, committed fallback |
 
 Concretely:
 
@@ -172,10 +175,11 @@ Concretely:
   that reads `profiles.toml` and the only module that maps layers to a
   profile.
 - The committed defaults are three small keys: `profile.default` (the
-  global default name, built-in `"default"`), `[[repo]] profile` (the
+  global default name), `[[repo]] profile` (the
   repo default), and `[role.<name>] profile` (the per-role default,
   e.g. reviewer). Each is optional; an absent key falls through to the
-  next layer.
+  next layer, and an empty layer 6 fails closed (exit 4): no key restores
+  a shipped default.
 - The resolver is a pure function over plain data,
   `profiles.resolve(declarations, selections, ticket_assignment, *,
   repo, role, number, now)`, returning `(Profile, Provenance)`. All I/O
@@ -288,11 +292,12 @@ Exit codes follow AGENTS.md (meanings unchanged):
 | ticket already live, lost race (launch path, unchanged) | 2 |
 | tracker unreachable while the ticket layer needs a live read | 3 |
 | unknown profile name, unknown runtime, unknown option key, bad duration, override conflict, ticket assignment naming an unknown profile, runtime binary missing | 4, naming the value and the fix |
+| no layer selects a profile (no flag, ticket, override, project, role or default value) | 4, naming `[profiles.default]` and the two default selections |
 | every provider on the resolved chain exhausted | 75 (unchanged `models.Exhausted`) |
 
 Doctor checks (each failing line names the fix; unknown runtime,
-missing binary and expired override fail, the rest are notes until the
-rollout tickets say otherwise):
+missing binary, expired override and a missing default fail, the rest
+are notes):
 
 - every declared profile validates (section 1); unknown runtime and
   unknown option key fail here too, before any launch;
@@ -304,6 +309,9 @@ rollout tickets say otherwise):
   profile; a dangling reference fails;
 - an expired override is still on disk: fails until
   `profile reset --temp` (visibility, per section 4);
+- a launch with no selection would hit the missing default: fails naming
+  `[profiles.default]` and the two default selections, the same refusal
+  the launch would print;
 - a shadowed `[profiles.<name>]` (local over committed) is listed as a
   note with both sources.
 
@@ -369,6 +377,7 @@ the tests pin this with a case per row.
 | runtime binary missing at launch | 4 | refused with the doctor's install hint; nothing started |
 | ticket assignment names an undeclared profile | 4 | launch refused; the claim stands, the ticket waits for a human |
 | tracker assignment and local pin disagree | 4 | launch refused naming both sources |
+| no layer selects a profile | 4 | launch refused naming `[profiles.default]` and the two default selections; doctor fails the same way |
 | `profile set --ticket` with `--temp` / `--until` | 4 | refused: layer 3 can never beat the layer-2 ticket assignment; names the shadowing layer and the fix (clear the ticket assignment or pin first) |
 | a second temporary override while one stands | 0 | setting it replaces the first, and `set` names what it replaced; a hand-edited file carrying two `[override]` tables is refused with exit 4 |
 | expired override still on disk | 1 from doctor | resolver already ignores it; `reset --temp` clears it |

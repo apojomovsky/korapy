@@ -169,19 +169,21 @@ class SettingsCarriage(unittest.TestCase):
 
 
 class SelectionGate(unittest.TestCase):
-    def test_no_declarations_and_no_flag_resolves_the_builtin_default(self):
+    def test_no_declarations_and_no_flag_fails_fast_naming_the_fix(self):
         tgt = target(resolve(project={}))
         store = FakeStore()
-        found = select(tgt, store=store)
-        self.assertEqual(found.profile, profiles.BUILTIN_DEFAULT)
-        self.assertEqual(found.runtime, profiles.BUILTIN_DEFAULT.runtime)
-        self.assertEqual(found.provenance.layer, 6)
+        with self.assertRaises(settings.SettingsError) as ctx:
+            select(tgt, store=store)
+        message = str(ctx.exception)
+        self.assertIn("[profiles.default]", message)
+        self.assertIn("profile.default", message)
+        self.assertIn('runtime = "muse"', message)
 
     def test_no_declarations_and_no_flag_never_touches_the_store(self):
         tgt = target(resolve(project={}))
         store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
-        found = select(tgt, store=store)
-        self.assertEqual(found.profile, profiles.BUILTIN_DEFAULT)
+        with self.assertRaises(settings.SettingsError):
+            select(tgt, store=store)
         self.assertEqual(store.calls, [])
 
     def test_a_flag_with_no_declarations_still_refuses_an_unknown_name(self):

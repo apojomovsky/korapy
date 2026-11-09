@@ -488,6 +488,15 @@ class RunVerb(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("--repo", err)
 
+    def test_show_with_no_declarations_is_exit_4_naming_the_fix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = self.run_cli(
+                ["profile", "show"], tmp, settings_fn=lambda: (resolved(), None)
+            )
+        self.assertEqual(code, 4)
+        self.assertIn("[profiles.default]", err)
+        self.assertIn("profile.default", err)
+
     def test_show_with_a_dangling_global_selection_is_exit_4(self):
         # The old test passed --profile to show, which has no such flag,
         # so argparse's unrecognized-arguments rejection (exit 4) fired
