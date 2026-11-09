@@ -258,14 +258,40 @@ class GateInput:
 #: closed or missing milestones sort last, where priority decides.
 _MILESTONE_LAST: tuple = (2, "", ())
 
+#: A stored milestone due date counts as dated only in this shape: the
+#: full UTC timestamp the tracker sync writes. Anything else fails
+#: closed to dateless, so string compare always orders chronologically.
+_DUE_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
+
+
+def _due_is_iso(due) -> bool:
+    """Whether a stored milestone due date is a real UTC timestamp. Pure.
+
+    The one check for the shape `row_milestone` normalizes on, shared
+    with the plan reasons that name a stored value failing it.
+    """
+    if not isinstance(due, str):
+        return False
+    match = _DUE_RE.fullmatch(due)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = map(int, match.groups())
+    try:
+        datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False
+    return True
+
 
 def row_milestone(row) -> tuple[str | None, str | None, bool]:
     """``(title, due_on, closed)`` for a policy row. Pure.
 
     The one reader for the milestone the tracker carried on the row's
     extra, shared by the milestone sort and the plan reasons. Only a
-    non-blank title counts; a missing concept, odd data, or an empty
-    title reads as no milestone, so ordering never raises.
+    non-blank title counts, and only a full ISO UTC timestamp counts
+    as dated; a missing concept, odd data, an empty title, or a due
+    date outside that shape reads as no milestone (or no due date),
+    so ordering never raises.
     """
     extra = getattr(row, "extra", None)
     if not isinstance(extra, dict):
@@ -274,9 +300,22 @@ def row_milestone(row) -> tuple[str | None, str | None, bool]:
     if not isinstance(title, str) or not title.strip():
         return None, None, False
     due = extra.get("milestone_due")
-    if not isinstance(due, str) or not due:
+    if not _due_is_iso(due):
         due = None
     return title, due, bool(extra.get("milestone_closed"))
+
+
+def _stored_due(row):
+    """The raw stored milestone due value, even when outside ISO shape. Pure.
+
+    A diagnostic for the plan reasons: `row_milestone` normalizes a
+    bad value to no due date for the sort, and the reason names the
+    stored value through here. Missing stays missing (``None``).
+    """
+    extra = getattr(row, "extra", None)
+    if not isinstance(extra, dict):
+        return None
+    return extra.get("milestone_due")
 
 
 def _natural_key(title: str) -> tuple:
@@ -304,9 +343,10 @@ def milestone_sort_key(row) -> tuple:
     Open milestones with a due date come first (earliest due date,
     ties by version title), then open milestones without one (lowest
     version title), then closed or missing milestones last (priority
-    decides among them). Due dates compare as ISO strings, which order
-    chronologically; only a non-blank title counts, and odd data reads
-    as no milestone, so ordering never raises.
+    decides among them). `row_milestone` admits only full ISO UTC
+    timestamps as dated, so the string compare orders chronologically;
+    only a non-blank title counts, and odd data reads as no milestone,
+    so ordering never raises.
     """
     title, due, closed = row_milestone(row)
     if title is None or closed:
@@ -314,6 +354,49 @@ def milestone_sort_key(row) -> tuple:
     if due is None:
         return (1, "", _natural_key(title))
     return (0, due, _natural_key(title))
+
+
+def _today_key(item) -> tuple:
+    """Today's section 3 key for one candidate. Pure.
+
+    The one place resolving it: `order` sorts every candidate by this
+    first, so other projects keep today's order byte-for-byte.
+    """
+    return (
+        KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
+        -priority_rank(item.row.priority if item.row is not None else ""),
+        item.wait,
+        item.project,
+        item.request.repo
+        if item.request is not None
+        else (item.row.repo if item.row is not None else ""),
+        item.request.number
+        if item.request is not None
+        else (item.row.number if item.row is not None else 0),
+    )
+
+
+def _milestone_key(item) -> tuple:
+    """The milestone-first key for one opted-in candidate. Pure.
+
+    Required kinds still group first; then the milestone component
+    (earliest due date, then version title, unmilestoned and
+    closed-milestone last), then the priority rank, the wait, and the
+    repo and number for determinism. The project is constant inside
+    one project's re-sort, so it stays out of the key.
+    """
+    return (
+        KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
+        milestone_sort_key(item.row) if item.row is not None else _MILESTONE_LAST,
+        -priority_rank(item.row.priority if item.row is not None else ""),
+        item.wait,
+        item.request.repo
+        if item.request is not None
+        else (item.row.repo if item.row is not None else ""),
+        item.request.number
+        if item.request is not None
+        else (item.row.number if item.row is not None else 0),
+    )
 
 
 def order(entries: Sequence[GateInput], *, milestone_first=frozenset()) -> list[GateInput]:
@@ -325,29 +408,23 @@ def order(entries: Sequence[GateInput], *, milestone_first=frozenset()) -> list[
     kind; missing rows sort with unknown priority and zero wait.
     `milestone_first` names the projects whose candidates instead
     order by milestone first (earliest due date, then version title,
-    unmilestoned and closed-milestone last) ahead of the priority rank;
-    every other candidate keeps today's key exactly, so with the
-    setting off the order is byte-identical to the plain call.
+    unmilestoned and closed-milestone last) ahead of the priority rank,
+    but only among that project's own candidates: each opted-in
+    project's entries re-sort by the milestone key into the slots
+    today's order gives them, and every other candidate stays exactly
+    where today puts it. With the setting off the order is byte-identical
+    to the plain call.
     """
     opted = set(milestone_first or ())
-    return sorted(
-        entries,
-        key=lambda item: (
-            KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
-            milestone_sort_key(item.row)
-            if item.row is not None and item.project in opted
-            else _MILESTONE_LAST,
-            -priority_rank(item.row.priority if item.row is not None else ""),
-            item.wait,
-            item.project,
-            item.request.repo
-            if item.request is not None
-            else (item.row.repo if item.row is not None else ""),
-            item.request.number
-            if item.request is not None
-            else (item.row.number if item.row is not None else 0),
-        ),
-    )
+    ranked = sorted(entries, key=_today_key)
+    staged = {}
+    for project in opted:
+        group = [item for item in ranked if item.project == project]
+        if group:
+            staged[project] = iter(sorted(group, key=_milestone_key))
+    if not staged:
+        return ranked
+    return [next(staged[item.project]) if item.project in staged else item for item in ranked]
 
 
 @dataclass(frozen=True)
@@ -2645,11 +2722,14 @@ def _gate_all(
     in-hand labels carry the prefix join the pulls fetch set (reusing
     the one listing per repository), and the gate refuses overlapping
     starts with code `area`. With `eligibility.milestone_first` on for
-    a project, that project's candidates post-sort by milestone
+    a project, that project's own candidates post-sort by milestone
     (earliest due date, then version title, unmilestoned and
-    closed-milestone last) ahead of the priority rank, and every gated
-    row for the project names its milestone in the reason, so `--plan`
-    shows it. Nothing is written.
+    closed-milestone last) ahead of the priority rank, while rows for
+    every other project keep today's order exactly; every gated row
+    for the opted-in project names its milestone in the reason
+    (`milestone none` for unmilestoned rows, and a bad-due note when
+    the stored due date is outside ISO shape), so `--plan` shows it.
+    Nothing is written.
     """
     if driven is None:
         driven = {}
@@ -2871,7 +2951,12 @@ def _gate_all(
                 suffix = f"; milestone {title}"
                 if closed:
                     suffix += " (closed)"
+                raw_due = _stored_due(candidate.row)
+                if raw_due is not None and raw_due != "" and not _due_is_iso(raw_due):
+                    suffix += f" (bad due {raw_due})"
                 verdict = replace(verdict, reason=verdict.reason + suffix)
+            else:
+                verdict = replace(verdict, reason=verdict.reason + "; milestone none")
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)

@@ -170,13 +170,16 @@ the drive loop to break.
 A project that wants the current release first opts in per project
 with `eligibility.milestone_first` (default in [`configuration.md`](configuration.md)). The selection stays
 `basic`'s; only the order changes: the pass post-sorts that
-project's candidates by milestone (earliest due date, then version
+project's own candidates by milestone (earliest due date, then version
 title, unmilestoned and closed-milestone last), by priority within a
 milestone, and by (repo, number) after that, leaving the required
-kinds first. The milestone (title, due date, closed flag) rides the
-tracker row from the existing issue listing, so the pass spends no
-new GitHub calls, and every gated row for the project names its
-milestone in the reason, so `drive --plan` shows it. With the
+kinds first. The reorder stays inside the opted-in project: rows for
+every other project keep today's order exactly. The milestone (title,
+due date, closed flag) rides the tracker row from the existing issue
+listing, so the pass spends no new GitHub calls, and every gated row
+for the project names its milestone in the reason (`milestone none`
+for unmilestoned rows; a stored due date outside ISO shape reads as
+no due date and is named), so `drive --plan` shows it. With the
 setting off the order is exactly today's.
 
 A project with its own board rules writes a small policy instead. A

@@ -190,6 +190,63 @@ class MilestoneOrderTest(unittest.TestCase):
             [("app", 1), ("app", 2), ("app", 3)],
         )
 
+    def test_opted_in_backlog_does_not_jump_other_projects_urgent(self):
+        # Blue opts in with a backlog ticket on a dated milestone; green
+        # stays out with an urgent unmilestoned ticket. Milestone-first
+        # reorders only within blue, so green's urgent still leads: the
+        # full order matches today's (setting-off) order exactly.
+        entries = [
+            candidate(
+                "blue",
+                "start",
+                row(1, priority="backlog", extra=milestone_extra("M1", DUE_EARLY)),
+            ),
+            candidate("green", "start", row(2, priority="urgent")),
+        ]
+        self.assertEqual(
+            ordered(entries, milestone_first={"blue"}),
+            [("app", 2), ("app", 1)],
+        )
+        self.assertEqual(
+            ordered(entries, milestone_first={"blue"}),
+            ordered(entries, milestone_first=set()),
+        )
+
+    def test_milestone_reorders_only_within_the_opted_in_project(self):
+        # Blue's own tickets swap by milestone while green's urgent keeps
+        # the slot today's order gives it: green never moves.
+        entries = [
+            candidate("blue", "start", row(1, priority="urgent")),
+            candidate(
+                "blue",
+                "start",
+                row(2, priority="backlog", extra=milestone_extra("M1", DUE_EARLY)),
+            ),
+            candidate("green", "start", row(3, priority="urgent")),
+        ]
+        self.assertEqual(
+            ordered(entries, milestone_first={"blue"}),
+            [("app", 2), ("app", 3), ("app", 1)],
+        )
+
+    def test_invalid_due_date_sorts_as_dateless(self):
+        # "2026-1-2" string-compares before "2026-12-01...", so without
+        # validation it would wrongly lead. Fail closed: it reads as no
+        # due date and sorts behind every dated milestone.
+        entries = [
+            candidate(
+                "blue",
+                "start",
+                row(1, priority="normal", extra=milestone_extra("M9", "2026-1-2")),
+            ),
+            candidate(
+                "blue",
+                "start",
+                row(2, priority="normal", extra=milestone_extra("M1", "2026-12-01T00:00:00Z")),
+            ),
+        ]
+        self.assertEqual(ordered(entries, milestone_first={"blue"}), [("app", 2), ("app", 1)])
+
     def test_setting_off_ignores_milestones(self):
         entries = [
             candidate("blue", "start", row(1, priority="urgent")),
@@ -266,6 +323,15 @@ class MilestoneInfoTest(unittest.TestCase):
 
     def test_malformed_milestone_fails(self):
         for milestone in ({"title": ""}, {"title": 3}, {"title": "M1", "due_on": 5}):
+            with self.subTest(milestone=milestone):
+                with self.assertRaises(iface.TrackerError):
+                    ghtracker.milestone_info_of({"milestone": milestone})
+
+    def test_blank_title_fails_like_a_missing_title(self):
+        # A whitespace-only title syncs no milestone the pass can read
+        # (the row reader strips it), so the sync rejects it the same
+        # way it rejects every other malformed milestone.
+        for milestone in ({"title": " "}, {"title": "   "}, {"title": "\t"}):
             with self.subTest(milestone=milestone):
                 with self.assertRaises(iface.TrackerError):
                     ghtracker.milestone_info_of({"milestone": milestone})
@@ -349,7 +415,7 @@ class MilestoneGateTest(unittest.TestCase):
         )
         self.assertIn("; milestone M1", gated[0].reason)
         self.assertIn("; milestone M2", gated[1].reason)
-        self.assertNotIn("milestone", gated[2].reason)
+        self.assertIn("; milestone none", gated[2].reason)
 
     def test_setting_off_is_todays_order_with_plain_reasons(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-ms-gate-"))
@@ -423,7 +489,41 @@ class MilestonePlanTest(unittest.TestCase):
         self.assertIn("app#1", lines[2])
         self.assertIn("; milestone M1", lines[0])
         self.assertIn("; milestone M2", lines[1])
-        self.assertNotIn("milestone", lines[2])
+        self.assertIn("; milestone none", lines[2])
+
+    def test_invalid_due_date_is_named_in_the_reason(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-ms-plan-"))
+        store = board.open_store(os.path.join(tmp, "board.sqlite"))
+        self.addCleanup(store.close)
+        for number, priority, extra in (
+            (1, "normal", milestone_extra("M9", "2026-1-2")),
+            (2, "normal", milestone_extra("M1", "2026-12-01T00:00:00Z")),
+            (3, "backlog", {}),
+        ):
+            store.upsert_item(
+                board_item("app", number, priority=priority, extra=extra),
+                operators=["operator"],
+                now=1000.0,
+            )
+        project = milestone_project(tmp)
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            os.path.join(tmp, "drive.lock"),
+            out,
+            err,
+            plan=True,
+            found=[project],
+            driven={"blue": frozenset({"app"})},
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        lines = [line for line in text.splitlines() if line.startswith("blue app#")]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("app#2", lines[0])
+        self.assertIn("app#1", lines[1])
+        self.assertIn("; milestone M9 (bad due 2026-1-2)", lines[1])
+        self.assertIn("; milestone none", lines[2])
 
     def test_plan_without_the_setting_hides_milestones(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-ms-plan-"))

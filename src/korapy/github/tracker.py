@@ -117,7 +117,7 @@ def milestone_info_of(payload) -> tuple[str | None, str | None, bool]:
     if not isinstance(milestone, dict):
         raise _fail(f"bad milestone {milestone!r}")
     title = milestone.get("title")
-    if not isinstance(title, str) or not title:
+    if not isinstance(title, str) or not title.strip():
         raise _fail(f"bad milestone {milestone!r}")
     due = milestone.get("due_on")
     if due is not None and not isinstance(due, str):
