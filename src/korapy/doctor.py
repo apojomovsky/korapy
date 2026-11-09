@@ -29,7 +29,6 @@ from korapy import (
     admission,
     boarddoctor,
     deps,
-    detect,
     drive,
     freeze,
     heavy,
@@ -50,6 +49,7 @@ from korapy import (
     resourcedoctor,
     resources,
     settings,
+    syncli,
     units,
 )
 from korapy import board as store
@@ -1331,12 +1331,15 @@ def production_board_issue_refs(board_config: settings.BoardConfig) -> object:
     return trackers.board_issue_refs_for(board_config, run=gh.run)
 
 
-def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
+def load_board_sites(settings_error: str | None, *, git) -> tuple[tuple, str | None]:
     """Board-mode sites for the live report, or ((), error) that names it.
 
-    Read-only: plain file reads plus the resolved per-repo tables. When
-    the settings themselves failed, there is nothing to assemble, and
-    the settings row already carries the failure.
+    Read-only: plain file reads plus the resolved per-repo tables and
+    one local origin read per entry without an explicit
+    `tracker.repo`. When the settings themselves failed, there is
+    nothing to assemble, and the settings row already carries the
+    failure. `git` is the required origin seam (tests pass a fake);
+    the one runner reaches the helper, not two.
     """
     if settings_error is not None:
         return (), None
@@ -1346,7 +1349,7 @@ def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
         return (), None
     if root is None:
         return (), None
-    sites, error = boarddoctor.sites_from_settings(root)
+    sites, error = boarddoctor.sites_from_settings(root, git=git)
     return tuple(sites), error
 
 
@@ -1418,7 +1421,8 @@ def _repo_site(
         return repodoctor.RepoSite(name, None, cause=str(err))
     clone = resolved["clone.path"]
     if not clone:
-        return repodoctor.RepoSite(name, None)
+        repo, problem = syncli.tracker_repo(root, name, resolved, git)
+        return repodoctor.RepoSite(name, None, cause=problem, tracker_repo=repo)
     path = clone if os.path.isabs(clone) else os.path.join(root, clone)
     try:
         proc = git(["remote", "get-url", "origin"], path)
@@ -1431,7 +1435,10 @@ def _repo_site(
     if getattr(proc, "returncode", 1) != 0:
         stderr = (getattr(proc, "stderr", "") or "").strip()
         if "No such remote" in stderr:
-            return repodoctor.RepoSite(name, None)
+            repo, problem = syncli.tracker_repo(root, name, resolved, git, origin="")
+            if problem is not None:
+                return repodoctor.RepoSite(name, None, cause=problem)
+            return repodoctor.RepoSite(name, None, tracker_repo=repo)
         cause = stderr or f"git exited {getattr(proc, 'returncode', 1)}"
         return repodoctor.RepoSite(
             name,
@@ -1441,13 +1448,14 @@ def _repo_site(
         )
     origin = (getattr(proc, "stdout", "") or "").strip()
     if not origin:
-        return repodoctor.RepoSite(name, None)
+        repo, problem = syncli.tracker_repo(root, name, resolved, git, origin="")
+        if problem is not None:
+            return repodoctor.RepoSite(name, None, cause=problem)
+        return repodoctor.RepoSite(name, None, tracker_repo=repo)
     push = _push_reading(origin, push_probe)
-    tracker_repo = resolved["tracker.repo"] or detect.remote_slug(origin)
-    if not tracker_repo:
-        return repodoctor.RepoSite(
-            name, origin, push=push, cause=f"no owner/name in the origin remote of {path}"
-        )
+    tracker_repo, problem = syncli.tracker_repo(root, name, resolved, git, origin=origin)
+    if problem is not None:
+        return repodoctor.RepoSite(name, origin, push=push, cause=problem)
     try:
         repo_tracker = tracker_factory(tracker_repo)
     except KeyError:
@@ -2113,7 +2121,7 @@ def production_env() -> Env:
     resource_readings = load_resource_readings(
         resolved, list_fn=production_list_fn, run=production_run
     )
-    board_sites, board_error = load_board_sites(settings_error)
+    board_sites, board_error = load_board_sites(settings_error, git=production_git)
     # The push readings, gathered once per report: one SSH probe and one
     # `gh` login check feed every site, so neither runs per repo. Both
     # degrade to False on failure (never a traceback); a wrong-False
