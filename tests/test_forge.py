@@ -7,6 +7,7 @@ takes its runner as an argument and every test injects a fake.
 
 import json
 import unittest
+from typing import Any
 from unittest import mock
 
 from korapy import forge, paths
@@ -19,7 +20,7 @@ MERGE_SHA = "d" * 40
 
 
 def make_pr(number=7, repo="acme/lib", **overrides):
-    fields = {
+    fields: dict[str, Any] = {
         "repo": repo,
         "number": number,
         "state": "open",
@@ -49,15 +50,30 @@ class FakeForge:
     `ForgeExists` even though the pre-check missed them.
     """
 
-    def __init__(self, pulls=(), index=None, *, user="operator", repos=None, fail=(), race=()):
+    def __init__(
+        self,
+        pulls=(),
+        index=None,
+        *,
+        user="operator",
+        repos=None,
+        fail=(),
+        race=(),
+        threads=None,
+        files=None,
+    ):
         self.pulls = {(pr.repo, pr.number): pr for pr in pulls}
         self.index = dict(index or {})
         self.requested = []
         self.pending_requested = []
+        self.threads_requested = []
+        self.files_requested = []
         self.user = user
         self.repos = dict(repos or {})
         self.fail = set(fail)
         self.race = set(race)
+        self.threads = dict(threads or {})
+        self.files = {key: tuple(value) for key, value in dict(files or {}).items()}
         self.created = []
         self.calls = []
 
@@ -88,6 +104,36 @@ class FakeForge:
                     raise forge.ForgeError(f"unusable pending count for {sha}")
                 return count
         return 0
+
+    def review_threads(self, repo, number):
+        """The staged threads for a canned PR, clear when unstaged.
+
+        A missing PR is ``ForgeError``, like ``pull_request``: callers
+        fail closed. ``fail={"review_threads"}`` raises instead, so the
+        merge core can prove an unreadable read blocks the merge.
+        """
+        self.threads_requested.append((repo, number))
+        self._fail("review_threads")
+        if not ghforge.is_repo_name(repo):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        if (repo, number) not in self.pulls:
+            raise forge.ForgeError(f"no such PR: {repo}#{number}")
+        return self.threads.get((repo, number), forge.ReviewThreads(0, 0, False))
+
+    def changed_files(self, repo, number):
+        """The staged paths for a canned PR, empty when unstaged.
+
+        Empty reads as no files (never as tested), so the merge core
+        fails closed unless the test stages a diff. A missing PR is
+        ``ForgeError``; ``fail={"changed_files"}`` raises instead.
+        """
+        self.files_requested.append((repo, number))
+        self._fail("changed_files")
+        if not ghforge.is_repo_name(repo):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        if (repo, number) not in self.pulls:
+            raise forge.ForgeError(f"no such PR: {repo}#{number}")
+        return self.files.get((repo, number), ())
 
     def merge(self, repo, number, *, head_sha, method):
         """Merge a canned PR, refusing like the adapter does.
@@ -1211,6 +1257,254 @@ class RepoNameHelper(unittest.TestCase):
             self.assertTrue(ghforge.is_repo_name(good))
         for bad in ("lib", "a/b/c", "a b/c", "", None, 7):
             self.assertFalse(ghforge.is_repo_name(bad))
+
+
+class PullRequestBodyTest(unittest.TestCase):
+    def test_body_defaults_to_empty(self):
+        self.assertEqual(make_pr().body, "")
+
+    def test_body_round_trips(self):
+        payload = pr_payload()
+        payload["body"] = "Closes #7\n\nSome text."
+        run = FakeRun({"repos/acme/lib/pulls/7": payload})
+        pr = ghforge.GithubForge(run).pull_request("acme/lib", 7)
+        self.assertEqual(pr.body, "Closes #7\n\nSome text.")
+
+    def test_missing_or_null_body_reads_as_empty(self):
+        for payload in (pr_payload(), {**pr_payload(), "body": None}):
+            with self.subTest(payload=payload.get("body")):
+                run = FakeRun({"repos/acme/lib/pulls/7": payload})
+                pr = ghforge.GithubForge(run).pull_request("acme/lib", 7)
+                self.assertEqual(pr.body, "")
+
+    def test_non_string_body_is_forge_error(self):
+        payload = pr_payload()
+        payload["body"] = 7
+        run = FakeRun({"repos/acme/lib/pulls/7": payload})
+        with self.assertRaises(forge.ForgeError):
+            ghforge.GithubForge(run).pull_request("acme/lib", 7)
+
+
+def files_payload(*names):
+    return [{"filename": name, "status": "modified"} for name in names]
+
+
+def files_path(repo="acme/lib", number=7, page=1, per_page=None):
+    from korapy.github import forge as ghforge_mod
+
+    width = per_page if per_page is not None else ghforge_mod.PER_PAGE
+    return f"repos/{repo}/pulls/{number}/files?per_page={width}&page={page}"
+
+
+class ChangedFilesTest(unittest.TestCase):
+    def test_single_short_page(self):
+        responses = {files_path(): files_payload("src/korapy/merge.py", "tests/test_merge.py")}
+        run = FakeRun(responses)
+        self.assertEqual(
+            ghforge.GithubForge(run).changed_files("acme/lib", 7),
+            ("src/korapy/merge.py", "tests/test_merge.py"),
+        )
+        self.assertEqual(run.calls, [["api", files_path()]])
+
+    def test_pagination_follows_full_pages(self):
+        with mock.patch.object(ghforge, "PER_PAGE", 2):
+            responses = {
+                files_path(per_page=2, page=1): files_payload("a.py", "b.py"),
+                files_path(per_page=2, page=2): files_payload("c.py"),
+            }
+            run = FakeRun(responses)
+            self.assertEqual(
+                ghforge.GithubForge(run).changed_files("acme/lib", 7), ("a.py", "b.py", "c.py")
+            )
+        self.assertEqual(
+            [c[1] for c in run.calls],
+            [files_path(per_page=2, page=1), files_path(per_page=2, page=2)],
+        )
+
+    def test_empty_listing_is_empty(self):
+        run = FakeRun({files_path(): []})
+        self.assertEqual(ghforge.GithubForge(run).changed_files("acme/lib", 7), ())
+
+    def test_malformed_pages_are_forge_error(self):
+        bad = [
+            {"files": []},
+            [{"status": "modified"}],
+            [{"filename": 7}],
+            [{"filename": ""}],
+            "not json",
+        ]
+        for page in bad:
+            with self.subTest(page=page):
+                run = FakeRun({files_path(): page})
+                with self.assertRaises(forge.ForgeError):
+                    ghforge.GithubForge(run).changed_files("acme/lib", 7)
+
+    def test_runner_failure_is_forge_error(self):
+        run = FakeRun({files_path(): RuntimeError("boom")})
+        with self.assertRaises(forge.ForgeError):
+            ghforge.GithubForge(run).changed_files("acme/lib", 7)
+
+    def test_bad_repo_never_calls_the_runner(self):
+        run = FakeRun({})
+        with self.assertRaises(forge.ForgeError):
+            ghforge.GithubForge(run).changed_files("not-a-repo", 7)
+        self.assertEqual(run.calls, [])
+
+
+def threads_data(*, resolved=0, unresolved=0, unknown=0, decision=None, truncated=False):
+    nodes: list = [{"isResolved": True}] * resolved
+    nodes += [{"isResolved": False}] * unresolved
+    nodes += [{"isResolved": "bogus"}] * unknown
+    return {
+        "repository": {
+            "pullRequest": {
+                "reviewDecision": decision,
+                "reviewThreads": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": truncated},
+                },
+            }
+        }
+    }
+
+
+class GraphqlRun:
+    """A fake raw `gh` runner for one GraphQL read, recording its calls."""
+
+    def __init__(self, payload_or_error):
+        self.payload_or_error = payload_or_error
+        self.calls: list = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(list(args))
+        if isinstance(self.payload_or_error, Exception):
+            raise self.payload_or_error
+        return json.dumps({"data": self.payload_or_error})
+
+
+class ReviewThreadsTest(unittest.TestCase):
+    def adapter(self, payload_or_error):
+        from tests.test_board_fields import FakePacer
+
+        run = GraphqlRun(payload_or_error)
+        return ghforge.GithubForge(run, pacer=FakePacer(), graphql_run=run), run
+
+    def test_clear_threads_with_an_approval(self):
+        adapter, run = self.adapter(threads_data(decision="APPROVED"))
+        threads = adapter.review_threads("acme/lib", 7)
+        self.assertEqual(threads.unresolved, 0)
+        self.assertEqual(threads.unknown, 0)
+        self.assertFalse(threads.change_requested)
+        self.assertEqual(len(run.calls), 1)
+        flat = " ".join(run.calls[0])
+        self.assertIn("graphql", flat)
+        self.assertIn("reviewThreads", flat)
+        self.assertIn("reviewDecision", flat)
+
+    def test_unresolved_threads_count(self):
+        adapter, _ = self.adapter(threads_data(resolved=2, unresolved=3, decision="APPROVED"))
+        threads = adapter.review_threads("acme/lib", 7)
+        self.assertEqual((threads.unresolved, threads.unknown), (3, 0))
+
+    def test_unreadable_thread_states_count_as_unknown(self):
+        adapter, _ = self.adapter(threads_data(resolved=1, unknown=2, decision="APPROVED"))
+        threads = adapter.review_threads("acme/lib", 7)
+        self.assertEqual((threads.unresolved, threads.unknown), (0, 2))
+
+    def test_truncated_listing_counts_as_unknown(self):
+        adapter, _ = self.adapter(threads_data(decision="APPROVED", truncated=True))
+        threads = adapter.review_threads("acme/lib", 7)
+        self.assertEqual(threads.unknown, 1)
+
+    def test_change_requested_decision(self):
+        adapter, _ = self.adapter(threads_data(decision="CHANGES_REQUESTED"))
+        self.assertTrue(adapter.review_threads("acme/lib", 7).change_requested)
+
+    def test_quiet_decisions_are_not_change_requests(self):
+        for decision in ("APPROVED", "REVIEW_REQUIRED", None):
+            with self.subTest(decision=decision):
+                adapter, _ = self.adapter(threads_data(decision=decision))
+                self.assertFalse(adapter.review_threads("acme/lib", 7).change_requested)
+
+    def test_unrecognized_decision_is_unknown(self):
+        adapter, _ = self.adapter(threads_data(decision="BOGUS"))
+        self.assertIsNone(adapter.review_threads("acme/lib", 7).change_requested)
+
+    def test_missing_pr_is_forge_error(self):
+        adapter, _ = self.adapter({"repository": {"pullRequest": None}})
+        with self.assertRaises(forge.ForgeError):
+            adapter.review_threads("acme/lib", 7)
+
+    def test_malformed_answers_are_forge_error(self):
+        bad = [
+            {"repository": {}},
+            {"repository": {"pullRequest": {"reviewDecision": "APPROVED"}}},
+            {"repository": {"pullRequest": ["not", "a", "dict"]}},
+        ]
+        for data in bad:
+            with self.subTest(data=data):
+                adapter, _ = self.adapter(data)
+                with self.assertRaises(forge.ForgeError):
+                    adapter.review_threads("acme/lib", 7)
+
+    def test_malformed_thread_list_is_forge_error(self):
+        data = threads_data(decision="APPROVED")
+        data["repository"]["pullRequest"]["reviewThreads"]["nodes"] = {"isResolved": True}
+        adapter, _ = self.adapter(data)
+        with self.assertRaises(forge.ForgeError):
+            adapter.review_threads("acme/lib", 7)
+
+    def test_runner_failure_is_forge_error(self):
+        adapter, _ = self.adapter(RuntimeError("boom"))
+        with self.assertRaises(forge.ForgeError):
+            adapter.review_threads("acme/lib", 7)
+
+    def test_bad_repo_never_calls_the_runner(self):
+        adapter, run = self.adapter(threads_data(decision="APPROVED"))
+        with self.assertRaises(forge.ForgeError):
+            adapter.review_threads("not-a-repo", 7)
+        self.assertEqual(run.calls, [])
+
+
+class FakeForgeReadsTest(unittest.TestCase):
+    def test_review_threads_default_clear(self):
+        fake = FakeForge(pulls=[make_pr()])
+        self.assertEqual(fake.review_threads("acme/lib", 7), forge.ReviewThreads(0, 0, False))
+
+    def test_review_threads_round_trip(self):
+        staged = forge.ReviewThreads(1, 0, False)
+        fake = FakeForge(pulls=[make_pr()], threads={("acme/lib", 7): staged})
+        self.assertEqual(fake.review_threads("acme/lib", 7), staged)
+        self.assertEqual(fake.threads_requested, [("acme/lib", 7)])
+
+    def test_review_threads_of_a_missing_pr_is_forge_error(self):
+        fake = FakeForge(pulls=[make_pr()])
+        with self.assertRaises(forge.ForgeError):
+            fake.review_threads("acme/lib", 9)
+
+    def test_review_threads_fail_names_raise_forge_error(self):
+        fake = FakeForge(pulls=[make_pr()], fail={"review_threads"})
+        with self.assertRaises(forge.ForgeError):
+            fake.review_threads("acme/lib", 7)
+
+    def test_changed_files_default_empty(self):
+        fake = FakeForge(pulls=[make_pr()])
+        self.assertEqual(fake.changed_files("acme/lib", 7), ())
+
+    def test_changed_files_round_trip(self):
+        fake = FakeForge(pulls=[make_pr()], files={("acme/lib", 7): ("src/korapy/merge.py",)})
+        self.assertEqual(fake.changed_files("acme/lib", 7), ("src/korapy/merge.py",))
+        self.assertEqual(fake.files_requested, [("acme/lib", 7)])
+
+    def test_changed_files_of_a_missing_pr_is_forge_error(self):
+        fake = FakeForge(pulls=[make_pr()])
+        with self.assertRaises(forge.ForgeError):
+            fake.changed_files("acme/lib", 9)
+
+    def test_changed_files_fail_names_raise_forge_error(self):
+        fake = FakeForge(pulls=[make_pr()], fail={"changed_files"})
+        with self.assertRaises(forge.ForgeError):
+            fake.changed_files("acme/lib", 7)
 
 
 if __name__ == "__main__":

@@ -68,12 +68,20 @@ class SequenceForge(FakeForge):
     without any clock or network.
     """
 
-    def __init__(self, reads):
+    def __init__(self, reads, threads=None, files=None):
         self.reads = list(reads)
         self.requested = []
         self.pending_requested = []
+        self.threads_requested = []
+        self.files_requested = []
         self.calls = []
         self._last = None
+        if threads is None:
+            threads = forge.ReviewThreads(0, 0, False)
+        if files is None:
+            files = ("tests/test_merge.py",)
+        self._threads = threads
+        self._files = tuple(files)
 
     def pull_request(self, repo, number):
         self.requested.append((repo, number))
@@ -82,6 +90,14 @@ class SequenceForge(FakeForge):
             return self._last
         self._last = self.reads[0]
         return self._last
+
+    def review_threads(self, repo, number):
+        self.threads_requested.append((repo, number))
+        return self._threads
+
+    def changed_files(self, repo, number):
+        self.files_requested.append((repo, number))
+        return self._files
 
     def pending_checks(self, repo, sha):
         self.pending_requested.append((repo, sha))
@@ -168,15 +184,30 @@ class MergeCase(unittest.TestCase):
             sessions_root=os.environ["KORAPY_SESSIONS"],
         )
 
-    def fake(self, **overrides):
+    def fake(self, threads=None, files=None, **overrides):
+        """A fake forge whose PR links the ticket and touches a test.
+
+        `threads` stages the one threads read (clear by default) and
+        `files` the changed paths (a test file by default), so the
+        readiness rows pass unless a test stages otherwise.
+        """
         fields = {
             "repo": FORGE_REPO,
             "number": PR,
             "base_sha": self.base,
             "head_sha": self.head,
+            "body": "Closes #1",
         }
         fields.update(overrides)
-        return FakeForge(pulls=[make_pr(**fields)])
+        if threads is None:
+            threads = forge.ReviewThreads(0, 0, False)
+        if files is None:
+            files = ("tests/test_merge.py",)
+        return FakeForge(
+            pulls=[make_pr(**fields)],
+            threads={(FORGE_REPO, PR): threads},
+            files={(FORGE_REPO, PR): files},
+        )
 
     def do_merge(self, fake=None, **overrides):
         params: dict[str, Any] = {
@@ -218,7 +249,7 @@ class CoreTest(MergeCase):
         self.assertEqual(result.merge_sha, MERGE_SHA)
         self.assertEqual(
             [check.name for check in result.checks],
-            ["lock", "open", "head", "review", "checks", "fork"],
+            ["lock", "open", "head", "review", "comments", "objectives", "tests", "checks", "fork"],
         )
         for check in result.checks:
             self.assertEqual(check.status, "ok", check.name)
@@ -353,7 +384,17 @@ class CoreTest(MergeCase):
         self.assertTrue(result.merged)
 
     def test_skip_of_anything_but_checks_is_usage(self):
-        for name in ("lock", "open", "head", "review", "fork", "bogus"):
+        for name in (
+            "lock",
+            "open",
+            "head",
+            "review",
+            "comments",
+            "objectives",
+            "tests",
+            "fork",
+            "bogus",
+        ):
             with self.subTest(name=name):
                 with self.assertRaises(merge.MergeError):
                     self.do_merge(self.fake(), skips=[name])
@@ -379,8 +420,16 @@ class CoreTest(MergeCase):
             self.do_merge(FakeForge())
 
     def test_verify_mismatch_fails_closed(self):
-        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
-        fake = UnverifiedForge(pulls=pulls)
+        pulls = [
+            make_pr(
+                repo=FORGE_REPO,
+                number=PR,
+                base_sha=self.base,
+                head_sha=self.head,
+                body="Closes #1",
+            )
+        ]
+        fake = UnverifiedForge(pulls=pulls, files={(FORGE_REPO, PR): ("tests/test_merge.py",)})
         result = self.do_merge(fake)
         self.assertEqual(result.exit_code, 1)
         self.assertFalse(result.merged)
@@ -390,7 +439,16 @@ class CoreTest(MergeCase):
 
     def test_merge_time_refusal_reports_the_failing_row(self):
         fake = RacedForge(
-            pulls=[make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+            pulls=[
+                make_pr(
+                    repo=FORGE_REPO,
+                    number=PR,
+                    base_sha=self.base,
+                    head_sha=self.head,
+                    body="Closes #1",
+                )
+            ],
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
         )
         result = self.do_merge(fake)
         self.assertEqual(result.exit_code, 1)
@@ -488,8 +546,16 @@ class MergeMethodTest(MergeCase):
         self.assertEqual(fake.calls, [])
 
     def test_refused_method_is_exit_1_naming_the_setting(self):
-        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
-        fake = MethodRefusedForge(pulls=pulls)
+        pulls = [
+            make_pr(
+                repo=FORGE_REPO,
+                number=PR,
+                base_sha=self.base,
+                head_sha=self.head,
+                body="Closes #1",
+            )
+        ]
+        fake = MethodRefusedForge(pulls=pulls, files={(FORGE_REPO, PR): ("tests/test_merge.py",)})
         result = self.do_merge(fake, method="merge")
         self.assertEqual(result.exit_code, 1)
         self.assertFalse(result.merged)
@@ -503,7 +569,16 @@ class MergeMethodTest(MergeCase):
 
     def test_race_refusal_still_names_the_row_not_the_method(self):
         fake = RacedForge(
-            pulls=[make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+            pulls=[
+                make_pr(
+                    repo=FORGE_REPO,
+                    number=PR,
+                    base_sha=self.base,
+                    head_sha=self.head,
+                    body="Closes #1",
+                )
+            ],
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
         )
         result = self.do_merge(fake, method="merge")
         self.assertEqual(result.exit_code, 1)
@@ -511,8 +586,16 @@ class MergeMethodTest(MergeCase):
         self.assertNotIn("method", [check.name for check in result.checks])
 
     def test_verify_mismatch_for_merge_method_fails_closed(self):
-        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
-        fake = UnverifiedForge(pulls=pulls)
+        pulls = [
+            make_pr(
+                repo=FORGE_REPO,
+                number=PR,
+                base_sha=self.base,
+                head_sha=self.head,
+                body="Closes #1",
+            )
+        ]
+        fake = UnverifiedForge(pulls=pulls, files={(FORGE_REPO, PR): ("tests/test_merge.py",)})
         result = self.do_merge(fake, method="merge")
         self.assertEqual(result.exit_code, 1)
         self.assertFalse(result.merged)
@@ -537,6 +620,7 @@ class PendingWaitTest(MergeCase):
             head_sha=self.head,
             checks_state=checks_state,
             checks_pending=pending,
+            body="Closes #1",
         )
 
     def clock(self):
@@ -603,9 +687,9 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(self.row(result, "review").status, "fail")
         self.assertEqual(self.row(result, "checks").status, "pending")
         self.assertEqual(sleeps, [])
-        self.assertEqual(len(fake.requested), 1)
+        self.assertEqual(len(fake.requested), 2)
 
-    def test_wait_with_skipped_checks_returns_after_one_read(self):
+    def test_wait_with_skipped_checks_settles_without_polling(self):
         fake = SequenceForge([self.pr("pending", 2)])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
@@ -628,10 +712,10 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(self.row(result, "checks").status, "skipped")
         self.assertFalse(result.merged)
         self.assertEqual(sleeps, [])
-        self.assertEqual(len(fake.requested), 1)
+        self.assertEqual(len(fake.requested), 2)
         self.assertEqual(fake.pending_requested, [])
 
-    def test_wait_with_an_already_failing_row_returns_after_one_read(self):
+    def test_wait_with_an_already_failing_row_settles_without_polling(self):
         fake = SequenceForge([self.pr("failing")])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
@@ -653,7 +737,9 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(self.row(result, "checks").status, "fail")
         self.assertFalse(result.merged)
         self.assertEqual(sleeps, [])
-        self.assertEqual(len(fake.requested), 1)
+        self.assertEqual(len(fake.requested), 2)
+        for name in ("comments", "objectives", "tests"):
+            self.assertIn(name, [check.name for check in result.checks])
 
     def test_wait_polls_until_passing_then_merges(self):
         fake = SequenceForge([self.pr("pending", 2), self.pr("pending", 1), self.pr("passing")])
@@ -1017,8 +1103,19 @@ class CliTest(MergeCase):
         self.assertIn("merge.method", err)
 
     def test_refused_method_text_names_the_setting(self):
-        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
-        code, out, _ = self.call(self.args(method="merge"), MethodRefusedForge(pulls=pulls))
+        pulls = [
+            make_pr(
+                repo=FORGE_REPO,
+                number=PR,
+                base_sha=self.base,
+                head_sha=self.head,
+                body="Closes #1",
+            )
+        ]
+        code, out, _ = self.call(
+            self.args(method="merge"),
+            MethodRefusedForge(pulls=pulls, files={(FORGE_REPO, PR): ("tests/test_merge.py",)}),
+        )
         self.assertEqual(code, 1)
         self.assertIn("merge method: fail", out)
         self.assertIn("merge.method", out)
@@ -1047,7 +1144,13 @@ class CliTest(MergeCase):
                 self.assertIn("--timeout", err)
 
     def test_wait_merges_once_the_checks_pass(self):
-        base = make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)
+        base = make_pr(
+            repo=FORGE_REPO,
+            number=PR,
+            base_sha=self.base,
+            head_sha=self.head,
+            body="Closes #1",
+        )
         fake = SequenceForge(
             [
                 base._replace(checks_state="pending"),
@@ -1220,6 +1323,363 @@ class PlanLockTest(MergeCase):
         with mock.patch.object(merge, "_read_locks", side_effect=OSError("no proc")):
             with self.assertRaises(merge.MergeError):
                 merge._lock_free(path)
+
+
+class ReadinessCase(MergeCase):
+    """One merge evaluation with the new readiness rows staged clear.
+
+    The head carries an approving record, the body links the ticket,
+    and the diff touches a test file, so each test below fails on
+    exactly the row it stages.
+    """
+
+    def staged(self, **overrides):
+        fields = {
+            "repo": FORGE_REPO,
+            "number": PR,
+            "base_sha": self.base,
+            "head_sha": self.head,
+            "body": "Closes #1",
+        }
+        fields.update(overrides.pop("pr", {}))
+        threads = overrides.pop("threads", forge.ReviewThreads(0, 0, False))
+        files = overrides.pop("files", ("tests/test_merge.py",))
+        fail = overrides.pop("fail", ())
+        self.assertEqual(overrides, {})
+        return FakeForge(
+            pulls=[make_pr(**fields)],
+            threads={(FORGE_REPO, PR): threads},
+            files={(FORGE_REPO, PR): files},
+            fail=fail,
+        )
+
+    def do_staged(self, fake, **overrides):
+        params: dict[str, Any] = {"head_sha": self.head, "forge": fake, "cwd": self.dir}
+        params.update(overrides)
+        return merge.run_merge(REPO, TICKET, FORGE_REPO, PR, **params)
+
+
+class CommentsRowTest(ReadinessCase):
+    def test_clear_threads_are_ok(self):
+        result = self.do_staged(self.staged())
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.merged)
+        self.assertEqual(self.row(result, "comments").status, "ok")
+
+    def test_unresolved_threads_block(self):
+        fake = self.staged(threads=forge.ReviewThreads(2, 0, False))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("unresolved", self.row(result, "comments").detail)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_unknown_threads_fail_closed(self):
+        fake = self.staged(threads=forge.ReviewThreads(0, 1, False))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "comments").status, "fail")
+        self.assertFalse(result.merged)
+
+    def test_change_request_blocks(self):
+        fake = self.staged(threads=forge.ReviewThreads(0, 0, True))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("change request", self.row(result, "comments").detail)
+        self.assertFalse(result.merged)
+
+    def test_unreadable_decision_fails_closed(self):
+        fake = self.staged(threads=forge.ReviewThreads(0, 0, None))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "comments").status, "fail")
+        self.assertFalse(result.merged)
+
+    def test_unreadable_read_blocks_with_the_reason_named(self):
+        fake = self.staged(fail={"review_threads"})
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "comments")
+        self.assertEqual(row.status, "fail")
+        self.assertIn("unreadable", row.detail)
+        self.assertFalse(result.merged)
+
+
+class ObjectivesRowTest(ReadinessCase):
+    def test_approve_with_a_closing_link_is_ok(self):
+        result = self.do_staged(self.staged())
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "objectives").status, "ok")
+
+    def test_refs_link_is_ok(self):
+        result = self.do_staged(self.staged(pr={"body": "Refs #1"}))
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "objectives").status, "ok")
+
+    def test_lows_only_findings_are_ok(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        reviewrecord.write_record(
+            REPO,
+            TICKET,
+            head,
+            reviewer="reviewer-1",
+            author="author-1",
+            verdict="approve-with-findings",
+            findings=[{"severity": "low", "text": "polish"}],
+            sessions_root=os.environ["KORAPY_SESSIONS"],
+        )
+        pr = make_pr(
+            repo=FORGE_REPO,
+            number=PR,
+            base_sha=self.base,
+            head_sha=head,
+            body="Closes #1",
+        )
+        fake = FakeForge(
+            pulls=[pr],
+            threads={(FORGE_REPO, PR): forge.ReviewThreads(0, 0, False)},
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
+        )
+        result = merge.run_merge(
+            REPO, TICKET, FORGE_REPO, PR, head_sha=head, forge=fake, cwd=self.dir
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "objectives").status, "ok")
+
+    def test_block_verdict_blocks(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        self.approve(head, verdict="block")
+        pr = make_pr(
+            repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=head, body="Closes #1"
+        )
+        fake = self.staged()
+        fake.pulls[(FORGE_REPO, PR)] = pr
+        result = merge.run_merge(
+            REPO, TICKET, FORGE_REPO, PR, head_sha=head, forge=fake, cwd=self.dir
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "objectives").status, "fail")
+        self.assertFalse(result.merged)
+
+    def test_fix_round_findings_block(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        reviewrecord.write_record(
+            REPO,
+            TICKET,
+            head,
+            reviewer="reviewer-9",
+            author="author-1",
+            verdict="approve-with-findings",
+            findings=[{"severity": "normal", "text": "must fix"}],
+            sessions_root=os.environ["KORAPY_SESSIONS"],
+        )
+        pr = make_pr(
+            repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=head, body="Closes #1"
+        )
+        fake = FakeForge(
+            pulls=[pr],
+            threads={(FORGE_REPO, PR): forge.ReviewThreads(0, 0, False)},
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
+        )
+        result = merge.run_merge(
+            REPO, TICKET, FORGE_REPO, PR, head_sha=head, forge=fake, cwd=self.dir
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "objectives").status, "fail")
+        self.assertFalse(result.merged)
+
+    def test_ungradable_findings_fail_closed(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        reviewrecord.write_record(
+            REPO,
+            TICKET,
+            head,
+            reviewer="reviewer-1",
+            author="author-1",
+            verdict="approve-with-findings",
+            findings=[{"severity": "bogus", "text": "ungradable"}],
+            sessions_root=os.environ["KORAPY_SESSIONS"],
+        )
+        pr = make_pr(
+            repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=head, body="Closes #1"
+        )
+        fake = FakeForge(
+            pulls=[pr],
+            threads={(FORGE_REPO, PR): forge.ReviewThreads(0, 0, False)},
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
+        )
+        result = merge.run_merge(
+            REPO, TICKET, FORGE_REPO, PR, head_sha=head, forge=fake, cwd=self.dir
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "objectives").status, "fail")
+
+    def test_missing_record_blocks(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        pr = make_pr(
+            repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=head, body="Closes #1"
+        )
+        fake = FakeForge(
+            pulls=[pr],
+            threads={(FORGE_REPO, PR): forge.ReviewThreads(0, 0, False)},
+            files={(FORGE_REPO, PR): ("tests/test_merge.py",)},
+        )
+        result = merge.run_merge(
+            REPO, TICKET, FORGE_REPO, PR, head_sha=head, forge=fake, cwd=self.dir
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "objectives").status, "fail")
+
+    def test_unlinked_body_blocks(self):
+        for body in ("", "No ticket link here.", "Closes #2"):
+            with self.subTest(body=body):
+                result = self.do_staged(self.staged(pr={"body": body}))
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(self.row(result, "objectives").status, "fail")
+                self.assertFalse(result.merged)
+
+
+class TestsRowTest(ReadinessCase):
+    def test_touched_tests_are_ok(self):
+        result = self.do_staged(self.staged(files=("src/korapy/merge.py", "tests/test_merge.py")))
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "tests").status, "ok")
+
+    def test_untested_diff_blocks(self):
+        fake = self.staged(files=("src/korapy/merge.py",))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("no test", self.row(result, "tests").detail)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_docs_only_diff_is_ok(self):
+        result = self.do_staged(self.staged(files=("docs/guide.md", "README.md")))
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "tests").status, "ok")
+
+    def test_docs_mixed_with_code_blocks(self):
+        fake = self.staged(files=("docs/guide.md", "src/korapy/merge.py"))
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "tests").status, "fail")
+
+    def test_waiver_label_is_ok(self):
+        pr = make_pr(
+            repo=FORGE_REPO,
+            number=PR,
+            base_sha=self.base,
+            head_sha=self.head,
+            body="Closes #1",
+            labels=("no-tests",),
+        )
+        fake = FakeForge(
+            pulls=[pr],
+            threads={(FORGE_REPO, PR): forge.ReviewThreads(0, 0, False)},
+            files={(FORGE_REPO, PR): ("src/korapy/merge.py",)},
+        )
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "tests").status, "ok")
+
+    def test_empty_diff_fails_closed(self):
+        fake = self.staged(files=())
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "tests").status, "fail")
+
+    def test_unreadable_read_blocks_with_the_reason_named(self):
+        fake = self.staged(fail={"changed_files"})
+        result = self.do_staged(fake)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "tests")
+        self.assertEqual(row.status, "fail")
+        self.assertIn("unreadable", row.detail)
+        self.assertFalse(result.merged)
+
+
+class ReadinessRowsTest(ReadinessCase):
+    def test_plan_reports_every_row_in_gate_order(self):
+        result = self.do_staged(self.staged(), plan=True)
+        self.assertEqual(
+            [check.name for check in result.checks],
+            ["lock", "open", "head", "review", "comments", "objectives", "tests", "checks", "fork"],
+        )
+        for check in result.checks:
+            self.assertEqual(check.status, "ok", check.name)
+
+    def test_plan_never_stops_at_the_first_failure(self):
+        fake = self.staged(
+            pr={"state": "closed", "checks_state": "failing", "body": "no link"},
+            threads=forge.ReviewThreads(1, 0, False),
+            files=("src/korapy/merge.py",),
+        )
+        result = self.do_staged(fake, plan=True)
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.merged)
+        self.assertEqual(
+            [check.name for check in result.checks],
+            ["lock", "open", "head", "review", "comments", "objectives", "tests", "checks", "fork"],
+        )
+        for name in ("open", "comments", "objectives", "tests", "checks"):
+            self.assertEqual(self.row(result, name).status, "fail", name)
+
+    def test_skip_of_a_readiness_row_is_usage(self):
+        for name in ("comments", "objectives", "tests"):
+            with self.subTest(name=name):
+                with self.assertRaises(merge.MergeError):
+                    self.do_staged(self.staged(), skips=[name])
+
+
+class MergeAutoSettingTest(unittest.TestCase):
+    def resolve(self, **kw):
+        kw.setdefault("env", {})
+        return settings.resolve(**kw)
+
+    def test_provider_is_registered(self):
+        self.assertIn("korapy.merge", settings.PROVIDERS)
+        self.assertIn("merge.auto", settings.REGISTRY)
+        self.assertEqual(merge.AUTO_SETTING, "merge.auto")
+
+    def test_drive_reads_the_same_setting_name(self):
+        from korapy import drive
+
+        self.assertEqual(drive.MERGE_AUTO_SETTING, merge.AUTO_SETTING)
+
+    def test_default_is_true(self):
+        self.assertTrue(settings.REGISTRY["merge.auto"].default)
+        self.assertTrue(self.resolve()["merge.auto"])
+
+    def test_env_disables(self):
+        resolved = self.resolve(env={"KORAPY_MERGE_AUTO": "false"})
+        self.assertFalse(resolved["merge.auto"])
+
+    def test_env_enables(self):
+        resolved = self.resolve(env={"KORAPY_MERGE_AUTO": "true"})
+        self.assertTrue(resolved["merge.auto"])
+
+    def test_bad_env_is_rejected(self):
+        with self.assertRaises(settings.SettingsError):
+            self.resolve(env={"KORAPY_MERGE_AUTO": "maybe"})
+
+    def test_project_file_disables(self):
+        resolved = self.resolve(project={"merge": {"auto": False}})
+        self.assertFalse(resolved["merge.auto"])
+        self.assertEqual(resolved.values["merge.auto"].origin, settings.PROJECT)
+
+    def test_project_file_must_hold_a_bool(self):
+        with self.assertRaises(settings.SettingsError):
+            self.resolve(project={"merge": {"auto": "yes"}})
 
 
 if __name__ == "__main__":
