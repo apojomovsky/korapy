@@ -5,7 +5,9 @@ fakes, and the pool and ledger are injected. No subprocesses, no network,
 no real state dirs.
 """
 
+import os
 import sqlite3
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -252,6 +254,26 @@ class TicketLayer(unittest.TestCase):
         store = FakeStore(found=row(labels=["ready", "profile:fast"]), fresh=True)
         found = select(tgt, store=store, tracker=FakeTracker([]))
         self.assertEqual((found.profile.name, found.provenance.layer), ("fast", 2))
+
+
+class DeclaredDefault(unittest.TestCase):
+    def test_a_declared_default_selects_its_runtime_at_launch(self):
+        tgt = target(resolve(project={"profiles": {"default": {"runtime": "muse"}}}))
+        found = select(tgt)
+        self.assertEqual(found.profile.name, "default")
+        self.assertEqual(found.runtime, "muse")
+        self.assertEqual(found.provenance.layer, 6)
+        self.assertNotIn("built-in", found.provenance.source)
+
+    def test_a_declared_default_in_a_real_file_selects_its_runtime(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-446-"))
+        with open(os.path.join(tmp, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[profiles.default]\nruntime = "muse"\n')
+        resolved = settings.load(root=tmp, repo=None, env={})
+        found = select(target(resolved))
+        self.assertEqual(found.profile.name, "default")
+        self.assertEqual(found.runtime, "muse")
+        self.assertEqual(found.provenance.layer, 6)
 
 
 class FlagShortCircuit(unittest.TestCase):

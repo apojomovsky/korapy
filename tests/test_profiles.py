@@ -5,6 +5,7 @@ runtime adapter's options schema. No files, no subprocesses, no network.
 """
 
 import unittest
+from types import MappingProxyType
 from unittest import mock
 
 from korapy import models, profiles, runtimes, settings
@@ -219,6 +220,14 @@ class NoSilentFallback(unittest.TestCase):
         with self.assertRaises(settings.SettingsError) as ctx:
             profiles.lookup({}, "default")
         self.assertIn("default", str(ctx.exception))
+
+    def test_a_declared_default_reads_through_any_mapping(self):
+        parsed = profiles.validate({"default": raw_profile("muse")}, ["provider-a"])
+        view = MappingProxyType(dict(parsed))
+        found = profiles.declared_default(view)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.runtime, "muse")
 
 
 class BuiltinDefault(unittest.TestCase):
