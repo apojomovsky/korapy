@@ -223,28 +223,100 @@ class Unresolvable(unittest.TestCase):
         self.assertIn("owner/name", site.cause or "")
 
 
+def _is_tracker_repo_const(node):
+    """Whether `node` is the `"tracker.repo"` string constant."""
+    return isinstance(node, ast.Constant) and node.value == "tracker.repo"
+
+
+def _is_tracker_repo_read(value):
+    """Whether an `or` value re-reads `tracker.repo` outside the helper.
+
+    Subscripts (`resolved["tracker.repo"]`) and calls carrying the key
+    (`resolved.get("tracker.repo")`, a `Call` rendering as
+    `('tracker.repo')` rather than `["tracker.repo"]`) alike: either
+    spelling in an `or` fallback re-introduces a second resolver.
+    """
+    if isinstance(value, ast.Subscript):
+        return ast.unparse(value.slice).strip("\"'") == "tracker.repo" or (
+            "tracker.repo" in ast.unparse(value)
+        )
+    if isinstance(value, ast.Call):
+        return any(_is_tracker_repo_const(arg) for arg in value.args) or any(
+            _is_tracker_repo_const(keyword.value) for keyword in value.keywords
+        )
+    return False
+
+
+def _is_tracker_repo_get_with_default(node):
+    """Whether `node` is `.get("tracker.repo", fallback)`.
+
+    The default-argument fallback needs no `or`: the fallback default
+    already re-introduces a second resolver, so it is flagged wherever
+    it appears.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "get"):
+        return False
+    if not node.args or not _is_tracker_repo_const(node.args[0]):
+        return False
+    return len(node.args) > 1 or bool(node.keywords)
+
+
+def _or_offenders(tree, name):
+    """`["{name}:{lineno}"]` for every `or` fallback re-reading `tracker.repo`."""
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
+            continue
+        if any(_is_tracker_repo_read(value) for value in node.values):
+            offenders.append(f"{name}:{node.lineno}")
+            continue
+        whole = ast.unparse(node)
+        if '["tracker.repo"]' in whole.replace(" ", ""):
+            offenders.append(f"{name}:{node.lineno}")
+    return offenders
+
+
+def _default_offenders(tree, name):
+    """`["{name}:{lineno}"]` for every `.get("tracker.repo", fallback)`."""
+    return [
+        f"{name}:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and _is_tracker_repo_get_with_default(node)
+    ]
+
+
 class ResolverGuard(unittest.TestCase):
     def test_no_tracker_repo_or_fallback_outside_the_helper(self):
         root = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
         offenders = []
         for path in sorted(root.glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.BoolOp) or not isinstance(node.op, ast.Or):
-                    continue
-                for value in node.values:
-                    if (
-                        isinstance(value, ast.Subscript)
-                        and ast.unparse(value.slice).strip("\"'") == "tracker.repo"
-                    ):
-                        offenders.append(f"{path.name}:{node.lineno}")
-                    elif isinstance(value, ast.Subscript) and "tracker.repo" in ast.unparse(value):
-                        offenders.append(f"{path.name}:{node.lineno}")
-                whole = ast.unparse(node)
-                if '["tracker.repo"]' in whole.replace(" ", ""):
-                    if f"{path.name}:{node.lineno}" not in offenders:
-                        offenders.append(f"{path.name}:{node.lineno}")
+            offenders.extend(_or_offenders(tree, path.name))
+            offenders.extend(_default_offenders(tree, path.name))
         self.assertEqual(offenders, [])
+
+    def test_or_with_subscript_fallback_is_flagged(self):
+        tree = ast.parse('repo = resolved["tracker.repo"] or name\n')
+        self.assertEqual(_or_offenders(tree, "snippet"), ["snippet:1"])
+
+    def test_or_with_get_call_fallback_is_flagged(self):
+        tree = ast.parse('repo = resolved.get("tracker.repo") or name\n')
+        self.assertEqual(_or_offenders(tree, "snippet"), ["snippet:1"])
+
+    def test_get_with_default_argument_is_flagged(self):
+        tree = ast.parse('repo = resolved.get("tracker.repo", name)\n')
+        self.assertEqual(_default_offenders(tree, "snippet"), ["snippet:1"])
+        self.assertEqual(_or_offenders(tree, "snippet"), [])
+
+    def test_plain_reads_without_a_fallback_pass(self):
+        tree = ast.parse(
+            'explicit = resolved["tracker.repo"]\nmaybe = resolved.get("tracker.repo")\n'
+        )
+        self.assertEqual(_or_offenders(tree, "snippet"), [])
+        self.assertEqual(_default_offenders(tree, "snippet"), [])
 
 
 if __name__ == "__main__":
