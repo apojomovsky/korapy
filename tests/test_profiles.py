@@ -221,6 +221,7 @@ class NoSilentFallback(unittest.TestCase):
             profiles.lookup({}, "default")
         self.assertIn("default", str(ctx.exception))
 
+
 class BuiltinDefault(unittest.TestCase):
     def test_a_non_dict_mapping_still_finds_the_declared_default(self):
         parsed = profiles.validate({"default": raw_profile("omp")}, ["provider-a"])
