@@ -40,11 +40,7 @@ def _shape(text):
 
 def _merged(payload):
     """Whether a PR object (single or list item) is merged."""
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("merged") is True:
-        return True
-    return bool(payload.get("merged_at"))
+    return gh.is_merged_pull(payload)
 
 
 def _pr_state(payload):

@@ -162,14 +162,14 @@ class BoardBackedTracker(BoardTracker):
         """Every REST item, oldest first, for a full resync."""
         return self._issues.items(repo)
 
-    def pulls_index(self, repo: str, max_calls: int):
-        """The open pull requests on the repository, keyed by ticket.
+    def pulls_index(self, repo: str, max_calls: int, *, merged_since: float | None = None):
+        """The open and recently merged pull requests on the repo, by ticket.
 
         The board variant carries no pull requests of its own, but the
         pull requests still live on the repository, so the index
         delegates to the REST adapter like the change feed does.
         """
-        return self._issues.pulls_index(repo, max_calls)
+        return self._issues.pulls_index(repo, max_calls, merged_since=merged_since)
 
     def comment(self, repo: str, number: int, body: str) -> None:
         """One decision-protocol comment, through the REST adapter."""
@@ -179,13 +179,13 @@ class BoardBackedTracker(BoardTracker):
         """Bodies of the item's comments, through the REST adapter.
 
         Comments live on the repository whatever the tracker variant,
-        so a board repo lists through the same adapter call as a
+        so a board repo reads through the same adapter call as a
         labels one.
         """
         return self._issues.comments(repo, number)
 
     def add_label(self, repo: str, number: int, label: str) -> None:
-        """The one decision label, through the REST adapter."""
+        """The loop-owned labels, through the REST adapter."""
         self._issues.add_label(repo, number, label)
 
     def remove_label(self, repo: str, number: int, label: str) -> None:

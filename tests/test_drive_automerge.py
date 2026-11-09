@@ -158,7 +158,7 @@ class AutoMergePassTest(unittest.TestCase):
             ),
             "launcher": launcher,
             "review_reader": lambda repo, number: dict(records.get((repo, number)) or {}),
-            "index_for": lambda repo, budget: (
+            "index_for": lambda repo, budget, *, merged_since=None: (
                 {
                     number: (LinkedPull(number=9 if number == 7 else 10, state="open"),)
                     for number in tickets

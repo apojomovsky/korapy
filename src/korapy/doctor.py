@@ -29,8 +29,8 @@ from korapy import (
     admission,
     boarddoctor,
     deps,
-    detect,
     drive,
+    freeze,
     heavy,
     host_ledger,
     hub,
@@ -49,6 +49,7 @@ from korapy import (
     resourcedoctor,
     resources,
     settings,
+    syncli,
     units,
 )
 from korapy import board as store
@@ -199,6 +200,13 @@ class Env(NamedTuple):
     #: reading, and then the ok row stays generic; a bad entry is
     #: already a failing row through `project_problems`.
     project_policies: Sequence[tuple[str, str, str | None]] | None = None
+    #: The freeze reading: the dict `freeze.freeze_view` returns, the
+    #: exception reading it raised, or None. None means the caller has
+    #: no reading, and then the report carries no freeze row.
+    freeze_view: Mapping[str, object] | Exception | None = None
+    #: The `freeze.max_age_s` setting the staleness warning reads
+    #: against, resolved once by production.
+    freeze_max_age_s: int = freeze.DEFAULT_MAX_AGE_S
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -686,6 +694,51 @@ def _check_boards(env: Env) -> list[Check]:
     ]
 
 
+def check_freeze(view: Mapping[str, object] | Exception | None, max_age_s: int) -> list[Check]:
+    """The `drive-freeze` row: no row without a reading.
+
+    A standing freeze reads ok with its reason and gate; past
+    `max_age_s` it warns, so a crash-orphaned freeze never blocks
+    starts silently. An unreadable freeze file fails: the loop holds
+    on broken state and the operator must repair it.
+    """
+    if view is None:
+        return []
+    if isinstance(view, Exception):
+        return [
+            Check(
+                "drive-freeze",
+                "fail",
+                f"freeze state unreadable: {view}",
+                "repair or remove the freeze file, then run `korapy doctor` again",
+            )
+        ]
+    reason = view.get("reason") or "no reason recorded"
+    raw_until = view.get("until")
+    until = [str(ref) for ref in raw_until] if isinstance(raw_until, list) else []
+    age = view.get("age_s")
+    detail = f"frozen: {reason}"
+    if until:
+        detail += f" (until {', '.join(until)} merge)"
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        age_text = "age unknown"
+        stale = False
+    else:
+        age_text = f"age {quotacli.format_age(age)}"
+        stale = age > max_age_s
+    detail += f", {age_text}"
+    if not stale:
+        return [Check("drive-freeze", "ok", detail, "")]
+    return [
+        Check(
+            "drive-freeze",
+            "warn",
+            f"{detail}: older than the {max_age_s}s freeze window",
+            "run `korapy freeze end` to resume dispatch",
+        )
+    ]
+
+
 def _check_repos(sites: Sequence[repodoctor.RepoSite]) -> list[Check]:
     """The remote-dependent rows: warn without a remote, strict with one.
 
@@ -1004,6 +1057,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_drive_timer(env.timer_state),
         *_check_drive_projects(env.project_problems, env.project_policies),
+        *check_freeze(env.freeze_view, env.freeze_max_age_s),
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
@@ -1120,6 +1174,33 @@ def check_settings(start: str, env: Mapping[str, str] | None = None) -> str | No
     return _resolved_settings(start, env)[1]
 
 
+def load_freeze_view(resolved: settings.Resolved | None):
+    """The freeze reading, or the exception reading it raised.
+
+    Only production builds it; tests inject the view into `Env`
+    directly. A missing freeze file is None (no row); an unreadable
+    one is the exception the `drive-freeze` row fails on. Reading
+    never lists units or reaches the tracker.
+    """
+    if resolved is None:
+        max_age_s = freeze.DEFAULT_MAX_AGE_S
+    else:
+        try:
+            max_age_s = resolved["freeze.max_age_s"]
+        except KeyError:
+            max_age_s = freeze.DEFAULT_MAX_AGE_S
+    try:
+        path = freeze.freeze_path()
+    except paths.PathError as err:
+        return err
+    try:
+        return freeze.freeze_view(path, now=time.time(), max_age_s=max_age_s)
+    except freeze.FreezeError as err:
+        return err
+    except OSError as err:
+        return err
+
+
 def load_dep_results() -> tuple[list[deps.Result], str | None]:
     """(results, error): the dep probes and their load failure, gathered once."""
     try:
@@ -1195,7 +1276,11 @@ def production_git(args: Sequence[str], cwd: str):
     `remote get-url` stays local; `ls-remote --symref` reaches the
     remote the same way the labels read does. Anything git cannot run
     reads as None so the caller degrades to a warn row, never a
-    traceback. Tests inject a fake.
+    traceback. Tests inject a fake. Kept separate from `syncli._git`
+    on purpose: this one runner feeds every git read in the report
+    (board sites, repo sites, default-branch lookups), while
+    `syncli._git` feeds sync, mirror and launch; sharing one would
+    couple the report seam to the sync seam.
     """
     from korapy.gitenv import clean_env
 
@@ -1250,12 +1335,15 @@ def production_board_issue_refs(board_config: settings.BoardConfig) -> object:
     return trackers.board_issue_refs_for(board_config, run=gh.run)
 
 
-def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
+def load_board_sites(settings_error: str | None, *, git) -> tuple[tuple, str | None]:
     """Board-mode sites for the live report, or ((), error) that names it.
 
-    Read-only: plain file reads plus the resolved per-repo tables. When
-    the settings themselves failed, there is nothing to assemble, and
-    the settings row already carries the failure.
+    Read-only: plain file reads plus the resolved per-repo tables and
+    one local origin read per entry without an explicit
+    `tracker.repo`. When the settings themselves failed, there is
+    nothing to assemble, and the settings row already carries the
+    failure. `git` is the required origin seam (tests pass a fake);
+    the one runner reaches the helper, not two.
     """
     if settings_error is not None:
         return (), None
@@ -1265,7 +1353,7 @@ def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
         return (), None
     if root is None:
         return (), None
-    sites, error = boarddoctor.sites_from_settings(root)
+    sites, error = boarddoctor.sites_from_settings(root, git=git)
     return tuple(sites), error
 
 
@@ -1337,7 +1425,8 @@ def _repo_site(
         return repodoctor.RepoSite(name, None, cause=str(err))
     clone = resolved["clone.path"]
     if not clone:
-        return repodoctor.RepoSite(name, None)
+        repo, problem = syncli.tracker_repo(root, name, resolved, git)
+        return repodoctor.RepoSite(name, None, cause=problem, tracker_repo=repo)
     path = clone if os.path.isabs(clone) else os.path.join(root, clone)
     try:
         proc = git(["remote", "get-url", "origin"], path)
@@ -1350,7 +1439,10 @@ def _repo_site(
     if getattr(proc, "returncode", 1) != 0:
         stderr = (getattr(proc, "stderr", "") or "").strip()
         if "No such remote" in stderr:
-            return repodoctor.RepoSite(name, None)
+            repo, problem = syncli.tracker_repo(root, name, resolved, git, origin="")
+            if problem is not None:
+                return repodoctor.RepoSite(name, None, cause=problem)
+            return repodoctor.RepoSite(name, None, tracker_repo=repo)
         cause = stderr or f"git exited {getattr(proc, 'returncode', 1)}"
         return repodoctor.RepoSite(
             name,
@@ -1360,13 +1452,14 @@ def _repo_site(
         )
     origin = (getattr(proc, "stdout", "") or "").strip()
     if not origin:
-        return repodoctor.RepoSite(name, None)
+        repo, problem = syncli.tracker_repo(root, name, resolved, git, origin="")
+        if problem is not None:
+            return repodoctor.RepoSite(name, None, cause=problem)
+        return repodoctor.RepoSite(name, None, tracker_repo=repo)
     push = _push_reading(origin, push_probe)
-    tracker_repo = resolved["tracker.repo"] or detect.remote_slug(origin)
-    if not tracker_repo:
-        return repodoctor.RepoSite(
-            name, origin, push=push, cause=f"no owner/name in the origin remote of {path}"
-        )
+    tracker_repo, problem = syncli.tracker_repo(root, name, resolved, git, origin=origin)
+    if problem is not None:
+        return repodoctor.RepoSite(name, origin, push=push, cause=problem)
     try:
         repo_tracker = tracker_factory(tracker_repo)
     except KeyError:
@@ -2032,7 +2125,7 @@ def production_env() -> Env:
     resource_readings = load_resource_readings(
         resolved, list_fn=production_list_fn, run=production_run
     )
-    board_sites, board_error = load_board_sites(settings_error)
+    board_sites, board_error = load_board_sites(settings_error, git=production_git)
     # The push readings, gathered once per report: one SSH probe and one
     # `gh` login check feed every site, so neither runs per repo. Both
     # degrade to False on failure (never a traceback); a wrong-False
@@ -2046,6 +2139,12 @@ def production_env() -> Env:
     )
     project_problems, project_policies = load_project_report()
     timer_state = load_timer_state()
+    try:
+        freeze_max_age_s = (
+            resolved["freeze.max_age_s"] if resolved is not None else freeze.DEFAULT_MAX_AGE_S
+        )
+    except KeyError:
+        freeze_max_age_s = freeze.DEFAULT_MAX_AGE_S
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None
     hub_auth = load_hub_auth(hub_url)
@@ -2080,6 +2179,8 @@ def production_env() -> Env:
         project_problems=project_problems,
         project_policies=project_policies,
         timer_state=timer_state,
+        freeze_view=load_freeze_view(resolved),
+        freeze_max_age_s=freeze_max_age_s,
         hub_url=hub_url or None,
         hub_auth=hub_auth,
         hub_probe=hub_probe,

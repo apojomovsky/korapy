@@ -227,6 +227,7 @@
   "state": "ready",
   "needs_decision": [],
   "ready_to_merge": [],
+  "research": [],
   "coordinator_handled": 0,
   "items": []
  },

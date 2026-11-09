@@ -48,6 +48,7 @@ from korapy import (
     leakguard,
     mergeup,
     paths,
+    prompts,
     resources,
     reviewrecord,
     settings,
@@ -535,11 +536,8 @@ def _check_review(required, repo, number, toplevel, base):
         if found and found != head
         else ""
     )
-    fix = (
-        f"ask a reviewer for a verdict on {short}, then record it: "
-        f"`korapy review record {repo} {number} --commit {head} "
-        "--verdict <approve|block> --author <change-author> --reviewer <reviewer-id>`"
-    )
+    command = prompts.review_record_command(repo, number, head, "<change-author>")
+    fix = f"ask a reviewer for a verdict on {short}, then record it: `{command}`"
     if record is None:
         return Check("review", FAIL, f"no approving review record for commit {short}", fix)
     if not reviewrecord.approves(record):

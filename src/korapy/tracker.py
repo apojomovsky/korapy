@@ -69,21 +69,35 @@ class BootstrapLabel(NamedTuple):
     description: str
 
 
-#: The only people-owned label korapy ever adds. The decision protocol
-#: holds a ticket for a human with this label; no adapter exposes a
-#: general label write, so any other name is refused.
+#: The people-owned labels korapy ever adds. The decision protocol
+#: holds a ticket for a human with `needs-decision`; the research
+#: finish adds `researched` to an answered question. No adapter
+#: exposes a general label write, so any other name is refused.
 NEEDS_DECISION = "needs-decision"
+
+#: A ticket carrying this label is a research question, not a change:
+#: it starts with the research worker prompt and finishes as a
+#: Findings comment, never a pull request.
+RESEARCH = "research"
+
+#: The loop adds this label to a research ticket whose Findings
+#: comment exists. A ticket carrying it is done; the finding stays
+#: visible as an attention item until acknowledged.
+RESEARCHED = "researched"
 
 #: The fixed board label set `github setup` bootstraps: exactly the
 #: labels the rest of korapy reads, no more. `ready` is what
 #: `board.ready` defaults to; `needs-triage` and `needs-decision` are
-#: the triage and decision flow; `hold` blocks `resume`; the
-#: `priority:*` names follow `PRIORITIES` in rank order.
+#: the triage and decision flow; `hold` blocks `resume`;
+#: `research` marks a research question and `researched` marks one
+#: answered; the `priority:*` names follow `PRIORITIES` in rank order.
 BOOTSTRAP_LABELS = (
     BootstrapLabel("ready", "marks an issue an agent may take"),
     BootstrapLabel("needs-triage", "waiting for triage to a repository"),
     BootstrapLabel(NEEDS_DECISION, "waiting on a human decision"),
     BootstrapLabel("hold", "held for a human; resume refuses while present"),
+    BootstrapLabel(RESEARCH, "a research question, answered by a Findings comment"),
+    BootstrapLabel(RESEARCHED, "a research question with its Findings comment"),
     BootstrapLabel(f"{PRIORITY_PREFIX}urgent", "handled first"),
     BootstrapLabel(f"{PRIORITY_PREFIX}high", "a correctness bug, a broken gate, or a flaky test"),
     BootstrapLabel(f"{PRIORITY_PREFIX}normal", "a feature"),
@@ -120,7 +134,9 @@ class TrackerItem(NamedTuple):
     kind: str  # "issue" | "pr"
     title: str
     body: str
-    state: str  # "open" | "closed"
+    # "open" | "closed", plus "merged" for pull requests from a
+    # pulls_index listing (feeds never report merged, only closed).
+    state: str
     author: str
     labels: tuple[str, ...]
     priority: str  # derived from the priority:* label, else ""
@@ -131,15 +147,21 @@ class TrackerItem(NamedTuple):
     agent: str = ""  # derived from the agent:* label, else ""
     status: str = ""  # derived from the status:* label, else ""
     extra: dict | None = None  # board concepts; normalized to {} on read
+    # Epoch seconds of the merge for a merged pull, else 0.0: the scope
+    # reads the merge time, not the last activity, so a comment after
+    # the merge never re-arms the withdrawal.
+    merged_at: float = 0.0
 
 
 class PullsIndex(NamedTuple):
-    """One repo's open pull requests, keyed by linked ticket number.
+    """One repo's open and recently merged pull requests, keyed by ticket.
 
-    ``by_issue`` maps each linked ticket to its open pull requests,
-    oldest first; ``calls`` counts the listing calls the index cost;
+    ``by_issue`` maps each linked ticket to its open pull requests plus
+    its merged pull requests updated since ``merged_since``, oldest
+    first; ``calls`` counts the listing calls the index cost;
     ``complete`` is False when the caller's budget stopped the listing
     early, leaving a partial index the caller must fail closed on.
+    Pull requests closed without merging are filed nowhere.
     """
 
     by_issue: dict[int, list[TrackerItem]]
@@ -169,20 +191,26 @@ class Tracker(Protocol):
         """Every item, for a full resync."""
         ...
 
-    def pulls_index(self, repo: str, max_calls: int) -> PullsIndex:
-        """The open pull requests on ``repo``, keyed by linked ticket.
+    def pulls_index(
+        self, repo: str, max_calls: int, *, merged_since: float | None = None
+    ) -> PullsIndex:
+        """The open and recently merged pull requests on ``repo``, by ticket.
 
-        One paged listing, not one read per ticket: a pull request
-        links to a ticket when it references it the way the adapter
-        reads as closing or relating it (on GitHub: a close keyword
-        or `Refs` line naming the ticket in the title or body, outside
-        fenced code). ``by_issue`` maps each linked ticket number to
-        its open pull requests, oldest first; ``calls`` counts the
-        listing calls the index cost; ``complete`` is False when
+        One paged listing per state, not one read per ticket: a pull
+        request links to a ticket when it references it the way the
+        adapter reads as closing or relating it (on GitHub: a close
+        keyword or `Refs` line naming the ticket in the title or body,
+        outside fenced code). ``by_issue`` maps each linked ticket
+        number to its open pull requests plus its merged pull requests
+        updated since ``merged_since``, oldest first; ``calls`` counts
+        the listing calls the index cost; ``complete`` is False when
         ``max_calls`` stopped the listing early, in which case the
-        index is partial and callers fail closed. A failed call raises
-        `TrackerError`; a rate-limit answer raises `TrackerRateLimited`
-        with the seconds to wait.
+        index is partial and callers fail closed. ``merged_since``
+        None lists no closed pull requests: with no live claim behind
+        the tickets only open pulls can still change a verdict. A pull
+        request closed without merging is filed nowhere. A failed call
+        raises `TrackerError`; a rate-limit answer raises
+        `TrackerRateLimited` with the seconds to wait.
         """
         ...
 
@@ -213,21 +241,24 @@ class Tracker(Protocol):
         ...
 
     def comments(self, repo: str, number: int) -> tuple[str, ...]:
-        """Bodies of the item's comments, oldest first, for the decision protocol only.
+        """Bodies of the item's comments, oldest first. Read-only.
 
         The decision verb lists before posting, so a retry posts only
-        when its decision line is absent. Read-only: a failed call
-        raises ``TrackerError``; a rate-limit answer raises
-        ``TrackerRateLimited`` with the seconds to wait.
+        when its decision line is absent; the loop also reads these
+        for research tickets, to find the Findings comment that
+        finishes them. A failed call raises ``TrackerError``; a
+        rate-limit answer raises ``TrackerRateLimited`` with the
+        seconds to wait.
         """
         ...
 
     def add_label(self, repo: str, number: int, label: str) -> None:
-        """Add one decision label to an item, for the decision protocol only.
+        """Add one loop-owned label to an item, for the protocols only.
 
-        The loop calls this with the single hold label; any other name is
-        refused with ``ValueError``. A failed call raises ``TrackerError``;
-        a rate-limit answer raises ``TrackerRateLimited`` with the seconds
+        The loop calls this with the decision hold label or the
+        research finish label; any other name is refused with
+        ``ValueError``. A failed call raises ``TrackerError``; a
+        rate-limit answer raises ``TrackerRateLimited`` with the seconds
         to wait.
         """
         ...

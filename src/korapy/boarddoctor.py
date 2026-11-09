@@ -24,7 +24,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from korapy import board, boardstatus, paths, quotacli, settings
+from korapy import board, boardstatus, paths, quotacli, settings, syncli
 from korapy import tracker as iface
 from korapy.github import gh
 
@@ -32,7 +32,7 @@ from korapy.github import gh
 class BoardSite(NamedTuple):
     """One repo the doctor may check: tracker repo, variant, board table."""
 
-    repo: str  # "owner/name" the adapter talks to (or the entry name)
+    repo: str  # "owner/name" the adapter talks to
     variant: str  # "labels" | "board"
     board: settings.BoardConfig | None  # the resolved [board] table
     #: Seconds a card may stay out of step before the drift row fails.
@@ -633,7 +633,7 @@ def check_sites(
 
 
 def sites_from_settings(
-    root: str | None, *, env: Mapping[str, str] | None = None
+    root: str | None, *, env: Mapping[str, str] | None = None, git
 ) -> tuple[list[BoardSite], str | None]:
     """Board sites from the ops root, or ([], error) that names it.
 
@@ -642,8 +642,11 @@ def sites_from_settings(
     not `None` (answered warn-only from config, with no board fetch). A
     labels repo with no table still gets no doctor row. Board sites
     carry the repo's ``board.drift_max_age_s`` for the drift row;
-    labels sites carry none and get no drift row. Reads plain files,
-    never the network.
+    labels sites carry none and get no drift row. Reads plain files
+    plus one local origin read per entry without an explicit
+    ``tracker.repo``, never the network. `git` is the required
+    origin seam (tests pass a fake); an entry whose tracker repo does
+    not resolve is an error naming it, never a guessed short name.
     """
     try:
         names = settings.repo_names(root)
@@ -657,7 +660,9 @@ def sites_from_settings(
             return [], f"cannot resolve [[repo]] {name}: {err}"
         if str(loaded["tracker.variant"]) != "board" and loaded.board is None:
             continue
-        repo = str(loaded["tracker.repo"] or name)
+        repo, problem = syncli.tracker_repo(root, name, loaded, git)
+        if problem is not None:
+            return [], problem
         variant = str(loaded["tracker.variant"])
         sites.append(
             BoardSite(

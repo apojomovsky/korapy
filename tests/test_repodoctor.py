@@ -255,15 +255,18 @@ class LoadRepoSites(unittest.TestCase):
         chdir(self, bare)
         self.assertEqual(self.load(), ())
 
-    def test_origin_unset_warns_both_rows_with_the_fix_line(self):
+    def test_origin_unset_warns_with_the_cause(self):
         sites = self.load()
-        self.assertEqual(sites, (repodoctor.RepoSite("demo", None),))
+        self.assertEqual(len(sites), 1)
+        self.assertIsNone(sites[0].origin)
+        self.assertIsNotNone(sites[0].cause)
+        self.assertIn("demo", sites[0].cause or "")
+        self.assertIn("owner/name", sites[0].cause or "")
         found = by_name(rows(*sites))
         self.assertEqual(found["remote:demo"].status, "warn")
-        self.assertIn("--create-remote", found["remote:demo"].fix)
-        self.assertIn("korapy github setup", found["remote:demo"].fix)
+        self.assertIn("demo", found["remote:demo"].detail)
         self.assertEqual(found["labels:demo"].status, "warn")
-        self.assertIn("korapy github setup", found["labels:demo"].fix)
+        self.assertIn("demo", found["labels:demo"].detail)
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
     def test_origin_read_is_local_only(self):
@@ -351,7 +354,7 @@ class LoadRepoSites(unittest.TestCase):
         self.assertIn("default branch", found["remote:demo"].detail)
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
-    def test_no_such_remote_reads_as_no_remote(self):
+    def test_no_such_remote_warns_with_the_cause(self):
         def git(args, cwd):
             self.assertEqual(args, ["remote", "get-url", "origin"])
             return SimpleNamespace(
@@ -359,10 +362,15 @@ class LoadRepoSites(unittest.TestCase):
             )
 
         sites = self.load(git=git)
-        self.assertEqual(sites, (repodoctor.RepoSite("demo", None),))
+        self.assertEqual(len(sites), 1)
+        self.assertIsNone(sites[0].origin)
+        self.assertIsNotNone(sites[0].cause)
+        self.assertIn("demo", sites[0].cause or "")
+        self.assertIn("owner/name", sites[0].cause or "")
         found = by_name(rows(*sites))
         self.assertEqual(found["remote:demo"].status, "warn")
-        self.assertIn("--create-remote", found["remote:demo"].fix)
+        self.assertIn("demo", found["remote:demo"].detail)
+        self.assertEqual(found["labels:demo"].status, "warn")
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
     def test_not_a_repository_warns_with_the_stderr_and_the_reinit_hint(self):
@@ -470,12 +478,15 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
             self.fail(f"no tracker read without a remote: {repo}")
 
         sites = doctor.load_repo_sites(None, git=FakeGit(root=target), tracker_factory=unused)
-        self.assertEqual(sites, (repodoctor.RepoSite(FIXTURE, None),))
+        self.assertEqual(len(sites), 1)
+        self.assertIsNone(sites[0].origin)
+        self.assertIsNotNone(sites[0].cause)
+        self.assertIn(FIXTURE, sites[0].cause or "")
         checks = doctor.run_checks(env(repo_sites=sites))
         found = by_name(checks)
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "warn")
+        self.assertIn(FIXTURE, found[f"remote:{FIXTURE}"].detail)
         self.assertEqual(found[f"labels:{FIXTURE}"].status, "warn")
-        self.assertIn("korapy github setup", found[f"labels:{FIXTURE}"].fix)
         self.assertEqual(doctor.exit_code(checks), 0)
 
     def test_after_create_remote_and_setup_doctor_shows_no_warning(self):

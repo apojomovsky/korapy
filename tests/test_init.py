@@ -312,7 +312,10 @@ TAIL = """# Defaults: uncomment to override.
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
-# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
+#
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -331,6 +334,7 @@ TAIL = """# Defaults: uncomment to override.
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
@@ -456,7 +460,10 @@ commits.conventional = false
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
-# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pulls plus recently updated closed pulls (tickets past the cap fail closed)
+#
+# [freeze]
+# freeze.max_age_s = 86400  # age in seconds after which a standing freeze warns in doctor instead of silently blocking starts
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -474,6 +481,7 @@ commits.conventional = false
 # merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
+# prompts.research = ""  # override file for the research prompt (relative to the ops root)
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
 # prompts.worker = ""  # override file for the worker prompt (relative to the ops root)

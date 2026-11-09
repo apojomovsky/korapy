@@ -148,7 +148,12 @@ class OpenPullPassTest(unittest.TestCase):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         code, out, err, launcher = self.run_start(
-            store, lambda repo, budget: ({7: (LinkedPull(number=9, state="open"),)}, 1, True)
+            store,
+            lambda repo, budget, *, merged_since=None: (
+                {7: (LinkedPull(number=9, state="open"),)},
+                1,
+                True,
+            ),
         )
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
@@ -186,7 +191,7 @@ class OpenPullPassTest(unittest.TestCase):
             agent_states={REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
             agent_tickets={REVIEWER_UNIT: ("app", 7)},
             finished_for={("app", 7): (REVIEWER_UNIT, "reviewer")},
-            index_for=lambda repo, budget: (
+            index_for=lambda repo, budget, *, merged_since=None: (
                 {7: (LinkedPull(number=9, state="closed"),)},
                 1,
                 True,
