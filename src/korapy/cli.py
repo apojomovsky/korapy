@@ -15,6 +15,7 @@ from korapy import (
     diskcli,
     doctor,
     drivehub,
+    freezecli,
     gccli,
     githubcli,
     heavycli,
@@ -247,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     decisioncli.add_parser(sub)
     diskcli.add_parser(sub)
     drivehub.add_parser(sub)
+    freezecli.add_parser(sub)
     hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)

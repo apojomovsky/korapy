@@ -44,6 +44,7 @@ from korapy import (
     boardsweep,
     disk,
     eligibility,
+    freeze,
     hold,
     host_ledger,
     launch,
@@ -52,10 +53,12 @@ from korapy import (
     profiles,
     projects,
     prompts,
+    push,
     quota,
     quota_ledger,
     quotacli,
     registry,
+    research,
     reviewrecord,
     settings,
     sync,
@@ -156,8 +159,9 @@ MANAGED_PREFIX = "drive-"
 
 #: Required kinds first: resume and fix rounds for already-claimed
 #: tickets before new starts, so in-flight work is not starved by new
-#: tickets. Review waits its turn with the starts.
-KIND_GROUP = {"resume": 0, "fix": 0, "start": 1, "review": 1}
+#: tickets. Review waits its turn with the starts, and research with
+#: the starts too: it claims and launches exactly like one.
+KIND_GROUP = {"resume": 0, "fix": 0, "start": 1, "review": 1, "research": 1}
 
 
 def is_managed_agent(agent) -> bool:
@@ -421,7 +425,12 @@ def gate(
     row gates as before. A fresh start on an
     unclaimed row with an open linked pull (`row.pulls`, listed once
     per repository when the rows were built) is refused: the pull, not
-    a new worker, carries the ticket. The row pulls are the one
+    a new worker, carries the ticket. Research rows skip both
+    linked-pull checks (unreadable and open): a research ticket
+    finishes as a Findings comment, so it never waits for a pull
+    request. A `review` requested on a research row is refused, and a
+    finished research holder never takes over as a reviewer: the
+    research finish settles those rows instead. The row pulls are the one
     linked-pull source the policies read too, so the two never
     disagree and the check costs no second lookup. Directly after it
     the area lock refuses kind `start` only (a fix or resume
@@ -477,6 +486,13 @@ def gate(
         )
     if row.external:
         return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
+    if request.kind == "review" and iface.RESEARCH in (row.labels or ()):
+        return _skip(
+            candidate,
+            request.kind,
+            "row",
+            f"{ref}: research tickets never take a reviewer, skipped",
+        )
 
     holder = row.agent or ""
     kind = route_kind(request.kind, holder)
@@ -488,10 +504,11 @@ def gate(
             and newest is not None
             and _finished_agent(newest) == holder
             and _finished_role(newest) != "reviewer"
+            and iface.RESEARCH not in (row.labels or ())
         )
         if takes_over:
             kind = "review"
-        elif request.kind == "start":
+        elif request.kind in ("start", "research"):
             return _skip(
                 candidate,
                 kind,
@@ -566,13 +583,13 @@ def gate(
                     "merge-ready, skipped",
                 )
 
-    if row.pulls is None:
+    if row.pulls is None and iface.RESEARCH not in (row.labels or ()):
         cause = getattr(row, "pulls_error", "") or ""
         detail = f" ({cause})" if cause else ""
         return _skip(
             candidate, kind, "row", f"{ref}: linked pulls unreadable, {kind} refused{detail}"
         )
-    if not holder and kind == "start":
+    if not holder and kind == "start" and iface.RESEARCH not in (row.labels or ()):
         opened = [pull for pull in row.pulls or () if getattr(pull, "state", "") == "open"]
         if opened:
             return _skip(
@@ -652,6 +669,8 @@ def gate(
 
     if kind == "start" and request.kind in ("resume", "fix"):
         reason = f"{ref}: {request.kind} on an unclaimed ticket, fresh start instead"
+    elif kind == "research":
+        reason = f"{ref}: unclaimed, fresh research start"
     elif kind == "start":
         reason = f"{ref}: unclaimed, fresh start"
     elif kind == "review":
@@ -832,15 +851,55 @@ def log_event(path, event):
     paths.atomic_write_text(path, "".join(line + "\n" for line in live))
 
 
-def pause_reason(path):
-    """The pause file's first line, None when the file is absent."""
+def pause_reason(path, freeze_path=None):
+    """The effective pause reason: the pause file, else the freeze, else None.
+
+    One resolver for every reader: the dispatch pass, the snapshot and
+    the dashboard all ask here, so a freeze holds the same pause with
+    no second flag. The operator pause wins when both stand.
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
     except FileNotFoundError:
-        return None
-    first = text.splitlines()[0].strip() if text.splitlines() else ""
-    return first if first else "paused by operator"
+        pass
+    else:
+        first = text.splitlines()[0].strip() if text.splitlines() else ""
+        return first if first else "paused by operator"
+    if freeze_path is not None:
+        return freeze.active_reason(freeze_path)
+    return None
+
+
+def _freeze_item_state(tracker_factory):
+    """Item states through the pass's tracker factory, for the until gate."""
+
+    def item_state(repo, number):
+        return tracker_factory(repo).item(repo, number).state
+
+    return item_state
+
+
+def _release_freeze(freeze_path, pause_path, tracker_factory, out):
+    """End a freeze whose until tickets all read merged. True when released.
+
+    Read-only when no freeze stands, when it names no gate, or when no
+    tracker factory can check the gate: then the pause holds. A merged
+    gate removes the freeze (and the pause it owns); the pass then
+    re-reads the pause file, so an operator pause still holds it.
+    An unreadable or half-removed freeze keeps the pause, so the next
+    pass retries instead of starting on broken state.
+    """
+    try:
+        record = freeze.read_freeze(freeze_path)
+    except freeze.FreezeError:
+        return False
+    if record is None or not record["until"] or tracker_factory is None:
+        return False
+    if not freeze.try_release(freeze_path, pause_path, _freeze_item_state(tracker_factory)):
+        return False
+    print(f"freeze ended: {', '.join(record['until'])} merged, resuming", file=out)
+    return True
 
 
 def read_day_count(path, today):
@@ -891,12 +950,16 @@ def check_lock(path):
     return False
 
 
-def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_path):
+def drive_status(
+    *, now, max_starts, journal_path, pause_path, freeze_path=None, day_path, lock_path
+):
     """The `snapshot` drive section from host state (pure reads).
 
     Raises JournalError when the journal is missing or corrupt, so the
     section reports a section error instead of crashing. A missing day
-    counter reads as zero starts; a corrupt one raises too.
+    counter reads as zero starts; a corrupt one raises too. A corrupt
+    freeze file never raises here: the section reports it as an
+    unreadable freeze holding the pause, so the dashboard names it.
     """
     try:
         with open(journal_path, encoding="utf-8") as handle:
@@ -952,7 +1015,25 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
             )
     today = _day_string(now)
     used = read_day_count(day_path, today)
-    reason = pause_reason(pause_path)
+    frozen = False
+    freeze_until: list = []
+    freeze_error = None
+    try:
+        reason = pause_reason(pause_path, freeze_path)
+        if freeze_path is not None:
+            record = freeze.read_freeze(freeze_path)
+            if record is not None:
+                frozen = True
+                freeze_until = list(record["until"])
+    except freeze.FreezeError as err:
+        frozen = True
+        freeze_error = str(err)
+        try:
+            reason = pause_reason(pause_path)
+        except OSError:
+            reason = None
+        if reason is None:
+            reason = f"freeze unreadable: {err}"
     return {
         "last_pass_at": tail[0]["at"],
         "last_exit": end["exit"] if end is not None else None,
@@ -960,6 +1041,10 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
         "paused": reason is not None,
         "pause_reason": reason,
         "pause_file": PAUSE_NAME,
+        "frozen": frozen,
+        "freeze_until": freeze_until,
+        "freeze_file": freeze.FREEZE_NAME,
+        "freeze_error": freeze_error,
         "starts_today": used,
         "starts_remaining": max(0, max_starts - used),
         "max_starts_per_day": max_starts,
@@ -1491,6 +1576,298 @@ def _review_missing(holder, newest, reviews, key) -> bool:
     )
 
 
+def needs_reprompt(holder, newest, reviews, key, reprompted) -> bool:
+    """Whether a recordless finished reviewer gets one resume. Pure.
+
+    The gate's skip and the reprompt decision share `_review_missing`,
+    so a ticket the gate did not skip as `review-missing` never
+    reprompts; `reprompted` is the set of (repo, number) keys with a
+    reprompt mark on file (plus any resumed earlier in the pass), and
+    a marked ticket never reprompts again. The step seeds the set
+    from the reviewer leaf's mark file, so the set and the file
+    cannot disagree: one fact, one place. Exactly one resume per
+    reviewer session is fixed loop behavior, like the existing
+    takeover rule, not operator tuning.
+    """
+    return _review_missing(holder, newest, reviews, key) and key not in (reprompted or ())
+
+
+#: The empty resume mark inside one reviewer session leaf. A file
+#: directly under the ticket root is refused: `paths._legacy_session`
+#: reads any direct child file as a legacy generation-0 session, so
+#: the mark lives inside the reviewer leaf, where neither half of
+#: `ticket_sessions` nor `latest_record` ever sees it.
+REPROMPT_MARK = ".reprompted"
+
+#: The reviewer author block's worker-id spelling, parsed back from the
+#: finished reviewer leaf's stored prompt.
+_AUTHOR_PREFIX = "written by agent `"
+
+
+def parse_review_author(text) -> str:
+    """The worker id a reviewer prompt names as the change's author. Pure.
+
+    Reads back the id `reviewer_author_block` wrote (`written by agent
+    \\`<id>\\``): the reviewer passes it as `review record --author`,
+    and the record refuses a self-review. A prompt without the block
+    names no author, so the resume is refused and the skip stands.
+    """
+    body = text if isinstance(text, str) else ""
+    start = body.find(_AUTHOR_PREFIX)
+    if start < 0:
+        return ""
+    start += len(_AUTHOR_PREFIX)
+    end = body.find("`", start)
+    if end <= start:
+        return ""
+    return body[start:end].strip()
+
+
+def reprompt_message(repo, number, commit, author) -> str:
+    """The message a review-record resume carries into the session. Pure.
+
+    The exact command comes from the one builder
+    (`prompts.review_record_command`), never a second copy, with the
+    head pinned to the ticket branch tip and the author pinned to the
+    pre-takeover worker id; the verdict is left to the reviewer.
+    """
+    command = prompts.review_record_command(repo, number, commit, author)
+    return (
+        f"Your review of {repo}#{number} finished without a review record: "
+        "a prose verdict alone is not a review. Record the commit you "
+        f"reviewed with the exact command:\n\n{command}\n\n"
+        "Run the command, then end your turn with the record path it prints."
+    )
+
+
+def _reprompt_mark(repo, number, gen, *, sessions_root=None):
+    """The resume mark path inside one reviewer session leaf."""
+    return os.path.join(
+        paths.role_session_dir(repo, number, "reviewer", gen, root=sessions_root),
+        REPROMPT_MARK,
+    )
+
+
+def _write_reprompt_mark(mark) -> bool:
+    """Write the resume mark; False when it cannot be written.
+
+    A mark that cannot be written fails closed: the skip stands, no
+    resume is requested, and the pass never reprompts without a mark.
+    """
+    try:
+        paths.atomic_write_text(mark, "")
+    except OSError:
+        return False
+    return True
+
+
+def _remote_tip(clone, branch, run):
+    """The remote tip sha of `branch`, or "" when missing or unreadable."""
+    sha, _proc = push.remote_head(clone, "origin", branch, run=run)
+    return sha
+
+
+def _reprompt_mark_for(repo, number, reviewer, *, tgt, sessions_root):
+    """(mark, None) for the finished reviewer session leaf, or (None, refusal).
+
+    Resolves the owning target, the unit prefix and the generation of
+    the finished reviewer session to the resume mark path. Any failure
+    is a `(outcome, reason)` refusal and the skip stands.
+    """
+    if tgt is None:
+        return (
+            None,
+            (
+                f"refused: {repo}#{number} has no launch target",
+                "the ticket has no launch target",
+            ),
+        )
+    try:
+        prefix = projects.unit_prefix(tgt.root, tgt.resolved)
+    except (KeyError, TypeError, AttributeError, settings.SettingsError) as err:
+        return None, (f"refused: {err}", "the unit prefix is unreadable")
+    parsed = units.parse_unit(prefix, reviewer or "")
+    if parsed is None:
+        return None, (
+            "refused: the reviewer session is unknown",
+            "the reviewer session is unknown",
+        )
+    _short, _num, gen = parsed
+    try:
+        mark = _reprompt_mark(tgt.repo, number, gen, sessions_root=sessions_root)
+    except paths.PathError as err:
+        return None, (f"refused: {err}", "the reviewer session is unknown")
+    return mark, None
+
+
+def _reprompt_one(repo, number, reviewer, *, title, tgt, mark, run):
+    """The refusal or the pinned resume plan for one recordless reviewer.
+
+    Runs the per-ticket checks and pins the head: the stored prompt's
+    author (never the same-pass capture, and never the finished
+    reviewer itself), the ticket branch, and the remote tip read
+    fresh. The mark file is re-checked here (the caller gates on
+    `needs_reprompt` against the same file first): a mark landing
+    between the two reads refuses rather than double-resuming. Any
+    failure is a `(outcome, reason)` refusal and the skip stands;
+    success is `("ok", tip, branch, message, mark)`, and the caller
+    revalidates the tip before it resumes.
+    """
+    if os.path.isfile(mark):
+        return "refused: already reprompted", "already reprompted"
+    try:
+        with open(os.path.join(os.path.dirname(mark), "prompt.md"), encoding="utf-8") as handle:
+            prompt = handle.read()
+    except OSError:
+        return "refused: the reviewer prompt is unreadable", "the reviewer prompt is unreadable"
+    author = parse_review_author(prompt)
+    if not author:
+        return (
+            "refused: the reviewer prompt names no author",
+            "the reviewer prompt names no author",
+        )
+    if author == reviewer:
+        return (
+            "refused: the author is the reviewer itself",
+            "the author is the reviewer itself",
+        )
+    try:
+        branch = worktrees.branch_for(
+            number, title or f"{repo}#{number}", template=tgt.branch_template
+        )
+    except worktrees.WorktreeError as err:
+        return f"refused: {err}", "the ticket branch is unknown"
+    tip = _remote_tip(tgt.clone, branch, run)
+    if not tip:
+        return (
+            "refused: the branch tip is unreadable",
+            "the branch tip is unreadable",
+        )
+    message = reprompt_message(repo, number, tip, author)
+    return ("ok", tip, branch, message, mark)
+
+
+def reprompt_missing_reviews(
+    missing,
+    *,
+    finished,
+    reviews,
+    titles,
+    resolve,
+    sessions_root=None,
+    run=None,
+    resume=None,
+    out=None,
+) -> dict:
+    """Resume each recordless reviewer once so it can record. Returns outcomes.
+
+    `missing` is the pass's `missing_review_records` list; `finished`
+    the newest finished entry per ticket, `reviews` its latest record
+    map, `titles` its row titles, and `resolve(repo, number)` the
+    launch target (or None when the ticket has none). The remote tip
+    reads through `push.remote_head` over `run` (None reads the host),
+    the mark lives in the reviewer leaf under `sessions_root` (None
+    reads the host default), and `resume(repo, number, tgt, message)`
+    relaunches the reviewer session. With no `resume` seam nothing is
+    read or written: the skips stand, exactly as before.
+
+    Per ticket: resolve the mark, refuse through `needs_reprompt`
+    when marked, pin the tip, revalidate it before the resume (a
+    move spends no resume), write the mark, resume through the seam
+    (a refusal keeps the skip), then revalidate after (a move just
+    proceeds: the mark is spent and the next pass orders a fresh
+    review of the new tip). Every refusal fails closed to today's
+    skip, and the pass never crashes on one ticket's cause. One line
+    per attempted ticket goes to `out`. At most three remote reads
+    per missing ticket; zero tracker or forge calls.
+    """
+    outcomes = {}
+    if resume is None:
+        return outcomes
+    stream = out if out is not None else io.StringIO()
+    reprompted = set()
+    for repo, number, reviewer in missing or ():
+        key = (repo, number)
+        newest = (finished or {}).get(key)
+        tgt = resolve(repo, number)
+        mark, refusal = _reprompt_mark_for(
+            repo, number, reviewer, tgt=tgt, sessions_root=sessions_root
+        )
+        if refusal is not None:
+            outcome, reason = refusal
+            outcomes[key] = outcome
+            print(f"{repo}#{number}: review reprompt refused ({reason}), skipped", file=stream)
+            continue
+        if os.path.isfile(mark):
+            reprompted.add(key)
+        if not needs_reprompt("", newest, reviews, key, reprompted):
+            reprompted.add(key)
+            outcomes[key] = "refused: already reprompted"
+            print(
+                f"{repo}#{number}: review reprompt refused (already reprompted), skipped",
+                file=stream,
+            )
+            continue
+        planned = _reprompt_one(
+            repo,
+            number,
+            reviewer,
+            title=(titles or {}).get(key),
+            tgt=tgt,
+            mark=mark,
+            run=run,
+        )
+        if planned[0] != "ok":
+            outcome, reason = planned
+            outcomes[key] = outcome
+            print(f"{repo}#{number}: review reprompt refused ({reason}), skipped", file=stream)
+            continue
+        _ok, tip, branch, message, mark = planned
+        again = _remote_tip(tgt.clone, branch, run)
+        if not again or again != tip:
+            outcomes[key] = "refused: the branch moved"
+            print(
+                f"{repo}#{number}: review reprompt refused (the branch moved), skipped",
+                file=stream,
+            )
+            continue
+        if not _write_reprompt_mark(mark):
+            outcomes[key] = "refused: the reprompt mark is unwritable"
+            print(
+                f"{repo}#{number}: review reprompt refused "
+                "(the reprompt mark is unwritable), skipped",
+                file=stream,
+            )
+            continue
+        try:
+            resume(repo, number, tgt, message)
+        except Exception as err:
+            outcomes[key] = f"refused: resume refused ({err})"
+            print(
+                f"{repo}#{number}: review reprompt refused (resume refused ({err})), skipped",
+                file=stream,
+            )
+            continue
+        reprompted.add(key)
+        after = _remote_tip(tgt.clone, branch, run)
+        short = reviewrecord.commit_id(tip)
+        if after and after != tip:
+            outcomes[key] = "resumed-tip-moved"
+            print(
+                f"{repo}#{number}: resumed reviewer `{reviewer}` to record commit {short}, "
+                f"but the branch moved to {reviewrecord.commit_id(after)}: "
+                "a fresh review of the new tip follows on the next pass",
+                file=stream,
+            )
+            continue
+        outcomes[key] = "resumed"
+        print(
+            f"{repo}#{number}: resumed reviewer `{reviewer}` to record commit {short}",
+            file=stream,
+        )
+    return outcomes
+
+
 def missing_review_records(finished, reviews, rows, *, driven=None) -> list:
     """[(repo, number, agent)] finished reviewers (outcome ok) with no record. Pure.
 
@@ -1686,6 +2063,177 @@ def linked_pulls_map(keys, index_for, *, max_calls, errors=None, claims_by_key=N
     return found, calls, limited
 
 
+def research_comments_for(tracker_factory):
+    """A per-ticket comments reader over the pass's trackers.
+
+    Each call reads one ticket's comment bodies through its tracker's
+    one `comments` seam: the only new GitHub reads the research finish
+    adds, spent in the pass that already lists the ticket's pulls. A
+    repo with no tracker, or a failed read, raises, and the map below
+    marks that ticket unreadable instead of settling blind.
+    """
+
+    def comments_for(repo, number):
+        tracker = tracker_factory(repo)
+        return tracker.comments(repo, number)
+
+    return comments_for
+
+
+def research_comments_map(keys, comments_for, *, errors=None):
+    """{(repo, number): comment bodies} for these research tickets.
+
+    The pass's one comment source for the research finish: one read
+    per ticket, no budget cap, since only finished research rows ask.
+    An unreadable ticket maps to None, and readers fail those rows
+    closed (the claim stays held for a later pass); when `errors` is
+    given, the first error string per unreadable ticket is recorded
+    there, so the log line can name the cause. A rate-limited read
+    propagates: like any other tracker outage it stops the pass
+    instead of settling blind while the same pass keeps launching
+    into further rate limits.
+    """
+    found: dict = {}
+    for key in dict.fromkeys(keys):
+        repo, number = key
+        try:
+            found[key] = list(comments_for(repo, number))
+        except iface.TrackerRateLimited:
+            raise
+        except Exception as exc:
+            found[key] = None
+            if errors is not None:
+                errors.setdefault(key, str(exc) or type(exc).__name__)
+    return found
+
+
+def driving_project(driven, repo) -> str:
+    """The project a finding on `repo` is reported to. Pure.
+
+    The one resolver from a driven repo to its project: `driven` is
+    {project name: tracker repos it drives}, and the first sorted
+    project driving the repo wins. A repo no project drives resolves
+    to "", and the settlement records that finding nowhere.
+    """
+    for project in sorted((driven or {})):
+        if repo in (driven or {})[project]:
+            return project
+    return ""
+
+
+def settle_research(
+    store,
+    tracker_factory,
+    due,
+    *,
+    live_units=None,
+    now,
+    out=None,
+    err=None,
+    events=None,
+    record_event=None,
+):
+    """Release settled research claims, label the answered ones. Returns freed.
+
+    `due` is `research.settlements` rows: claimed research tickets
+    whose finished worker left a verdict in the comments. A row with
+    findings releases its claim and gains the `researched` label, and
+    its finding is reported through `record_event`; a row without
+    findings releases bare, so the ticket is startable again instead
+    of waiting on a reviewer that never comes. The label write goes
+    first and direct, like the decision writes: on `TrackerError` the
+    claim is kept with a logbook line and retried on a later pass,
+    never released unlabeled. Rows with a live unit keep their claim
+    whatever the comments say. Every release appends its journal
+    entry when `events` is a list, and races under the pass (`Claimed`)
+    are left held with a logbook line, never retried. `record_event`
+    is `(project, repo, number, findings)` for each answered row; the
+    project rides the settlement itself, resolved by the pass through
+    `driving_project` where the project context still exists, and a
+    settlement with no project records nothing. A failed event record
+    warns and the release still stands: the comment and the label
+    carry the finding, the event only surfaces it.
+    """
+    stream = out if out is not None else io.StringIO()
+    trouble = err if err is not None else io.StringIO()
+    live = set(live_units or ())
+    released: dict = {}
+    for item in due or ():
+        key = (item.repo, item.number)
+        ref = f"{item.repo}#{item.number}"
+        if key in live:
+            print(
+                f"{ref}: finished research `{item.agent}` with a live unit, claim kept", file=stream
+            )
+            continue
+        tracker = None
+        if tracker_factory is not None:
+            try:
+                tracker = tracker_factory(item.repo)
+            except KeyError:
+                print(
+                    f"{ref}: no tracker for this repo, research unsettled, claim kept", file=stream
+                )
+                continue
+        if item.has_findings:
+            if tracker is None:
+                print(
+                    f"{ref}: no tracker for this repo, research unsettled, claim kept", file=stream
+                )
+                continue
+            try:
+                tracker.add_label(item.repo, item.number, iface.RESEARCHED)
+            except Exception as problem:
+                print(f"{ref}: researched label refused ({problem}), claim kept", file=stream)
+                continue
+            if record_event is not None:
+                project = getattr(item, "project", "") or ""
+                if not project:
+                    print(
+                        f"{ref}: no driving project, finding recorded nowhere",
+                        file=stream,
+                    )
+                else:
+                    try:
+                        record_event(project, item.repo, item.number, item.findings)
+                    except Exception as problem:  # noqa: BLE001 - surfacing never stops the pass
+                        print(
+                            f"{ref}: finding event refused ({problem}), release stands",
+                            file=trouble,
+                        )
+        try:
+            current = store.claim_of(item.repo, item.number)
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"{ref}: research claim unreadable ({problem}), left held", file=stream)
+            continue
+        if current is None or not current.agent or current.agent != item.agent:
+            print(f"{ref}: research claim changed under the pass, left held", file=stream)
+            continue
+        try:
+            store.release(item.repo, item.number, item.agent, current.epoch, now=now)
+        except board.Claimed:
+            print(f"{ref}: research release raced a re-claim, left held", file=stream)
+            continue
+        except (board.ExternalItem, board.StoreError, sqlite3.Error) as problem:
+            print(f"{ref}: research release refused ({problem}), left held", file=stream)
+            continue
+        if item.has_findings:
+            print(
+                f"{ref}: findings posted, released finished research `{item.agent}` as researched",
+                file=stream,
+            )
+        else:
+            print(
+                f"{ref}: no Findings comment, released finished research `{item.agent}`, "
+                "open for a fresh start",
+                file=stream,
+            )
+        if events is not None:
+            events.append({"event": "release", "at": now, "ticket": ref, "agent": item.agent})
+        released[key] = item.agent
+    return released
+
+
 #: The proceeding kinds the summary counts after starts, in order.
 SUMMARY_KINDS = ("resume", "fix", "review")
 
@@ -1697,8 +2245,9 @@ def render(rows, *, label, plan=True, pulls_calls=0, pulls_limited=False):
     """The candidate table plus the summary line under `label`.
 
     Each row names its project, so two projects requesting the same
-    ticket print distinguishable lines. The summary counts only
-    proceeding `start` rows as starts; other proceeding kinds are named
+    ticket print distinguishable lines. The summary counts proceeding
+    `start` and `research` rows as starts (research claims and
+    launches exactly like a start); other proceeding kinds are named
     separately, and skipped rows count toward no kind. The summary
     also names the GitHub calls the pulls lookup spent (`pulls
     calls`), so a listing regression is visible at once, and flags a
@@ -1709,7 +2258,7 @@ def render(rows, *, label, plan=True, pulls_calls=0, pulls_limited=False):
         head = f"{row.project} " if row.project else ""
         lines.append(f"{head}{row.repo}#{row.number}: {row.verdict} ({row.reason})")
     proceeding = [row for row in rows if row.verdict != "skip"]
-    starts = sum(1 for row in proceeding if row.kind == "start")
+    starts = sum(1 for row in proceeding if row.kind in ("start", "research"))
     started = "would start" if plan else "started"
     summary = f"{label}: {len(rows)} candidate(s), {started} {starts}"
     for kind in SUMMARY_KINDS:
@@ -2128,9 +2677,10 @@ def _gate_all(
     for candidate in order(candidates):
         if candidate.request is not None and candidate.row is not None:
             holder_now = candidate.row.agent if candidate.row is not None else ""
+            effective_kind = route_kind(candidate.request.kind, holder_now)
             if (
                 stop_starts
-                and route_kind(candidate.request.kind, holder_now) == "start"
+                and effective_kind in ("start", "research")
                 and counted.get(candidate.project, 0) >= floor_of(candidate.project)
             ):
                 ref = f"{candidate.request.repo}#{candidate.request.number}"
@@ -2139,7 +2689,7 @@ def _gate_all(
                         project=candidate.project,
                         repo=candidate.request.repo,
                         number=candidate.request.number,
-                        kind="start",
+                        kind=effective_kind,
                         verdict="skip",
                         reason=f"{ref}: host full, new starts stop here",
                         code=admission.TOTAL_FULL,
@@ -2541,6 +3091,29 @@ def is_orphan(
     return now - claim.claimed_at > 2 * gone_s
 
 
+def _research_awaiting_settlement(item, claim, finished) -> bool:
+    """Whether this claimed row is a finished research row awaiting settlement.
+
+    Pure: an open claimed row carrying the research label (and not the
+    researched one) whose finished registry entry, read through the
+    one finished-entry reader, names the research role behind the
+    current holder. Such a row settles through its Findings comment,
+    never through orphan recovery: releasing it as an orphan would
+    drop a posted verdict before its comments are read, and the
+    ticket would restart as fresh research with the finding never
+    surfacing.
+    """
+    if claim is None or not claim.agent:
+        return False
+    if getattr(item, "state", "open") != "open":
+        return False
+    labels = getattr(item, "labels", None) or ()
+    if iface.RESEARCH not in labels or iface.RESEARCHED in labels:
+        return False
+    newest = (finished or {}).get((item.repo, item.number))
+    return _finished_role(newest) == "research" and _finished_agent(newest) == claim.agent
+
+
 def _orphan_claims(
     store,
     *,
@@ -2550,19 +3123,26 @@ def _orphan_claims(
     live_units=None,
     agent_states=None,
     agent_tickets=None,
+    finished=None,
 ):
     """The provably-dead claims, in store order. Pure reads.
 
     The scan half of `release_orphans`: each store row whose claim the
-    orphan rule calls dead, resolved through the one resolver. Runs
-    through the shared retry policy; a persistent failure propagates
-    for the caller to skip the step with every claim kept.
+    orphan rule calls dead, resolved through the one resolver. A
+    finished research row awaiting settlement is never an orphan,
+    whatever its age: its verdict is settled through its comments,
+    and only `finished` (the pass's newest finished entry per ticket)
+    exempts it, never the claim's age. Runs through the shared retry
+    policy; a persistent failure propagates for the caller to skip the
+    step with every claim kept.
     """
 
     def scan():
         found = []
         for item in store.items():
             claim = store.claim_of(item.repo, item.number)
+            if _research_awaiting_settlement(item, claim, finished):
+                continue
             if not is_orphan(
                 claim,
                 now=now,
@@ -2590,6 +3170,7 @@ def release_orphans(
     events=None,
     agent_states=None,
     agent_tickets=None,
+    finished=None,
 ) -> int:
     """Release every provably-dead claim, one logbook line each.
 
@@ -2605,8 +3186,11 @@ def release_orphans(
     the holder and leaves the epoch for the next claim to mint, which
     fences a stale holder still acting on the old epoch; the worktree
     and branch stay untouched. Rows with no claim are left alone:
-    adoption happens only in resync, never here. When `events` is a
-    list, each release appends its journal entry.
+    adoption happens only in resync, never here. `finished` is the
+    pass's newest finished entry per ticket: a finished research row
+    awaiting settlement is never released here, whatever its age, so
+    its Findings comment survives until the settlement reads it. When
+    `events` is a list, each release appends its journal entry.
     """
     orphans = _orphan_claims(
         store,
@@ -2616,6 +3200,7 @@ def release_orphans(
         live_units=live_units,
         agent_states=agent_states,
         agent_tickets=agent_tickets,
+        finished=finished,
     )
     released = 0
     for claim in orphans:
@@ -3576,8 +4161,11 @@ def handle_stuck(
             print(f"{ref}: restart stop failed ({problem}), claim kept", file=out)
             continue
         title = item.title if item.title else ref
+        restart_kind = "research" if iface.RESEARCH in (item.labels or ()) else "start"
         try:
-            unit = launch(project, claim.repo, claim.number, "start", claim.agent, title, now=now)
+            unit = launch(
+                project, claim.repo, claim.number, restart_kind, claim.agent, title, now=now
+            )
         except Exception as problem:
             unrecord()
             print(f"{ref}: restart launch failed ({problem}), claim kept", file=out)
@@ -4801,13 +5389,17 @@ def _overlay_text(root):
         raise launch.LaunchError(f"cannot read the agent overlay: {err}") from None
 
 
-def _worker_prompt(root, tgt, number, title):
-    """A `(workdir, branch) -> text` renderer for the worker role.
+def _worker_prompt(root, tgt, number, title, role="worker"):
+    """A `(workdir, branch) -> text` renderer for a worker-like role.
 
-    Validated before the launch makes anything, so a bad override never
-    leaves a stray branch behind. The heartbeat lines go on in
+    `role` is `worker` or `research`: the research prompt answers the
+    ticket with one Findings comment instead of a change. Validated
+    before the launch makes anything, so a bad override never leaves
+    a stray branch behind. The heartbeat lines go on in
     `launch.launch`, not here.
     """
+    if role not in ("worker", "research"):
+        raise launch.LaunchError(f"{tgt.repo}#{number}: unknown worker-like role {role!r}")
     agents_md = os.path.join(tgt.clone, "AGENTS.md")
     base = {
         "issue": str(number),
@@ -4817,14 +5409,14 @@ def _worker_prompt(root, tgt, number, title):
         "project_agents_md": (agents_md if os.path.isfile(agents_md) else "AGENTS.md (none found)"),
     }
     try:
-        prompts.render("worker", {**base, "worktree": "-", "branch": "-"}, ops_root=root)
+        prompts.render(role, {**base, "worktree": "-", "branch": "-"}, ops_root=root)
     except prompts.PromptsError as err:
         raise launch.LaunchError(str(err)) from None
 
     def render_prompt(workdir, branch):
         try:
             return prompts.render(
-                "worker", {**base, "worktree": workdir, "branch": branch}, ops_root=root
+                role, {**base, "worktree": workdir, "branch": branch}, ops_root=root
             )
         except prompts.PromptsError as err:
             raise launch.LaunchError(str(err)) from None
@@ -4906,15 +5498,93 @@ def _reviewer_prompt(root, tgt, number, title, author):
     return render_prompt
 
 
+def _reprompt_target(registered, driven, stuck_project):
+    """A `reprompt_missing_reviews` target resolver over registered projects.
+
+    The owner is the stuck sweep's project lookup when it names one,
+    else the first project driving the repo; the target resolves
+    through `_local_repo` and `launch.target`, so the clone, the
+    branch template and the unit prefix agree with a fresh launch.
+    Anything unresolvable reads as no target, and the skip stands.
+    """
+    by_name = {project.name: project for project in registered}
+
+    def resolve(repo, number):
+        owner = None
+        if stuck_project is not None:
+            try:
+                owner = stuck_project(repo, number)
+            except settings.SettingsError:
+                return None
+        if owner is None:
+            for name, repos in (driven or {}).items():
+                if repo in repos:
+                    owner = name
+                    break
+        entry = by_name.get(owner) if owner else None
+        if entry is None:
+            return None
+        try:
+            short = _local_repo(entry.root, repo)
+            return launch.target(entry.root, short)
+        except (launch.LaunchError, settings.SettingsError):
+            return None
+
+    return resolve
+
+
+def production_reprompt_resume(registered, *, store, hold_label, now):
+    """A `reprompt_missing_reviews` resume over the existing launch path.
+
+    Returns `resume_one(repo, number, tgt, message)`: the unit name of
+    the resumed reviewer. The resume goes through `launch.resume`
+    with role reviewer (read-only preserved, like every reviewer
+    resume), the store-backed hold check, and the production seams;
+    a held ticket or a missing session raises before anything is
+    made, and the caller keeps the skip. `tgt` is the already-resolved
+    launch target, so this never resolves settings twice.
+    """
+
+    def resume_one(repo, number, tgt, message):
+        project = projects.for_root(tgt.root, registered)
+        if project is None:
+            raise launch.LaunchError(f"{repo}#{number}: unknown project for ops root {tgt.root!r}")
+
+        def hold_reason_fn(resume_tgt, resume_number):
+            _ = (resume_tgt, resume_number)
+            return hold.reason(_store_labels(store, now), (repo, number), (), hold_label=hold_label)
+
+        def list_fn(prefix):
+            return units.list_units(prefix, run=units.default_run)
+
+        unit, _ = launch.resume(
+            tgt,
+            number,
+            message,
+            role="reviewer",
+            hold_reason_fn=hold_reason_fn,
+            list_fn=list_fn,
+            run=units.default_run,
+            usage=disk.production_usage,
+            host_ledger_fn=host_ledger.ensure,
+            git=worktrees.git,
+        )
+        return unit
+
+    return resume_one
+
+
 def production_launcher(registered, *, store=None, hold_label=None):
     """The launch handoff over the existing launch path.
 
     Returns `launch_one(project, repo, number, kind, agent, title, *,
     now, author=None)`: the unit name of the started agent. `start` and
     `fix` launch a worker (a fix reuses the ticket's branch through the
-    launch path); `review` launches with the reviewer role and the
-    worker id as its author, which the prompt carries to record time;
-    `resume` relaunches the holder's session with the fix message. The
+    launch path); `research` launches with the research prompt, which
+    answers with one Findings comment instead of a change; `review`
+    launches with the reviewer role and the worker id as its author,
+    which the prompt carries to record time; `resume` relaunches the
+    holder's session with the fix message. The
     target resolves from the project's ops root, and the unit starts
     through `launch.launch` (or `launch.resume`) with the production
     seams. A review without an author, a resume without the store-backed
@@ -4924,7 +5594,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
 
     def launch_one(project, repo, number, kind, agent, title, *, now, author=None):
         _ = (agent, now)
-        if kind not in ("start", "review", "resume", "fix"):
+        if kind not in ("start", "review", "resume", "fix", "research"):
             raise launch.LaunchError(f"{repo}#{number}: unknown drive kind {kind!r}")
         if kind == "review" and not (author or "").strip():
             raise launch.LaunchError(
@@ -4976,13 +5646,14 @@ def production_launcher(registered, *, store=None, hold_label=None):
                 git=worktrees.git,
             )
             return unit
-        factory = _worker_prompt(entry.root, tgt, number, title)
+        worker_role = "research" if kind == "research" else "worker"
+        factory = _worker_prompt(entry.root, tgt, number, title, role=worker_role)
         unit, _ = launch.launch(
             tgt,
             number,
             factory,
             title=title,
-            role="worker",
+            role=worker_role,
             list_fn=list_fn,
             run=units.default_run,
             usage=disk.production_usage,
@@ -5036,6 +5707,12 @@ def _launching_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    reprompt_resume=None,
+    reprompt_run=None,
+    reprompt_resolve=None,
+    reprompt_sessions_root=None,
+    comments_for=None,
+    record_event=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -5100,7 +5777,13 @@ def _launching_pass(
     `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
     setting) caps the listing calls. A capped pass prints "pulls
     lookup limited" and refuses the unchecked starts; the summary line
-    counts the listing calls.
+    counts the listing calls. `comments_for` (None settles no research
+    row) reads one finished research ticket's comment bodies for the
+    research finish, through the pass's one comment map; with none
+    those rows keep their claims. `record_event` reports each answered
+    finding as `(project, repo, number, findings)` for the dashboard
+    attention; with none the finding still lands as a comment and a
+    label, only the event is missing.
     """
     events: list[dict] = []
     released = 0
@@ -5321,6 +6004,7 @@ def _launching_pass(
                 events=events if journal_path is not None else None,
                 agent_states=agent_states,
                 agent_tickets=agent_tickets,
+                finished=finished,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"korapy drive: orphan recovery skipped ({problem})", file=err)
@@ -5332,6 +6016,69 @@ def _launching_pass(
         except sqlite3.Error as problem:
             print(f"korapy drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
+    if agent_states is not None and comments_for is not None and tracker_factory is not None:
+        comment_errors: dict = {}
+        units_now = set(live_units or ())
+        holders = {
+            key: (_finished_agent(entry), _finished_role(entry))
+            for key, entry in (finished or {}).items()
+        }
+        research_keys = set()
+        for item in _items:
+            key = (item.repo, item.number)
+            if item.state != "open" or key in units_now:
+                continue
+            if iface.RESEARCH not in (item.labels or ()):
+                continue
+            if iface.RESEARCHED in (item.labels or ()):
+                continue
+            if not item.agent or not is_managed_agent(item.agent):
+                continue
+            agent, role = holders.get(key, (None, None))
+            if role != "research" or agent != item.agent:
+                continue
+            research_keys.add(key)
+        try:
+            comments_by_key = research_comments_map(
+                research_keys, comments_for, errors=comment_errors
+            )
+        except iface.TrackerRateLimited as problem:
+            print(f"korapy drive: research comments rate limited ({problem}), pass stops", file=err)
+            return finish(UNREACHABLE)
+        for key in sorted(comment_errors):
+            print(
+                f"{key[0]}#{key[1]}: research comments unreadable,"
+                f" claim kept ({comment_errors[key]})",
+                file=out,
+            )
+        try:
+            settled = settle_research(
+                store,
+                tracker_factory,
+                research.settlements(
+                    _items,
+                    holders,
+                    comments_by_key,
+                    projects={key: driving_project(driven, key[0]) for key in research_keys},
+                ),
+                live_units=live_units,
+                now=now,
+                out=out,
+                events=events if journal_path is not None else None,
+                record_event=record_event,
+            )
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"korapy drive: research settlement skipped ({problem})", file=err)
+        else:
+            freed.update(settled)
+            try:
+                _items = store.items()
+            except board.StoreError as problem:
+                print(f"korapy drive: {problem}", file=err)
+                return finish(USAGE)
+            except sqlite3.Error as problem:
+                print(f"korapy drive: cannot read the store: {problem}", file=err)
+                return finish(USAGE)
     if review_reader is not None:
         union = _driven_union(driven)
         reviews = review_records_for(
@@ -5370,6 +6117,22 @@ def _launching_pass(
         driven=driven,
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)
+    if reprompt_resume is not None:
+        reprompt_missing_reviews(
+            missing_review_records(finished, reviews, _released_rows(_items, freed), driven=driven),
+            finished=finished,
+            reviews=reviews,
+            titles={(item.repo, item.number): item.title for item in _items},
+            resolve=(
+                reprompt_resolve
+                if reprompt_resolve is not None
+                else _reprompt_target(registered, driven, stuck_project)
+            ),
+            sessions_root=reprompt_sessions_root,
+            run=reprompt_run,
+            resume=reprompt_resume,
+            out=out,
+        )
     if host is None:
         try:
             configured = settings.load(root=None)["drive.agent_host"]
@@ -5590,6 +6353,7 @@ def run_pass(
     finished_for=None,
     journal_path=None,
     pause_path=None,
+    freeze_path=None,
     day_path=None,
     max_starts=None,
     hub_epoch_of=None,
@@ -5601,6 +6365,12 @@ def run_pass(
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
+    reprompt_resume=None,
+    reprompt_run=None,
+    reprompt_resolve=None,
+    reprompt_sessions_root=None,
+    comments_for=None,
+    record_event=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -5650,8 +6420,12 @@ def run_pass(
     readiness resolve holders through: a claim's holder id never names
     its unit-name entry. The plan pass reads it too, so `--plan`
     prints the same reviewer-holder skips. When `pause_path` names an
-    existing pause file, either pass reports it and exits 1, starting
-    nothing. When `journal_path` is set, the non-plan pass journals its
+    existing pause file, or `freeze_path` a standing freeze, either
+    pass reports it and exits 1, starting nothing; the non-plan pass
+    first ends a freeze whose until tickets all read merged, through
+    `tracker_factory`, and then runs; a pause file the freeze did not
+    own still holds the pass. A plan never releases, so a dry
+    run changes nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
     `max_starts` are set, starts beyond the day's budget become `cap`
     skips and the pass ends with exit 1. `review_reader`
@@ -5665,10 +6439,23 @@ def run_pass(
     so a dry run contacts no tracker. `pulls_max_calls` caps the
     listing calls (None reads the `drive.pulls_max_calls` host
     setting); a capped pass prints "pulls lookup limited" and refuses
-    the unchecked starts. `quota_refresh_after_s`
+    the unchecked starts. `comments_for` reads one finished research
+    ticket's comment bodies for the research finish (None settles no
+    research row); `record_event` reports each answered finding as
+    `(project, repo, number, findings)` for the dashboard attention.
+    `quota_refresh_after_s`
     re-reads stale quota at the start of the non-plan pass, before the
     sync, only; `--plan` never takes it, so a dry run runs no reader.
-    `quota_load_reader` builds those readers. `now` defaults to the wall
+    `quota_load_reader` builds those readers. `reprompt_resume` is the
+    review-record resume seam (`(repo, number, tgt, message) -> unit`,
+    None resumes nothing: the `review-missing` skips stand, exactly as
+    before); with it the claiming pass resumes each recordless
+    reviewer once through `reprompt_missing_reviews`, while `--plan`
+    never resumes. `reprompt_run` is the git run seam behind the
+    remote tip reads, `reprompt_resolve` the launch-target resolver
+    (None resolves over the registered projects), and
+    `reprompt_sessions_root` the sessions root holding the resume
+    marks (None reads the host default). `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
@@ -5684,13 +6471,24 @@ def run_pass(
     moment = time.time() if now is None else now
     if pause_path is not None:
         try:
-            reason = pause_reason(pause_path)
-        except OSError as problem:
+            reason = pause_reason(pause_path, freeze_path)
+        except (OSError, freeze.FreezeError) as problem:
             print(f"korapy drive: cannot read the pause file: {problem}", file=err)
             return USAGE
         if reason is not None:
-            print(f"korapy drive: paused: {reason}", file=err)
-            return NO
+            if (
+                not plan
+                and freeze_path is not None
+                and _release_freeze(freeze_path, pause_path, tracker_factory, out)
+            ):
+                try:
+                    reason = pause_reason(pause_path)
+                except (OSError, freeze.FreezeError) as problem:
+                    print(f"korapy drive: cannot read the pause file: {problem}", file=err)
+                    return USAGE
+            if reason is not None:
+                print(f"korapy drive: paused: {reason}", file=err)
+                return NO
     args = {
         "now": moment,
         "projects_fn": projects_fn,
@@ -5753,6 +6551,12 @@ def run_pass(
                 driven=driven,
                 quota_refresh_after_s=quota_refresh_after_s,
                 quota_load_reader=quota_load_reader,
+                reprompt_resume=reprompt_resume,
+                reprompt_run=reprompt_run,
+                reprompt_resolve=reprompt_resolve,
+                reprompt_sessions_root=reprompt_sessions_root,
+                comments_for=comments_for,
+                record_event=record_event,
                 **args,
             )
     except LockHeld as held:

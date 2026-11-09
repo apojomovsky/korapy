@@ -87,6 +87,7 @@ PROVIDERS = (
     "korapy.detect",
     "korapy.disk",
     "korapy.drive",
+    "korapy.freeze",
     "korapy.hold",
     "korapy.hub",
     "korapy.launch",

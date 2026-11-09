@@ -296,8 +296,8 @@ def register(
     not ended; after ``done`` it starts a fresh run. A ``ticket`` here is
     explicit; a re-register without one keeps the previous ticket and its
     source, so a hook retry never drops an inferred ticket. ``role`` is
-    the prompt role the agent was launched with (worker, reviewer or
-    triage), or None; a re-register without one keeps the previous role.
+    the prompt role the agent was launched with (worker, reviewer,
+    triage or research), or None; a re-register without one keeps the previous role.
     ``profile`` is the agent profile the launch resolved, or None; like
     the role, a re-register without one keeps the previous profile, so
     snapshot shows the recorded profile while the agent runs.

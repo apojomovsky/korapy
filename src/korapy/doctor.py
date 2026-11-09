@@ -31,6 +31,7 @@ from korapy import (
     deps,
     detect,
     drive,
+    freeze,
     heavy,
     host_ledger,
     hub,
@@ -218,6 +219,13 @@ class Env(NamedTuple):
     #: None means the caller has no reading, and then the report
     #: carries no `area:*` rows.
     area_sites: Sequence[AreaSite] | None = None
+    #: The freeze reading: the dict `freeze.freeze_view` returns, the
+    #: exception reading it raised, or None. None means the caller has
+    #: no reading, and then the report carries no freeze row.
+    freeze_view: Mapping[str, object] | Exception | None = None
+    #: The `freeze.max_age_s` setting the staleness warning reads
+    #: against, resolved once by production.
+    freeze_max_age_s: int = freeze.DEFAULT_MAX_AGE_S
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -744,6 +752,51 @@ def _check_boards(env: Env) -> list[Check]:
     ]
 
 
+def check_freeze(view: Mapping[str, object] | Exception | None, max_age_s: int) -> list[Check]:
+    """The `drive-freeze` row: no row without a reading.
+
+    A standing freeze reads ok with its reason and gate; past
+    `max_age_s` it warns, so a crash-orphaned freeze never blocks
+    starts silently. An unreadable freeze file fails: the loop holds
+    on broken state and the operator must repair it.
+    """
+    if view is None:
+        return []
+    if isinstance(view, Exception):
+        return [
+            Check(
+                "drive-freeze",
+                "fail",
+                f"freeze state unreadable: {view}",
+                "repair or remove the freeze file, then run `korapy doctor` again",
+            )
+        ]
+    reason = view.get("reason") or "no reason recorded"
+    raw_until = view.get("until")
+    until = [str(ref) for ref in raw_until] if isinstance(raw_until, list) else []
+    age = view.get("age_s")
+    detail = f"frozen: {reason}"
+    if until:
+        detail += f" (until {', '.join(until)} merge)"
+    if isinstance(age, bool) or not isinstance(age, (int, float)):
+        age_text = "age unknown"
+        stale = False
+    else:
+        age_text = f"age {quotacli.format_age(age)}"
+        stale = age > max_age_s
+    detail += f", {age_text}"
+    if not stale:
+        return [Check("drive-freeze", "ok", detail, "")]
+    return [
+        Check(
+            "drive-freeze",
+            "warn",
+            f"{detail}: older than the {max_age_s}s freeze window",
+            "run `korapy freeze end` to resume dispatch",
+        )
+    ]
+
+
 def _check_repos(sites: Sequence[repodoctor.RepoSite]) -> list[Check]:
     """The remote-dependent rows: warn without a remote, strict with one.
 
@@ -1063,6 +1116,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_drive_timer(env.timer_state),
         *_check_drive_projects(env.project_problems, env.project_policies),
         *_check_area_sites(env.area_sites),
+        *check_freeze(env.freeze_view, env.freeze_max_age_s),
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
@@ -1177,6 +1231,33 @@ def _production_settings(
 def check_settings(start: str, env: Mapping[str, str] | None = None) -> str | None:
     """None when the host config and the ops root's file resolve."""
     return _resolved_settings(start, env)[1]
+
+
+def load_freeze_view(resolved: settings.Resolved | None):
+    """The freeze reading, or the exception reading it raised.
+
+    Only production builds it; tests inject the view into `Env`
+    directly. A missing freeze file is None (no row); an unreadable
+    one is the exception the `drive-freeze` row fails on. Reading
+    never lists units or reaches the tracker.
+    """
+    if resolved is None:
+        max_age_s = freeze.DEFAULT_MAX_AGE_S
+    else:
+        try:
+            max_age_s = resolved["freeze.max_age_s"]
+        except KeyError:
+            max_age_s = freeze.DEFAULT_MAX_AGE_S
+    try:
+        path = freeze.freeze_path()
+    except paths.PathError as err:
+        return err
+    try:
+        return freeze.freeze_view(path, now=time.time(), max_age_s=max_age_s)
+    except freeze.FreezeError as err:
+        return err
+    except OSError as err:
+        return err
 
 
 def load_dep_results() -> tuple[list[deps.Result], str | None]:
@@ -2169,6 +2250,12 @@ def production_env() -> Env:
     project_problems, project_policies = load_project_report()
     area_sites = load_area_report()
     timer_state = load_timer_state()
+    try:
+        freeze_max_age_s = (
+            resolved["freeze.max_age_s"] if resolved is not None else freeze.DEFAULT_MAX_AGE_S
+        )
+    except KeyError:
+        freeze_max_age_s = freeze.DEFAULT_MAX_AGE_S
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None
     hub_auth = load_hub_auth(hub_url)
@@ -2204,6 +2291,8 @@ def production_env() -> Env:
         project_policies=project_policies,
         area_sites=area_sites,
         timer_state=timer_state,
+        freeze_view=load_freeze_view(resolved),
+        freeze_max_age_s=freeze_max_age_s,
         hub_url=hub_url or None,
         hub_auth=hub_auth,
         hub_probe=hub_probe,
