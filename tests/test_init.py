@@ -309,6 +309,9 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.area_fail_open = false  # area lock reads claim-held areas only during a pulls outage: unreadable linked pulls stop holding other tickets
+# drive.area_hold_until_merged = true  # area lock holds through the merge window: an open linked pull on another ticket keeps overlapping areas locked
+# drive.area_prefix = ""  # label prefix naming ticket areas for the area lock (empty means off; for example "area:")
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
@@ -456,6 +459,9 @@ commits.conventional = false
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.area_fail_open = false  # area lock reads claim-held areas only during a pulls outage: unreadable linked pulls stop holding other tickets
+# drive.area_hold_until_merged = true  # area lock holds through the merge window: an open linked pull on another ticket keeps overlapping areas locked
+# drive.area_prefix = ""  # label prefix naming ticket areas for the area lock (empty means off; for example "area:")
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
