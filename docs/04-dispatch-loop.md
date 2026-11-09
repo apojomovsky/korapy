@@ -327,7 +327,8 @@ Per-candidate gate order, cheapest first:
    reviewer leaf's stored prompt, the resume mark `.reprompted`
    inside the reviewer leaf). The command text is built by the one
    `prompts.review_record_command` builder, shared with the reviewer
-   prompt and the takeoff fix hint. A moved or unreadable tip, an
+   prompt and the takeoff fix hint (which appends
+   `--reviewer <reviewer-id>`). A moved or unreadable tip, an
    unreadable prompt, a missing or self-naming author, an unknown
    reviewer session, an unwritable mark, or a refused resume all
    fail closed to the skip; a move after the resume just proceeds,

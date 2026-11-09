@@ -66,11 +66,12 @@ def review_record_command(repo, number, commit, author):
     """The exact `korapy review record` command a reviewer runs.
 
     One builder, one place: the reviewer prompt template, the loop's
-    reprompt message and the takeoff fix hint all carry this string,
-    and an agreement test pins the three copies, so the verdict
-    spelling cannot drift from :data:`korapy.reviewrecord.VERDICTS`
-    again. `repo`, `number`, `commit` and `author` render verbatim:
-    callers pass placeholders (`<change-author>`) or pinned values.
+    reprompt message and the takeoff fix hint all carry this string
+    (the hint appends `--reviewer <reviewer-id>`, pinned by its own
+    agreement test), so the verdict spelling cannot drift from
+    :data:`korapy.reviewrecord.VERDICTS` again. `repo`, `number`,
+    `commit` and `author` render verbatim: callers pass placeholders
+    (`<change-author>`) or pinned values.
     """
     from korapy import reviewrecord
 

@@ -1577,8 +1577,16 @@ def _write_reprompt_mark(mark) -> bool:
 
 
 def _remote_tip(clone, branch, run):
-    """The remote tip sha of `branch`, or "" when missing or unreadable."""
-    sha, _proc = push.remote_head(clone, "origin", branch, run=run)
+    """The remote tip sha of `branch`, or "" when missing or unreadable.
+
+    An unexpected runner error reads as unreadable too: the pin and
+    both revalidations fail closed for the ticket instead of aborting
+    the pass.
+    """
+    try:
+        sha, _proc = push.remote_head(clone, "origin", branch, run=run)
+    except Exception:
+        return ""
     return sha
 
 
@@ -1633,7 +1641,9 @@ def _reprompt_one(repo, number, reviewer, *, title, tgt, mark, run):
     try:
         with open(os.path.join(os.path.dirname(mark), "prompt.md"), encoding="utf-8") as handle:
             prompt = handle.read()
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError is the non-UTF-8 leaf: decoding raises
+        # UnicodeDecodeError, a ValueError, not OSError.
         return "refused: the reviewer prompt is unreadable", "the reviewer prompt is unreadable"
     author = parse_review_author(prompt)
     if not author:
@@ -1723,15 +1733,26 @@ def reprompt_missing_reviews(
                 file=stream,
             )
             continue
-        planned = _reprompt_one(
-            repo,
-            number,
-            reviewer,
-            title=(titles or {}).get(key),
-            tgt=tgt,
-            mark=mark,
-            run=run,
-        )
+        try:
+            planned = _reprompt_one(
+                repo,
+                number,
+                reviewer,
+                title=(titles or {}).get(key),
+                tgt=tgt,
+                mark=mark,
+                run=run,
+            )
+        except Exception as err:
+            # Fail closed for this ticket only: an unexpected planning
+            # error (beyond the refusals `_reprompt_one` returns) never
+            # aborts the pass for the tickets behind it.
+            outcomes[key] = f"refused: reprompt refused ({err})"
+            print(
+                f"{repo}#{number}: review reprompt refused (reprompt refused ({err})), skipped",
+                file=stream,
+            )
+            continue
         if planned[0] != "ok":
             outcome, reason = planned
             outcomes[key] = outcome
