@@ -265,11 +265,29 @@ class DeclaredDefault(unittest.TestCase):
         self.assertEqual(found.provenance.layer, 6)
         self.assertNotIn("built-in", found.provenance.source)
 
+    def test_a_committed_default_beats_the_declared_table(self):
+        tgt = target(
+            resolve(
+                project={
+                    "profiles": {
+                        "default": {"runtime": "muse"},
+                        "fast": {"runtime": "omp"},
+                    },
+                    "profile": {"default": "fast"},
+                }
+            )
+        )
+        found = select(tgt)
+        self.assertEqual(found.profile.name, "fast")
+        self.assertEqual(found.runtime, "omp")
+        self.assertEqual(found.provenance.layer, 6)
+        self.assertIn("committed", found.provenance.source)
+
     def test_a_declared_default_in_a_real_file_selects_its_runtime(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-446-"))
         with open(os.path.join(tmp, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[profiles.default]\nruntime = "muse"\n')
-        resolved = settings.load(root=tmp, repo=None, env={})
+        resolved = settings.load(root=tmp, repo=None, env={"KORAPY_CONFIG": tmp})
         found = select(target(resolved))
         self.assertEqual(found.profile.name, "default")
         self.assertEqual(found.runtime, "muse")
