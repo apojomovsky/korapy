@@ -537,7 +537,10 @@ def _check_review(required, repo, number, toplevel, base):
         else ""
     )
     command = prompts.review_record_command(repo, number, head, "<change-author>")
-    fix = f"ask a reviewer for a verdict on {short}, then record it: `{command}`"
+    # The builder carries the shared core; the hint names the reviewer
+    # explicitly, since a coordinator shell may not set KORAPY_AGENT_ID
+    # to the reviewer (or at all), and `review record` exits 4 without it.
+    fix = f"ask a reviewer for a verdict on {short}, then record it: `{command} --reviewer <reviewer-id>`"
     if record is None:
         return Check("review", FAIL, f"no approving review record for commit {short}", fix)
     if not reviewrecord.approves(record):
