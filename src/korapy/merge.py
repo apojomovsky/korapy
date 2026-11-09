@@ -207,9 +207,11 @@ _monotonic = time.monotonic
 def _resolve_skips(skips) -> frozenset[str]:
     """`skips` as a set, or raise MergeError naming the refused name.
 
-    Unknown names and the identity checks (`lock`, `open`, `head`,
-    `review`, `fork`) are refused: skipping identity is not a policy
-    choice (mirroring takeoff).
+    Only `checks` may be waived. Unknown names, including the
+    readiness rows (`comments`, `objectives`, `tests`), are refused
+    as unknown; the identity checks (`lock`, `open`, `head`,
+    `review`, `fork`) are refused because skipping identity is not
+    a policy choice (mirroring takeoff).
     """
     names = list(skips or [])
     unknown = [name for name in names if name not in SKIPPABLE + IDENTITY]
