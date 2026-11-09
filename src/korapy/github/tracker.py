@@ -102,12 +102,12 @@ def milestone_info_of(payload) -> tuple[str | None, str | None, bool]:
     """The milestone facts of an issues-endpoint object: ``(title, due_on, closed)``.
 
     A missing or null milestone reads as ``(None, None, False)``; a
-    title-less milestone, a non-string due date, or a non-string state
-    is a ``TrackerError``, never a guess. A missing due date reads as
-    ``None`` and a missing or non-closed state reads as open, so
-    title-only fixtures keep working. Pure, so the readers share it
-    with this module's own parse, and no pass spends a new call on it:
-    the facts ride the already-fetched issue payload.
+    title-less milestone, a non-string due date, or a state outside
+    ``None``/``open``/``closed`` is a ``TrackerError``, never a guess.
+    A missing due date reads as ``None`` and a missing or open state
+    reads as open, so title-only fixtures keep working. Pure, so the
+    readers share it with this module's own parse, and no pass spends
+    a new call on it: the facts ride the already-fetched issue payload.
     """
     if not isinstance(payload, dict):
         raise _fail(f"item is not an object: {payload!r}")
@@ -123,9 +123,13 @@ def milestone_info_of(payload) -> tuple[str | None, str | None, bool]:
     if due is not None and not isinstance(due, str):
         raise _fail(f"bad milestone {milestone!r}")
     state = milestone.get("state")
-    if state is not None and not isinstance(state, str):
+    if state is None or state == "open":
+        closed = False
+    elif state == "closed":
+        closed = True
+    else:
         raise _fail(f"bad milestone {milestone!r}")
-    return title, due, state == "closed"
+    return title, due, closed
 
 
 def milestone_of(payload) -> str | None:
@@ -313,11 +317,14 @@ class GithubTracker:
             # key keeps the stored extra when the store merges by key),
             # but the milestone rides along from the same payload: one
             # more field on the existing listing, no new call. A missing
-            # milestone clears the stored one, like the board reader.
+            # milestone clears the stored one, like the board reader,
+            # and the closed flag rides only with a title: an
+            # unmilestoned reading carries an explicit None so the
+            # merge drops a stale stored flag instead of keeping it.
             extra={
                 "milestone": milestone_title,
                 "milestone_due": milestone_due,
-                "milestone_closed": milestone_closed,
+                "milestone_closed": milestone_closed if milestone_title is not None else None,
             },
         )
 

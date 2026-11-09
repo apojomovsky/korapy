@@ -356,17 +356,23 @@ def milestone_sort_key(row) -> tuple:
     return (0, due, _natural_key(title))
 
 
-def _today_key(item) -> tuple:
-    """Today's section 3 key for one candidate. Pure.
+def _section3_key(item, before=(), after=()) -> tuple:
+    """The shared section 3 key, with `before` and `after` slotted in. Pure.
 
-    The one place resolving it: `order` sorts every candidate by this
-    first, so other projects keep today's order byte-for-byte.
+    The one composition behind both orders: the required-kind group,
+    then `before` (the milestone component for the milestone-first
+    re-sort), then the priority rank and the wait, then `after` (the
+    project for today's order), then the repo and number for
+    determinism. Withdrawn rows (no request) sort after every
+    requested kind; missing rows sort with unknown priority and zero
+    wait.
     """
     return (
         KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
+        *before,
         -priority_rank(item.row.priority if item.row is not None else ""),
         item.wait,
-        item.project,
+        *after,
         item.request.repo
         if item.request is not None
         else (item.row.repo if item.row is not None else ""),
@@ -374,6 +380,15 @@ def _today_key(item) -> tuple:
         if item.request is not None
         else (item.row.number if item.row is not None else 0),
     )
+
+
+def _today_key(item) -> tuple:
+    """Today's section 3 key for one candidate. Pure.
+
+    The project, not the milestone, follows the wait, so other
+    projects keep today's order byte-for-byte.
+    """
+    return _section3_key(item, after=(item.project,))
 
 
 def _milestone_key(item) -> tuple:
@@ -385,18 +400,31 @@ def _milestone_key(item) -> tuple:
     repo and number for determinism. The project is constant inside
     one project's re-sort, so it stays out of the key.
     """
-    return (
-        KIND_GROUP.get(item.request.kind, 2) if item.request is not None else 2,
-        milestone_sort_key(item.row) if item.row is not None else _MILESTONE_LAST,
-        -priority_rank(item.row.priority if item.row is not None else ""),
-        item.wait,
-        item.request.repo
-        if item.request is not None
-        else (item.row.repo if item.row is not None else ""),
-        item.request.number
-        if item.request is not None
-        else (item.row.number if item.row is not None else 0),
+    return _section3_key(
+        item,
+        before=(milestone_sort_key(item.row) if item.row is not None else _MILESTONE_LAST,),
     )
+
+
+def _milestone_suffix(row) -> str:
+    """The plan-reason tail naming the row's milestone. Pure.
+
+    The one computation for the milestone reason suffix, shared by
+    the gated verdicts and the host-full shortcut: `; milestone none`
+    for unmilestoned rows, `; milestone <title>` (with ` (closed)`
+    for a closed milestone), and a bad-due note when the stored due
+    date is outside ISO shape.
+    """
+    title, _, closed = row_milestone(row)
+    if title is None:
+        return "; milestone none"
+    suffix = f"; milestone {title}"
+    if closed:
+        suffix += " (closed)"
+    raw_due = _stored_due(row)
+    if raw_due is not None and raw_due != "" and not _due_is_iso(raw_due):
+        suffix += f" (bad due {raw_due})"
+    return suffix
 
 
 def order(entries: Sequence[GateInput], *, milestone_first=frozenset()) -> list[GateInput]:
@@ -2901,6 +2929,9 @@ def _gate_all(
     stop_starts = False
     gated_rows = []
     for candidate in order(candidates, milestone_first=milestone_projects):
+        suffix = ""
+        if candidate.project in milestone_projects and candidate.row is not None:
+            suffix = _milestone_suffix(candidate.row)
         if candidate.request is not None and candidate.row is not None:
             holder_now = candidate.row.agent if candidate.row is not None else ""
             effective_kind = route_kind(candidate.request.kind, holder_now)
@@ -2917,7 +2948,7 @@ def _gate_all(
                         number=candidate.request.number,
                         kind=effective_kind,
                         verdict="skip",
-                        reason=f"{ref}: host full, new starts stop here",
+                        reason=f"{ref}: host full, new starts stop here{suffix}",
                         code=admission.TOTAL_FULL,
                     )
                 )
@@ -2945,18 +2976,8 @@ def _gate_all(
             area_hold_until_merged=area_hold_until_merged,
             area_fail_open=area_fail_open,
         )
-        if candidate.project in milestone_projects and candidate.row is not None:
-            title, _, closed = row_milestone(candidate.row)
-            if title is not None:
-                suffix = f"; milestone {title}"
-                if closed:
-                    suffix += " (closed)"
-                raw_due = _stored_due(candidate.row)
-                if raw_due is not None and raw_due != "" and not _due_is_iso(raw_due):
-                    suffix += f" (bad due {raw_due})"
-                verdict = replace(verdict, reason=verdict.reason + suffix)
-            else:
-                verdict = replace(verdict, reason=verdict.reason + "; milestone none")
+        if suffix:
+            verdict = replace(verdict, reason=verdict.reason + suffix)
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
