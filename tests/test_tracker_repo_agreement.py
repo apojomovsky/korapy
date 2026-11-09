@@ -294,15 +294,37 @@ def _default_offenders(tree, name):
     ]
 
 
+def _scan_offenders(root):
+    """`["{relative path}:{lineno}"]` for every `tracker.repo` fallback.
+
+    Every file under `root` (including subpackages), so a fallback
+    hiding in `github/` or `web/` cannot pass the gate by nesting.
+    """
+    root = pathlib.Path(root)
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        name = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        offenders.extend(_or_offenders(tree, name))
+        offenders.extend(_default_offenders(tree, name))
+    return offenders
+
+
 class ResolverGuard(unittest.TestCase):
     def test_no_tracker_repo_or_fallback_outside_the_helper(self):
         root = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
-        offenders = []
-        for path in sorted(root.glob("*.py")):
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-            offenders.extend(_or_offenders(tree, path.name))
-            offenders.extend(_default_offenders(tree, path.name))
-        self.assertEqual(offenders, [])
+        self.assertEqual(_scan_offenders(root), [])
+
+    def test_scan_covers_subpackages(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-tracker-guard-")
+        self.addCleanup(tmp.cleanup)
+        pkg = os.path.join(tmp.name, "sub")
+        os.makedirs(pkg)
+        with open(os.path.join(pkg, "mod.py"), "w", encoding="utf-8") as handle:
+            handle.write('repo = resolved.get("tracker.repo", name)\n')
+        with open(os.path.join(tmp.name, "top.py"), "w", encoding="utf-8") as handle:
+            handle.write('repo = resolved["tracker.repo"]\n')
+        self.assertEqual(_scan_offenders(tmp.name), ["sub/mod.py:1"])
 
     def test_or_with_subscript_fallback_is_flagged(self):
         tree = ast.parse('repo = resolved["tracker.repo"] or name\n')
