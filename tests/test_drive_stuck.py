@@ -543,6 +543,54 @@ class RestartPassTest(unittest.TestCase):
         self.assertIn("restart", out.getvalue())
         self.assertEqual(drive.load_restarts(self.budget), {"app#7": [NOW]})
 
+    def test_a_stuck_research_worker_restarts_with_the_research_kind(self):
+        store = board.open_store(self.db)
+        self.addCleanup(store.close)
+        store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                kind="issue",
+                title="Title 7",
+                body="Body",
+                state="open",
+                author="operator",
+                labels=["research"],
+                priority="",
+                assignees=[],
+                url="https://example.com/app/7",
+                tracker_updated_at=1000.0,
+                extra={},
+            ),
+            operators=["operator"],
+            now=1000.0,
+        )
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 7)),
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        project, repo, number, kind, agent, _title, _author = launcher.calls[0]
+        self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "research"))
+        self.assertEqual(agent, AGENT)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+        self.assertEqual(drive.load_restarts(self.budget), {"app#7": [NOW]})
+
     def test_a_stale_heartbeat_with_a_live_unit_only_watches(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
