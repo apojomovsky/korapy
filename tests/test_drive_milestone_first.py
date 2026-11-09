@@ -247,6 +247,48 @@ class MilestoneOrderTest(unittest.TestCase):
         ]
         self.assertEqual(ordered(entries, milestone_first={"blue"}), [("app", 2), ("app", 1)])
 
+    def test_impossible_due_date_sorts_as_dateless(self):
+        # Month 13 matches the ISO shape but is not a real date, so it
+        # reads as no due date and sorts behind every dated milestone.
+        entries = [
+            candidate(
+                "blue",
+                "start",
+                row(1, priority="normal", extra=milestone_extra("M9", "2026-13-01T00:00:00Z")),
+            ),
+            candidate(
+                "blue",
+                "start",
+                row(2, priority="normal", extra=milestone_extra("M1", "2026-12-01T00:00:00Z")),
+            ),
+        ]
+        self.assertEqual(ordered(entries, milestone_first={"blue"}), [("app", 2), ("app", 1)])
+
+    def test_two_opted_in_projects_reorder_within_each_project(self):
+        # Both projects opt in, so each re-sorts its own candidates by
+        # milestone into the slots today's order gives it: blue's dated
+        # ticket and green's dated ticket each move ahead of their own
+        # project's unmilestoned urgent, while neither project moves
+        # into the other's slots.
+        entries = [
+            candidate("blue", "start", row(1, priority="urgent")),
+            candidate(
+                "blue",
+                "start",
+                row(2, priority="backlog", extra=milestone_extra("M1", DUE_EARLY)),
+            ),
+            candidate("green", "start", row(3, priority="urgent")),
+            candidate(
+                "green",
+                "start",
+                row(4, priority="backlog", extra=milestone_extra("M0", DUE_LATE)),
+            ),
+        ]
+        self.assertEqual(
+            ordered(entries, milestone_first={"blue", "green"}),
+            [("app", 2), ("app", 4), ("app", 1), ("app", 3)],
+        )
+
     def test_setting_off_ignores_milestones(self):
         entries = [
             candidate("blue", "start", row(1, priority="urgent")),
@@ -327,6 +369,22 @@ class MilestoneInfoTest(unittest.TestCase):
                 with self.assertRaises(iface.TrackerError):
                     ghtracker.milestone_info_of({"milestone": milestone})
 
+    def test_unknown_state_fails(self):
+        # Only a missing, open or closed state reads; anything else is
+        # a TrackerError, never a silent guess at open.
+        for state in ("bogus", "", "OPEN", "Closed", 3):
+            with self.subTest(state=state):
+                with self.assertRaises(iface.TrackerError):
+                    ghtracker.milestone_info_of({"milestone": {"title": "M1", "state": state}})
+        self.assertEqual(
+            ghtracker.milestone_info_of({"milestone": {"title": "M1", "state": "open"}}),
+            ("M1", None, False),
+        )
+        self.assertEqual(
+            ghtracker.milestone_info_of({"milestone": {"title": "M1", "state": "closed"}}),
+            ("M1", None, True),
+        )
+
     def test_blank_title_fails_like_a_missing_title(self):
         # A whitespace-only title syncs no milestone the pass can read
         # (the row reader strips it), so the sync rejects it the same
@@ -359,6 +417,38 @@ class MilestoneSyncTest(unittest.TestCase):
         self.assertEqual(found[0].extra["milestone_due"], DUE_EARLY)
         self.assertIs(found[0].extra["milestone_closed"], False)
         self.assertEqual([item.extra["milestone_due"] for item in found], [DUE_EARLY, None])
+        # An unmilestoned row carries an explicit None flag: the flag
+        # rides only with a title, and the None lets the store merge
+        # drop a stale stored flag instead of keeping it.
+        self.assertIsNone(found[1].extra["milestone_closed"])
+
+    def test_removed_milestone_clears_the_stored_closed_flag(self):
+        # A row that loses its milestone must not keep a stale
+        # milestone_closed: True: the reading carries None, and the
+        # store merge drops the key.
+        run = FakeRun()
+        path = (
+            "repos/acme/app/issues?state=all&sort=updated"
+            f"&direction=asc&per_page={ghtracker.PER_PAGE}"
+        )
+        run.add(
+            path,
+            [
+                item_payload(
+                    1,
+                    milestone={"title": "M1", "due_on": DUE_EARLY, "state": "closed"},
+                ),
+                item_payload(2),
+            ],
+        )
+        adapter = ghtracker.GithubTracker(run)
+        found = {item.number: item for item in adapter.items("acme/app")}
+        self.assertIs(found[1].extra["milestone_closed"], True)
+        stored = dict(found[1].extra)
+        merged = board.merge_extra(stored, found[2].extra)
+        self.assertNotIn("milestone_closed", merged)
+        self.assertNotIn("milestone", merged)
+        self.assertNotIn("milestone_due", merged)
 
 
 def milestone_project(tmp, name="blue", milestone_first=True):
@@ -413,6 +503,90 @@ class MilestoneGateTest(unittest.TestCase):
             [(row.repo, row.number) for row in gated],
             [("app", 2), ("app", 3), ("app", 1)],
         )
+        self.assertIn("; milestone M1", gated[0].reason)
+        self.assertIn("; milestone M2", gated[1].reason)
+        self.assertIn("; milestone none", gated[2].reason)
+
+    def test_closed_milestone_names_the_closure_in_the_reason(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-ms-gate-"))
+        project = milestone_project(tmp)
+        items = [
+            board_item(
+                "app",
+                1,
+                priority="normal",
+                extra=milestone_extra("M0", DUE_EARLY, closed=True),
+            ),
+            board_item("app", 2, priority="normal"),
+            board_item("app", 3, priority="backlog"),
+        ]
+        out = io.StringIO()
+        gated, problems, _, _, _, _, _ = drive._gate_all(
+            items,
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            [(row.repo, row.number) for row in gated],
+            [("app", 1), ("app", 2), ("app", 3)],
+        )
+        self.assertIn("; milestone M0 (closed)", gated[0].reason)
+        self.assertIn("; milestone none", gated[1].reason)
+        self.assertIn("; milestone none", gated[2].reason)
+
+    def test_host_full_skip_still_names_the_milestone(self):
+        # The host-full shortcut skips without gating, but the reason
+        # still names the row's milestone for an opted-in project.
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-ms-gate-"))
+        project = milestone_project(tmp)
+        items = [
+            board_item(
+                "app",
+                1,
+                priority="urgent",
+                extra=milestone_extra("M1", DUE_EARLY),
+            ),
+            board_item(
+                "app",
+                2,
+                priority="normal",
+                extra=milestone_extra("M2", DUE_LATE),
+            ),
+            board_item("app", 3, priority="normal"),
+        ]
+        out = io.StringIO()
+        gated, problems, _, _, _, _, _ = drive._gate_all(
+            items,
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset({("blue", "app", 9)}),
+            limits=admission.Limits(total=1),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            [(row.repo, row.number) for row in gated],
+            [("app", 1), ("app", 2), ("app", 3)],
+        )
+        self.assertIn("host full", gated[0].reason)
+        self.assertIn("new starts stop here", gated[1].reason)
+        self.assertIn("new starts stop here", gated[2].reason)
         self.assertIn("; milestone M1", gated[0].reason)
         self.assertIn("; milestone M2", gated[1].reason)
         self.assertIn("; milestone none", gated[2].reason)

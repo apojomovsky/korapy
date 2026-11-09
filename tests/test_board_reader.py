@@ -727,6 +727,26 @@ class PollItemsTest(unittest.TestCase):
         found = self.poll_one(run, [], milestone=None)
         self.assertIn("milestone", found.extra)
         self.assertIsNone(found.extra["milestone"])
+        self.assertIsNone(found.extra["milestone_closed"])
+
+    def test_removed_milestone_clears_the_stored_closed_flag(self):
+        # A row that loses its milestone must not keep a stale
+        # milestone_closed: True: the reading carries None, and the
+        # store merge drops the key.
+        run = BoardFakeRun()
+        with_milestone = self.poll_one(
+            run,
+            [],
+            milestone={"title": "M1", "due_on": "2026-11-30T00:00:00Z", "state": "closed"},
+        )
+        self.assertIs(with_milestone.extra["milestone_closed"], True)
+        stored = dict(with_milestone.extra)
+        run = BoardFakeRun()
+        without = self.poll_one(run, [], milestone=None)
+        merged = store.merge_extra(stored, without.extra)
+        self.assertNotIn("milestone_closed", merged)
+        self.assertNotIn("milestone", merged)
+        self.assertNotIn("milestone_due", merged)
 
     def test_board_updated_at_is_the_max_of_both_times(self):
         run = BoardFakeRun()
