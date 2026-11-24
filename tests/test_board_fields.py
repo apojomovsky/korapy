@@ -52,7 +52,7 @@ def _guarded_pacer_factory() -> NoReturn:
     raise AssertionError("test reached the default GraphQL pacer: inject a fake pacer")
 
 
-_guarded_pacer_factory._korapy_pacer_guard = True  # ty: ignore[unresolved-attribute]
+_guarded_pacer_factory._korapy_pacer_guard = True  # ty: ignore[missing-attribute]
 gh._pacer = _guarded_pacer_factory  # ty: ignore[invalid-assignment]
 
 

@@ -97,9 +97,9 @@ class SharedLoopTest(unittest.TestCase):
         self.assertEqual(report.refused, ())
         self.assertIsNone(report.stopped)
         flags = run.flag_values("AddItem", "")
-        self.assertIn("projectId=PVT_1", flags)
-        self.assertIn("contentId=I_2", flags)
-        self.assertNotIn("contentId=I_1", flags)
+        self.assertIn("project=PVT_1", flags)
+        self.assertIn("content=I_2", flags)
+        self.assertNotIn("content=I_1", flags)
 
     def test_an_already_present_issue_is_kept_without_a_mutation(self):
         run = ProvisionFakeRun()
@@ -185,7 +185,7 @@ class AdoptingTrackerTest(unittest.TestCase):
         self.assertEqual(report.refused, ())
         self.assertIsNone(report.stopped)
         flags = run.graphql_variables("AddItem")
-        added_ids = [call["contentId"] for call in flags]
+        added_ids = [call["content"] for call in flags]
         self.assertEqual(added_ids, ["I_2", "I_3"])
 
     def test_adopt_respects_the_cap(self):

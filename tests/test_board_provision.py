@@ -527,9 +527,9 @@ class FullCreateTests(unittest.TestCase):
         provisioner, spec = bootstrap_provisioner_for(run)
         provisioner.ensure_board(spec)
         flags = run.flag_values("BoardCreate", "")
-        self.assertIn("ownerId=U_1", flags)
+        self.assertIn("owner=U_1", flags)
         self.assertIn("title=demo board", flags)
-        self.assertIn("repositoryId=R_1", flags)
+        self.assertIn("repo=R_1", flags)
 
     def test_created_select_options_carry_color_and_description(self):
         run = script_full_create(ProvisionFakeRun())
@@ -550,13 +550,13 @@ class FullCreateTests(unittest.TestCase):
         )
         provisioner, spec = bootstrap_provisioner_for(run)
         provisioner.ensure_board(spec)
-        names = run.flag_values("SelectFieldCreate", "singleSelectOptions[][name]")
-        self.assertIn("singleSelectOptions[][name]=Urgent", names)
-        self.assertIn("singleSelectOptions[][name]=Todo", names)
-        colors = run.flag_values("SelectFieldCreate", "singleSelectOptions[][color]")
+        names = run.flag_values("SelectFieldCreate", "options[][name]")
+        self.assertIn("options[][name]=Urgent", names)
+        self.assertIn("options[][name]=Todo", names)
+        colors = run.flag_values("SelectFieldCreate", "options[][color]")
         self.assertTrue(colors)
         self.assertTrue(all(value.split("=", 1)[1] for value in colors))
-        descs = run.flag_values("SelectFieldCreate", "singleSelectOptions[][description]")
+        descs = run.flag_values("SelectFieldCreate", "options[][description]")
         self.assertEqual(len(descs), len(names))
 
     def test_create_without_a_repo_sends_no_link(self):
@@ -765,6 +765,115 @@ def addressed_run(*fields, repos=("example/demo",), public=False, final_fields=N
     return run
 
 
+def link_answer(repo="example/demo", rid="R_1"):
+    """A link-mutation answer for one repository."""
+    return {"linkProjectV2ToRepository": {"repository": {"id": rid, "nameWithOwner": repo}}}
+
+
+class ExistingUserBoardTests(unittest.TestCase):
+    """An addressed user-owned board: ids resolve, nulls never ship.
+
+    The setup repro names an existing user-owned board by number while
+    the link is missing and three fields are missing: the ensure must
+    send the link and the field creations with the looked-up project
+    and repository ids, never null. A board object without a node id
+    stops with a plain ``TrackerError`` naming the id before any
+    mutation, and a config table that differs from the standard one
+    still links and creates by the resolved ids.
+    """
+
+    def test_link_and_field_creates_carry_the_looked_up_ids(self):
+        live = [
+            text_node("F_agent", "Agent"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+        ]
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script("BoardByNumber", [by_number(project_node(repos=(), fields=live))])
+        run.add_rest("repos/example/demo", {"node_id": "R_1"})
+        run.script("BoardLinkRepo", [link_answer()])
+        run.script(
+            "TextFieldCreate",
+            [
+                {"createProjectV2Field": {"projectV2Field": {"id": "F_new1", "name": name}}}
+                for name in ("Agent state", "Blocked by")
+            ],
+        )
+        run.script(
+            "SelectFieldCreate",
+            [{"createProjectV2Field": {"projectV2Field": {"id": "F_new2", "name": "Priority"}}}],
+        )
+        run.script("BoardById", by_id(project_node(fields=standard_field_nodes())))
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.ensure_board(spec)
+        self.assertEqual(
+            report.created,
+            ("link:example/demo", "field:Agent state", "field:Priority", "field:Blocked by"),
+        )
+        self.assertEqual(report.refused, ())
+        link_flags = [
+            flag for flag in run.flag_values("BoardLinkRepo", "") if not flag.startswith("query=")
+        ]
+        self.assertCountEqual(link_flags, ["project=PVT_1", "repo=R_1"])
+        for marker in ("TextFieldCreate", "SelectFieldCreate"):
+            self.assertIn("project=PVT_1", run.flag_values(marker, ""))
+        self.assertIn("field:Agent", report.kept)
+        self.assertIn("field:Status", report.kept)
+
+    def test_null_project_id_stops_before_any_mutation(self):
+        bad = project_node()
+        bad["id"] = None
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script("BoardByNumber", [by_number(bad)])
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(iface.TrackerError) as caught:
+            provisioner.ensure_board(spec)
+        self.assertIn("project id", str(caught.exception))
+        self.assertEqual(run.mutations(), [])
+
+    def test_custom_table_on_an_existing_board_links_and_creates_by_id(self):
+        live = [
+            text_node("F_agent", "Agent"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+            text_node("F_blocked", "Blocked by"),
+        ]
+        final = [
+            text_node("F_agent", "Agent"),
+            text_node("F_status", "Agent state"),
+            select_node("F_state", "State", STATUS_OPTIONS),
+            select_node("F_prio", "Prio", PRIORITY_OPTIONS),
+            text_node("F_blocked", "Blocked by"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+        ]
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script("BoardByNumber", [by_number(project_node(repos=(), fields=live))])
+        run.add_rest("repos/example/demo", {"node_id": "R_1"})
+        run.script("BoardLinkRepo", [link_answer()])
+        run.script(
+            "TextFieldCreate",
+            [{"createProjectV2Field": {"projectV2Field": {"id": "F_new1", "name": "Agent state"}}}],
+        )
+        run.script(
+            "SelectFieldCreate",
+            [
+                {"createProjectV2Field": {"projectV2Field": {"id": fid, "name": name}}}
+                for fid, name in (("F_new2", "State"), ("F_new3", "Prio"))
+            ],
+        )
+        run.script("BoardById", by_id(project_node(fields=final)))
+        provisioner = GithubBoardProvisioner(run, pacer=FakePacer())
+        spec = spec_for(table(status_column="State", priority_column="Prio"))
+        report = provisioner.ensure_board(spec)
+        self.assertEqual(
+            report.created,
+            ("link:example/demo", "field:Agent state", "field:State", "field:Prio"),
+        )
+        self.assertEqual(report.refused, ())
+        link_flags = [
+            flag for flag in run.flag_values("BoardLinkRepo", "") if not flag.startswith("query=")
+        ]
+        self.assertCountEqual(link_flags, ["project=PVT_1", "repo=R_1"])
+
+
 class FieldEnsureTests(unittest.TestCase):
     def test_missing_ranks_append_with_the_live_list_resent(self):
         live = [
@@ -792,13 +901,13 @@ class FieldEnsureTests(unittest.TestCase):
         self.assertEqual(report.created, ("option:Priority/Low", "option:Priority/Backlog"))
         self.assertIn("field:Priority", report.kept)
         self.assertEqual(report.refused, ())
-        flags = run.flag_values("OptionsAppend", "singleSelectOptions[]")
+        flags = run.flag_values("OptionsAppend", "options[]")
         id_flags = [flag for flag in flags if "[id]=" in flag]
         self.assertEqual(len(id_flags), 3)
-        self.assertIn("singleSelectOptions[][id]=opt-1", flags)
-        self.assertIn("singleSelectOptions[][color]=RED", flags)
-        self.assertIn("singleSelectOptions[][name]=Low", flags)
-        self.assertNotIn("singleSelectOptions[][id]=opt-4", flags)
+        self.assertIn("options[][id]=opt-1", flags)
+        self.assertIn("options[][color]=RED", flags)
+        self.assertIn("options[][name]=Low", flags)
+        self.assertNotIn("options[][id]=opt-4", flags)
         self.assertEqual(
             report.priority_map,
             {
