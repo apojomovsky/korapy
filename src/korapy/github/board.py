@@ -1733,9 +1733,9 @@ class GithubBoardProvisioner:
         Returns ``(id, number, title, public, repos, live fields, field
         ids by name)``; the ids serve the option-append update, which the
         planner input does not carry. A board object without a node id
-        raises ``ValueError`` naming the missing project id instead: no
-        link or field mutation can address it, so the ensure stops
-        before sending one.
+        fails closed naming the missing project id instead: no link or
+        field mutation can address it, so the ensure stops before
+        sending one.
         """
         if not isinstance(payload, dict):
             raise _fail(f"board project is not an object: {payload!r}")
@@ -1744,10 +1744,7 @@ class GithubBoardProvisioner:
         title = payload.get("title")
         public = payload.get("public")
         if not isinstance(project_id, str) or not project_id:
-            raise ValueError(
-                "the board lookup returned no project id: refusing to link "
-                "or create fields against a board without one"
-            )
+            raise _fail("the board lookup returned no project id")
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise _fail(f"bad board project number {number!r}")
         if not isinstance(title, str) or not title:
@@ -2048,6 +2045,16 @@ class GithubBoardProvisioner:
         Never alters or deletes what exists: an existing field is kept
         byte-for-byte, and options are only ever appended to a kept
         Priority field. See the class docstring for the error contract.
+
+        GitHub calls, all paced through the shared bucket: two reads to
+        find the board (owner, then by-number), one REST repo read plus
+        one link mutation when the link is missing, one mutation per
+        created field (one more per kept Priority field gaining ranks),
+        and one by-id read-back. An already-converged board costs three
+        GraphQL reads and no mutation; a board missing its link and
+        three fields costs seven GraphQL calls and one REST call.
+        ``populate`` adds one membership read, one issue listing, and
+        one mutation per added issue.
         """
         _, owner_id = self._resolve_owner(spec.owner)
         created: list = []

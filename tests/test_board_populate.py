@@ -315,5 +315,65 @@ class PopulateAfterEnsureTests(unittest.TestCase):
         self.assertFalse(run.has_mutation("BoardLinkRepo"))
 
 
+class ExistingUserBoardAddItemTests(unittest.TestCase):
+    """Six missing issues on an existing user-owned board: ids resolve, then doctor clears.
+
+    The sweep's add-item path shares the provisioner's single id source:
+    every ``AddItem`` mutation carries the looked-up board id with a
+    non-null content id, all six issues land on the board, the link step
+    stays skipped, and the ``board`` and ``board-drift`` doctor rows read
+    ok once the membership covers the stored rows with no drift verdicts.
+    """
+
+    NUMBERS = (449, 450, 451, 452, 453, 454)
+
+    def test_six_missing_issues_are_added_with_the_board_id_then_doctor_clears(self):
+        from tests.test_board_doctor import check, site, stored_numbers, tempdir
+        from tests.test_board_planner import spec_for, table
+        from tests.test_board_provision import (
+            by_id,
+            by_number,
+            owner_body,
+            project_node,
+            standard_field_nodes,
+        )
+
+        board = project_node(fields=standard_field_nodes())
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script("BoardByNumber", [by_number(board)])
+        run.script("BoardById", by_id(board))
+        provisioner = provisioner_for(run)
+        ensured = provisioner.ensure_board(spec_for(table()))
+        self.assertEqual(ensured.created, ())
+        self.assertIn("link:example/demo", ensured.kept)
+        self.assertEqual(ensured.project_id, "PVT_1")
+        items_route(run, items_page())
+        issues_route(run, [issue(number) for number in self.NUMBERS])
+        add_route(run, [added_answer(f"ITEM_{number}") for number in self.NUMBERS])
+        report = provisioner.populate(ensured.project_id, "example/demo")
+        self.assertEqual(report.added, tuple(f"example/demo#{number}" for number in self.NUMBERS))
+        self.assertEqual(report.kept, ())
+        self.assertEqual(report.refused, ())
+        self.assertFalse(run.has_mutation("BoardLinkRepo"))
+        add_queries = [query for query in run.queries() if "AddItem" in query]
+        self.assertEqual(len(add_queries), len(self.NUMBERS))
+        flags = [flag for flag in run.flag_values("AddItem", "") if not flag.startswith("query=")]
+        self.assertEqual(flags.count("project=PVT_1"), len(self.NUMBERS))
+        contents = sorted(flag for flag in flags if flag.startswith("content="))
+        self.assertEqual(contents, [f"content=I_{number}" for number in self.NUMBERS])
+        directory = tempdir()
+        stored_numbers(directory, *self.NUMBERS)
+        rows = check(
+            [site(drift_max_age_s=600)],
+            store_dir=directory,
+            refs=[("example/demo", number) for number in self.NUMBERS],
+        )
+        self.assertEqual(
+            [row.name for row in rows],
+            ["board:example/demo", "board-drift:example/demo"],
+        )
+        self.assertTrue(all(row.status == "ok" for row in rows))
+
+
 if __name__ == "__main__":
     unittest.main()

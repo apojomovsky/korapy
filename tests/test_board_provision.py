@@ -777,7 +777,7 @@ class ExistingUserBoardTests(unittest.TestCase):
     the link is missing and three fields are missing: the ensure must
     send the link and the field creations with the looked-up project
     and repository ids, never null. A board object without a node id
-    stops with a plain ``ValueError`` naming the id before any
+    stops with a plain ``TrackerError`` naming the id before any
     mutation, and a config table that differs from the standard one
     still links and creates by the resolved ids.
     """
@@ -825,7 +825,7 @@ class ExistingUserBoardTests(unittest.TestCase):
         run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
         run.script("BoardByNumber", [by_number(bad)])
         provisioner, spec = provisioner_for(run)
-        with self.assertRaises(ValueError) as caught:
+        with self.assertRaises(iface.TrackerError) as caught:
             provisioner.ensure_board(spec)
         self.assertIn("project id", str(caught.exception))
         self.assertEqual(run.mutations(), [])
