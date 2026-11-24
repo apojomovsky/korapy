@@ -1501,7 +1501,7 @@ def _add_item(run, pacer, project_id, content_id):
     attempts = 0
     while True:
         try:
-            payload = _mutate(run, pacer, _ADD_ITEM, projectId=project_id, contentId=content_id)
+            payload = _mutate(run, pacer, _ADD_ITEM, project=project_id, content=content_id)
         except iface.TrackerRateLimited:
             raise
         except _BoardForbidden as err:
@@ -1732,7 +1732,10 @@ class GithubBoardProvisioner:
 
         Returns ``(id, number, title, public, repos, live fields, field
         ids by name)``; the ids serve the option-append update, which the
-        planner input does not carry.
+        planner input does not carry. A board object without a node id
+        fails closed naming the missing project id instead: no link or
+        field mutation can address it, so the ensure stops before
+        sending one.
         """
         if not isinstance(payload, dict):
             raise _fail(f"board project is not an object: {payload!r}")
@@ -1741,7 +1744,7 @@ class GithubBoardProvisioner:
         title = payload.get("title")
         public = payload.get("public")
         if not isinstance(project_id, str) or not project_id:
-            raise _fail(f"bad board project id {project_id!r}")
+            raise _fail("the board lookup returned no project id")
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise _fail(f"bad board project number {number!r}")
         if not isinstance(title, str) or not title:
@@ -1853,9 +1856,9 @@ class GithubBoardProvisioner:
 
     def _create_board(self, spec, owner_id, repo_id):
         """The spec's board, created and read back, as parsed data."""
-        variables = {"ownerId": owner_id, "title": spec.title}
+        variables = {"owner": owner_id, "title": spec.title}
         if repo_id is not None:
-            variables["repositoryId"] = repo_id
+            variables["repo"] = repo_id
         payload = self._mutate(_CREATE, **variables)
         node = payload.get("createProjectV2") if isinstance(payload, dict) else None
         project = node.get("projectV2") if isinstance(node, dict) else None
@@ -1873,7 +1876,7 @@ class GithubBoardProvisioner:
         gates everything after it: when the update errors the error
         propagates and nothing else runs.
         """
-        payload = self._mutate(_MAKE_PRIVATE, projectId=project_id)
+        payload = self._mutate(_MAKE_PRIVATE, project=project_id)
         node = payload.get("updateProjectV2") if isinstance(payload, dict) else None
         if not isinstance(node, dict) or not isinstance(node.get("projectV2"), dict):
             raise _fail(f"unusable board update answer: {payload!r}")
@@ -1921,7 +1924,7 @@ class GithubBoardProvisioner:
             refused.append(_link_fix(spec.repo))
             return
         try:
-            payload = self._mutate(_LINK, projectId=project_id, repositoryId=repo_id)
+            payload = self._mutate(_LINK, project=project_id, repo=repo_id)
         except iface.TrackerRateLimited:
             raise
         except _BoardForbidden:
@@ -1940,7 +1943,7 @@ class GithubBoardProvisioner:
     def _create_field(self, project_id, field):
         """One spec field created, with its standard options when single-select."""
         if field.kind == "text":
-            payload = self._mutate(_TEXT_FIELD_CREATE, projectId=project_id, name=field.name)
+            payload = self._mutate(_TEXT_FIELD_CREATE, project=project_id, name=field.name)
         else:
             options = [
                 {"name": name, "color": _NEW_OPTION_COLOR, "description": ""}
@@ -1948,9 +1951,9 @@ class GithubBoardProvisioner:
             ]
             payload = self._mutate(
                 _SELECT_FIELD_CREATE,
-                projectId=project_id,
+                project=project_id,
                 name=field.name,
-                singleSelectOptions=options,
+                options=options,
             )
         node = payload.get("createProjectV2Field") if isinstance(payload, dict) else None
         created = node.get("projectV2Field") if isinstance(node, dict) else None
@@ -1991,9 +1994,7 @@ class GithubBoardProvisioner:
         options += [
             {"name": name, "color": _NEW_OPTION_COLOR, "description": ""} for name in missing
         ]
-        payload = self._mutate(
-            _OPTIONS_APPEND, fieldId=field_ids[plan.name], singleSelectOptions=options
-        )
+        payload = self._mutate(_OPTIONS_APPEND, field=field_ids[plan.name], options=options)
         node = payload.get("updateProjectV2Field") if isinstance(payload, dict) else None
         if not isinstance(node, dict) or not isinstance(node.get("projectV2Field"), dict):
             raise _fail(f"unusable board options answer: {payload!r}")
@@ -2044,6 +2045,16 @@ class GithubBoardProvisioner:
         Never alters or deletes what exists: an existing field is kept
         byte-for-byte, and options are only ever appended to a kept
         Priority field. See the class docstring for the error contract.
+
+        GitHub calls, all paced through the shared bucket: two reads to
+        find the board (owner, then by-number), one REST repo read plus
+        one link mutation when the link is missing, one mutation per
+        created field (one more per kept Priority field gaining ranks),
+        and one by-id read-back. An already-converged board costs three
+        GraphQL reads and no mutation; a board missing its link and
+        three fields costs seven GraphQL calls and one REST call.
+        ``populate`` adds one membership read, one issue listing, and
+        one mutation per added issue.
         """
         _, owner_id = self._resolve_owner(spec.owner)
         created: list = []
