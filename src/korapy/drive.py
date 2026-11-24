@@ -2689,9 +2689,10 @@ def milestone_first_for(registered):
 def area_configs_for(registered):
     """Per-project (prefix, hold_until_merged, fail_open). Pure lookup.
 
-    The one resolver both `_gate_all` (gate params, extended fetch
-    set) and the claiming pass (in-pass re-check) read through, so a
-    project setting never resolves twice two ways. A project whose
+    The one resolver for a pass: `_launching_pass` resolves once and
+    threads the map into `_gate_all` (gate params, extended fetch
+    set) and the claiming pass (in-pass re-check), so a project
+    setting never resolves twice two ways in one pass. A project whose
     settings fail to load is left out of the map and reads as opted
     out: the same broken file already fails the pass through the quota
     settings the main loop resolves for that project, so this reader
@@ -2735,6 +2736,7 @@ def _gate_all(
     pulls_max_calls=None,
     claims_by_key=None,
     driven,
+    area_configs=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -2794,7 +2796,9 @@ def _gate_all(
     pass: the pulls-less pre-pass and the main loop share the loaded
     policies, so a policy's top-level code runs once per pass.
     With a non-empty `drive.area_prefix` a project's lock options
-    resolve through `area_configs_for`, same-project rows whose
+    resolve through `area_configs_for` (threaded in as `area_configs`
+    by a launching pass, which resolves once per pass; resolved here
+    only when no map is threaded), same-project rows whose
     in-hand labels carry the prefix join the pulls fetch set (reusing
     the one listing per repository), and the gate refuses overlapping
     starts with code `area`. With `eligibility.milestone_first` on for
@@ -2835,7 +2839,8 @@ def _gate_all(
             )
         except eligibility.EligibilityError as problem:
             policy_errors[project.name] = problem
-    area_configs = area_configs_for(registered)
+    if area_configs is None:
+        area_configs = area_configs_for(registered)
     milestone_projects = {name for name, on in milestone_first_for(registered).items() if on}
     if index_for is not None:
         wanted: set = set()
@@ -5020,7 +5025,8 @@ def _claim_and_launch(
     fresh claim (before any hub proposal), with the tickets this pass
     already claimed added as synthetic same-project holders: the
     second same-area start refuses with code `area` and its claim is
-    never minted. Research rows bypass the re-check like they bypass
+    never minted. A synthetic holder is dropped when its launch fails
+    and its fresh claim is released (a lost race keeps both). Research rows bypass the re-check like they bypass
     the gate, and a gated start missing from the snapshot refuses
     fail-closed instead of claiming blind. With none the loop claims
     as before.
@@ -5615,8 +5621,10 @@ def _claim_and_launch(
             rows.append(skipped)
             continue
         base = (area_rows or {}).get((gated.project, gated.repo, gated.number))
+        synthetic = None
         if base is not None and prefix:
-            claimed_areas.append((gated.project, replace(base, agent=agent, pulls=())))
+            synthetic = (gated.project, replace(base, agent=agent, pulls=()))
+            claimed_areas.append(synthetic)
         if launcher is None:
             rows.append(
                 Gated(
@@ -5654,6 +5662,21 @@ def _claim_and_launch(
                     store, gated.repo, gated.number, agent, now=now, role="fresh"
                 )
             )
+            if not race and synthetic is not None:
+                try:
+                    current = store.claim_of(gated.repo, gated.number)
+                except (board.StoreError, sqlite3.Error):
+                    kept = True
+                else:
+                    kept = current is not None
+                    if kept and current.agent != agent and synthetic in claimed_areas:
+                        index = claimed_areas.index(synthetic)
+                        claimed_areas[index] = (
+                            synthetic[0],
+                            replace(synthetic[1], agent=current.agent),
+                        )
+                if not kept and synthetic in claimed_areas:
+                    claimed_areas.remove(synthetic)
             rows.append(
                 Gated(
                     project=gated.project,
@@ -6571,6 +6594,7 @@ def _launching_pass(
     except (board.StoreError, sqlite3.Error) as problem:
         print(f"korapy drive: cannot read claims: {problem}", file=err)
         return finish(USAGE)
+    area_configs = area_configs_for(registered)
     gated_rows, problems, eligible_keys, pulls_calls, pulls_limited, pulls_by_key, pull_errors = (
         _gate_all(
             _items,
@@ -6594,6 +6618,7 @@ def _launching_pass(
             pulls_max_calls=pulls_max_calls,
             claims_by_key=claims_by_key,
             driven=driven,
+            area_configs=area_configs,
         )
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed), driven=driven)
@@ -6626,7 +6651,6 @@ def _launching_pass(
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=err)
             return finish(USAGE)
-    area_configs = area_configs_for(registered)
     area_base = _released_rows(
         _items,
         freed,
