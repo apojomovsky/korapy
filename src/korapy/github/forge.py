@@ -493,6 +493,7 @@ class GithubForge:
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
         owner, name = repo.split("/", 1)
+        # Outside the reset-wait retry: this one GraphQL read stays paced only (tracked by #739).
         try:
             data = gh.graphql(
                 _THREADS_QUERY,

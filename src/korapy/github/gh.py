@@ -631,7 +631,14 @@ def _note_rate_limit_headers(pacer, text: str, default_resource: str) -> str:
         return body
     note = getattr(pacer, "note_reported", None)
     if callable(note):
-        note(headers.get("x-ratelimit-resource") or default_resource, remaining, reset)
+        resource = headers.get("x-ratelimit-resource") or default_resource
+        try:
+            note(resource, remaining, reset)
+        except ValueError:
+            # An unknown resource never breaks a call that already
+            # answered: it folds into the default resource instead.
+            if resource != default_resource:
+                note(default_resource, remaining, reset)
     return body
 
 
@@ -747,6 +754,30 @@ class _ResetWaitPacer:
         return None
 
 
+#: The retry bound for paced calls without an explicit `budget_s`,
+#: resolved once per process: every paced call otherwise pays a live
+#: settings load. Callers that already hold a `Resolved` (merge) keep
+#: threading their own `budget_s` instead. Tests reset the cache
+#: through `reset_default_budget_s`.
+_process_budget_s: int | None = None
+
+
+def _default_budget_s() -> int:
+    """The retry bound when the caller threads none: resolved once."""
+    global _process_budget_s
+    if _process_budget_s is None:
+        from korapy.github.retry import retry_max_wait_s
+
+        _process_budget_s = retry_max_wait_s()
+    return _process_budget_s
+
+
+def reset_default_budget_s() -> None:
+    """Forget the cached retry bound (tests only)."""
+    global _process_budget_s
+    _process_budget_s = None
+
+
 def paced_run_with_reset_wait(
     args: list[str],
     cost: float = REST_READ_COST,
@@ -756,6 +787,7 @@ def paced_run_with_reset_wait(
     budget_s: float | None = None,
     now=None,
     sleep=None,
+    stop=None,
 ) -> str:
     """`paced_run` under the reset-wait retry (docs/19, section 1).
 
@@ -763,10 +795,10 @@ def paced_run_with_reset_wait(
     counts against the same wall-clock bound the retry measures. This
     is the runner the forge and tracker adapters are wired with in
     production, so an in-process caller waits the way a script would.
-    `budget_s` defaults to the one reader of
-    `github.retry_max_wait_s`; tests inject a fake clock and sleep.
+    `budget_s` defaults to the bound resolved once per process;
+    tests inject a fake clock, sleep, and stop.
     """
-    from korapy.github.retry import retry_max_wait_s, run_with_reset_wait
+    from korapy.github.retry import run_with_reset_wait
 
     active_pacer = _ResetWaitPacer(_pacer() if pacer is None else pacer)
     return run_with_reset_wait(
@@ -774,9 +806,10 @@ def paced_run_with_reset_wait(
             call_args, cost=cost, timeout=timeout, run=run, pacer=active_pacer
         ),
         list(args),
-        budget_s=retry_max_wait_s() if budget_s is None else budget_s,
+        budget_s=_default_budget_s() if budget_s is None else budget_s,
         now=time.time if now is None else now,
         sleep=time.sleep if sleep is None else sleep,
+        stop=stop,
     )
 
 

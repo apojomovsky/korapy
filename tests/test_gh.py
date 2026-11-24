@@ -835,3 +835,31 @@ class HeaderCaptureTest(unittest.TestCase):
         body, headers = gh.split_rate_limit_headers(self.HEADERS + "body")
         self.assertEqual(body, "body")
         self.assertEqual(headers["x-ratelimit-remaining"], "2500")
+
+    def test_an_unknown_resource_falls_back_to_the_default(self):
+        headers = (
+            "HTTP/2 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 2500\r\n"
+            "x-ratelimit-reset: 2000\r\nx-ratelimit-resource: search\r\n\r\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = gh.GraphqlPacer(os.path.join(tmp, "pacing.json"), now=lambda: 1000.0)
+            body = gh._note_rate_limit_headers(pacer, headers + '{"ok": true}', "core")
+            self.assertEqual(body, '{"ok": true}')
+            with open(os.path.join(tmp, "pacing.json")) as handle:
+                state = json.load(handle)
+            # A resource the bucket never heard of folds into the
+            # default instead of raising out of a successful call.
+            self.assertEqual(state["core_tokens"], 60.0)
+            self.assertEqual(state["graphql_tokens"], gh.GRAPHQL_CAPACITY)
+
+
+class DefaultBudgetTest(unittest.TestCase):
+    def test_the_retry_bound_resolves_once_per_process(self):
+        from korapy.github import retry
+
+        self.addCleanup(gh.reset_default_budget_s)
+        gh.reset_default_budget_s()
+        with mock.patch.object(retry, "retry_max_wait_s", return_value=77) as resolve:
+            self.assertEqual(gh._default_budget_s(), 77)
+            self.assertEqual(gh._default_budget_s(), 77)
+            self.assertEqual(resolve.call_count, 1)

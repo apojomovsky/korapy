@@ -19,11 +19,18 @@ and no process ever sleeps in a test.
 
 import datetime
 import json
+import math
 import os
 import sys
 
 from korapy import settings
-from korapy.github.gh import GhError, is_rate_limited, rate_limit_kind
+from korapy.github.gh import (
+    GhError,
+    _PACING_NAP_S,
+    is_rate_limited,
+    rate_limit_kind,
+    stop_requested,
+)
 
 #: Seconds past the reported reset before the retried call runs: the
 #: provider's clock and ours may disagree by a little.
@@ -90,12 +97,25 @@ def reset_epoch(payload, kind) -> float | None:
     reset = entry.get("reset") if isinstance(entry, dict) else None
     if isinstance(reset, bool) or not isinstance(reset, (int, float)):
         return None
-    return float(reset)
+    try:
+        value = float(reset)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def reset_text(epoch: float) -> str:
-    """One reset epoch as the give-up message spells it (UTC, second)."""
-    moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+    """One reset epoch as the give-up message spells it (UTC, second).
+
+    Total: an epoch outside the clock range reads as an unread reset
+    instead of raising out of the give-up path.
+    """
+    try:
+        moment = datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return "an unread reset"
     return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -108,15 +128,20 @@ def _give_up(budget_s: float, reset: float | None, detail: str = "") -> GhError:
     )
 
 
-def run_with_reset_wait(run, args, *, budget_s, now, sleep) -> str:
+def run_with_reset_wait(run, args, *, budget_s, now, sleep, stop=None) -> str:
     """Run `run(args)`, waiting out rate limits until `budget_s` is spent.
 
     `run` returns stdout and raises on failure, like the `gh` seam.
     `budget_s` is a wall-clock bound around every call and sleep,
     measured through the injected `now`, so pacer naps inside `run`
-    count against it too. A success after waiting reports the waited
-    seconds on stderr; the return is the successful call's stdout.
+    count against it too. The reset wait runs in `_PACING_NAP_S`-sized
+    naps through the injected `sleep`, and stops at the stop flag
+    (`stop`, defaulting to the `gh` seam's flag) the way pacer waits
+    do, so a stop during a long reset wait ends within one nap. A
+    success after waiting reports the waited seconds on stderr; the
+    return is the successful call's stdout.
     """
+    stopped = stop if stop is not None else stop_requested
     start = now()
     waited = 0.0
     past_reset: float | None = None
@@ -149,8 +174,18 @@ def run_with_reset_wait(run, args, *, budget_s, now, sleep) -> str:
                 continue
             if wake > start + budget_s:
                 raise _give_up(budget_s, reset) from err
-            sleep(wake - current)
-            waited += wake - current
+            while True:
+                delay = wake - now()
+                if delay <= 0:
+                    break
+                if stopped():
+                    raise GhError(
+                        "unavailable",
+                        "stop requested while waiting for the GitHub rate limit reset; retry later",
+                    ) from err
+                nap = min(delay, _PACING_NAP_S)
+                sleep(nap)
+                waited += nap
             continue
         if waited:
             print(f"waited {waited:g}s for the GitHub rate limit reset", file=sys.stderr)

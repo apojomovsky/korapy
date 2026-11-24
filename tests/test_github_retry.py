@@ -81,7 +81,10 @@ class RunWithResetWaitTest(unittest.TestCase):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(self.run_retry(run, clock), "ok")
         # The message guessed 62s; the reported core reset is 300s out.
-        self.assertEqual(clock.sleeps, [300.0 + retry.RESET_MARGIN_S])
+        self.assertEqual(sum(clock.sleeps), 300.0 + retry.RESET_MARGIN_S)
+        # Sliced into short naps so a stop ends the wait within one nap.
+        self.assertGreater(len(clock.sleeps), 1)
+        self.assertTrue(all(0.0 < nap <= gh._PACING_NAP_S for nap in clock.sleeps))
         self.assertEqual(run.calls[1], ["api", "rate_limit"])
         self.assertEqual(len(run.calls), 3)
         self.assertIn(f"waited {300.0 + retry.RESET_MARGIN_S:g}s", err.getvalue())
@@ -93,7 +96,8 @@ class RunWithResetWaitTest(unittest.TestCase):
             [limited("GraphQL: API rate limit exceeded"), rate_limit_payload(clock), "ok"],
         )
         self.run_retry(run, clock)
-        self.assertEqual(clock.sleeps, [900.0 + retry.RESET_MARGIN_S])
+        self.assertEqual(sum(clock.sleeps), 900.0 + retry.RESET_MARGIN_S)
+        self.assertTrue(all(0.0 < nap <= gh._PACING_NAP_S for nap in clock.sleeps))
 
     def test_each_rate_limit_event_reads_rate_limit_once(self):
         clock = Clock()
@@ -208,6 +212,51 @@ class RunWithResetWaitTest(unittest.TestCase):
         self.assertEqual(len(run.calls), 4)
         self.assertEqual(clock.sleeps, [])
 
+    def test_a_stop_request_ends_the_reset_wait_within_one_nap(self):
+        clock = Clock()
+        run = ScriptedRun(clock, [limited(), rate_limit_payload(clock)])
+        stop_at = clock.t + 3 * gh._PACING_NAP_S
+        with self.assertRaises(gh.GhError) as caught:
+            retry.run_with_reset_wait(
+                run,
+                ["api", "repos/acme/lib/pulls/7"],
+                budget_s=1800.0,
+                now=clock.now,
+                sleep=clock.sleep,
+                stop=lambda: clock.t >= stop_at,
+            )
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn("stop requested", str(caught.exception))
+        # Three naps, not the full 305s wait; the retried call never ran.
+        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(sum(clock.sleeps), 3 * gh._PACING_NAP_S)
+
+    def test_a_preset_stop_request_sleeps_nothing(self):
+        clock = Clock()
+        run = ScriptedRun(clock, [limited(), rate_limit_payload(clock)])
+        with self.assertRaises(gh.GhError) as caught:
+            retry.run_with_reset_wait(
+                run,
+                ["api", "repos/acme/lib/pulls/7"],
+                budget_s=1800.0,
+                now=clock.now,
+                sleep=clock.sleep,
+                stop=lambda: True,
+            )
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(len(run.calls), 2)
+
+    def test_an_out_of_range_reset_gives_up_without_crashing(self):
+        clock = Clock()
+        payload = json.dumps({"resources": {"core": {"reset": 10**1000}, "graphql": {"reset": 0}}})
+        run = ScriptedRun(clock, [limited(), payload])
+        with self.assertRaises(gh.GhError) as caught:
+            self.run_retry(run, clock)
+        self.assertEqual(caught.exception.kind, "unavailable")
+        self.assertIn("an unread reset", str(caught.exception))
+        self.assertEqual(clock.sleeps, [])
+
 
 class StubPacer:
     def __init__(self):
@@ -237,7 +286,7 @@ class PacedRunIntegrationTest(unittest.TestCase):
         self.assertEqual(out, "ok")
         # Every attempt, the rate_limit read included, ran paced.
         self.assertEqual(len(pacer.acquired), 3)
-        self.assertEqual(clock.sleeps, [300.0 + retry.RESET_MARGIN_S])
+        self.assertEqual(sum(clock.sleeps), 300.0 + retry.RESET_MARGIN_S)
         # The guessed 62s cooldown never lands: the reported reset is
         # the only wait a retry-managed call takes.
         self.assertEqual(pacer.cooldowns, [])
@@ -245,6 +294,7 @@ class PacedRunIntegrationTest(unittest.TestCase):
     def test_a_configured_budget_flows_through_the_paced_seam(self):
         clock = Clock()
         run = ScriptedRun(clock, [limited(), rate_limit_payload(clock, core_in=3600.0)])
+        self.addCleanup(gh.reset_default_budget_s)
         with mock.patch.object(retry, "retry_max_wait_s", return_value=50):
             with self.assertRaises(gh.GhError) as caught:
                 gh.paced_run_with_reset_wait(
@@ -271,6 +321,15 @@ class PureResetTest(unittest.TestCase):
 
     def test_reset_text_is_the_give_up_spelling(self):
         self.assertEqual(retry.reset_text(1767225600.0), "2026-01-01T00:00:00Z")
+
+    def test_an_out_of_range_reset_reads_as_unusable(self):
+        payload = {"resources": {"core": {"reset": 10**1000}, "graphql": {"reset": 0}}}
+        self.assertIsNone(retry.reset_epoch(payload, "rest"))
+        self.assertIsNone(retry.reset_epoch({"resources": {"core": {}}}, "rest"))
+
+    def test_an_out_of_range_reset_spells_as_unread(self):
+        self.assertEqual(retry.reset_text(1e30), "an unread reset")
+        self.assertEqual(retry.reset_text(float("inf")), "an unread reset")
 
 
 class SettingTest(unittest.TestCase):
