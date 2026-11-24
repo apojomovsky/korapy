@@ -1078,11 +1078,12 @@ def _release_freeze(freeze_path, pause_path, tracker_factory, out):
     """
     try:
         record = freeze.read_freeze(freeze_path)
-    except freeze.FreezeError:
+        if record is None or not record["until"] or tracker_factory is None:
+            return False
+        released = freeze.try_release(freeze_path, pause_path, _freeze_item_state(tracker_factory))
+    except (freeze.FreezeError, OSError):
         return False
-    if record is None or not record["until"] or tracker_factory is None:
-        return False
-    if not freeze.try_release(freeze_path, pause_path, _freeze_item_state(tracker_factory)):
+    if not released:
         return False
     print(f"freeze ended: {', '.join(record['until'])} merged, resuming", file=out)
     return True

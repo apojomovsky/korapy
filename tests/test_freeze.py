@@ -398,6 +398,64 @@ class DriveFreezeTest(unittest.TestCase):
         self.assertEqual(launcher.calls, [])
         self.assertTrue(os.path.exists(self.frost))
 
+    def test_freeze_changing_before_release_holds_the_pass(self):
+        from unittest import mock
+
+        from tests.test_drive import stored
+
+        freeze.write_freeze(
+            self.frost, reason="sweep", until=["app#7"], now=1000.0, owned_pause=True
+        )
+        with open(self.pause, "w", encoding="utf-8") as handle:
+            handle.write("frozen: sweep\n")
+        real_read = freeze.read_freeze
+        calls = {"count": 0}
+
+        def flaky(path):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise freeze.FreezeError("freeze file changed")
+            return real_read(path)
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(freeze, "read_freeze", flaky):
+            code, _, err, launcher = self.passing(
+                store,
+                plan=False,
+                found=[("blue", [("app", 7, "start")])],
+                tracker_factory=lambda repo: closed_tracker(),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("frozen: sweep", err)
+        self.assertEqual(launcher.calls, [])
+        self.assertTrue(os.path.exists(self.frost))
+        self.assertTrue(os.path.exists(self.pause))
+
+    def test_release_oserror_holds_the_pass(self):
+        from unittest import mock
+
+        from tests.test_drive import stored
+
+        freeze.write_freeze(
+            self.frost, reason="sweep", until=["app#7"], now=1000.0, owned_pause=True
+        )
+        with open(self.pause, "w", encoding="utf-8") as handle:
+            handle.write("frozen: sweep\n")
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(freeze, "try_release", side_effect=OSError("freeze file changed")):
+            code, _, err, launcher = self.passing(
+                store,
+                plan=False,
+                found=[("blue", [("app", 7, "start")])],
+                tracker_factory=lambda repo: closed_tracker(),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("frozen: sweep", err)
+        self.assertEqual(launcher.calls, [])
+        self.assertTrue(os.path.exists(self.frost))
+
     def test_plan_never_releases_a_merged_freeze(self):
         from tests.test_drive import stored
 
