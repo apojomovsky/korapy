@@ -397,6 +397,42 @@ class AreaFetchTest(unittest.TestCase):
         self.assertEqual([pull.number for pull in held], [56])
         self.assertEqual(pull_errors, {})
 
+    def test_threaded_area_configs_are_used_without_resolving_again(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-area-fetch-"))
+        project = area_project(tmp)
+        items = [
+            board_item("app", 12, labels=["area:ci"]),
+            board_item("app", 34, labels=["area:ci", "hold"]),
+        ]
+        fake = FakeTracker()
+        fake.index["app"] = {34: [reading("app", 56, kind="pr", state="open")]}
+        out = io.StringIO()
+        with mock.patch.object(
+            drive, "area_configs_for", side_effect=AssertionError("resolved twice")
+        ) as resolver:
+            gated, problems, _, _, _, _, _ = drive._gate_all(
+                items,
+                [project],
+                out,
+                now=2000.0,
+                live_set=frozenset(),
+                limits=admission.Limits(total=4),
+                quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+                pool=None,
+                ledger_data={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                index_for=drive.pulls_index_for(lambda repo: fake),
+                pulls_max_calls=20,
+                claims_by_key={},
+                driven={"blue": frozenset({"app", "api"})},
+                area_configs={"blue": ("area:", True, False)},
+            )
+        resolver.assert_not_called()
+        self.assertEqual(problems, [])
+        self.assertEqual(len(gated), 1)
+        self.assertEqual(gated[0].code, "area")
+
     def test_an_unreadable_holder_listing_fails_closed(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-area-fetch-"))
         project = area_project(tmp)
@@ -591,6 +627,166 @@ class InPassAreaTest(unittest.TestCase):
         self.assertEqual(rows[1].reason, "app#34: area `ci` held by app#12 pull #56, start refused")
         self.assertEqual([call[2] for call in launcher.calls], [12])
         self.assertIsNone(store.claim_of("app", 34))
+
+    def test_a_failed_first_launch_releases_its_synthetic_holder(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels),
+            ("blue", "app", 34): row(number=34, labels=labels),
+        }
+
+        class FlakyLauncher(FakeLauncher):
+            def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+                self.calls.append((project, repo, number, kind, agent, title, author))
+                if number == 12:
+                    raise RuntimeError("launch refused")
+                return f"{agent}-unit"
+
+        launcher = FlakyLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 1)
+        self.assertEqual((rows[0].verdict, rows[0].code), ("skip", "launch"))
+        self.assertEqual((rows[1].verdict, rows[1].code), ("start", ""))
+        self.assertEqual([call[2] for call in launcher.calls], [12, 34])
+        self.assertIsNone(store.claim_of("app", 12))
+        self.assertIsNotNone(store.claim_of("app", 34))
+
+    def test_a_race_kept_claim_still_blocks_the_second_start(self):
+        from korapy import units
+
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels),
+            ("blue", "app", 34): row(number=34, labels=labels),
+        }
+
+        class RacingLauncher(FakeLauncher):
+            def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+                self.calls.append((project, repo, number, kind, agent, title, author))
+                if number == 12:
+                    raise units.UnitExists("app-12 already live")
+                return f"{agent}-unit"
+
+        launcher = RacingLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 0)
+        self.assertEqual((rows[0].verdict, rows[0].code), ("skip", "launch"))
+        self.assertEqual((rows[1].verdict, rows[1].code), ("skip", "area"))
+        self.assertEqual([call[2] for call in launcher.calls], [12])
+        self.assertIsNotNone(store.claim_of("app", 12))
+        self.assertIsNone(store.claim_of("app", 34))
+
+    def test_a_reclaimed_claim_still_blocks_the_second_start(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels),
+            ("blue", "app", 34): row(number=34, labels=labels),
+        }
+
+        class ReclaimingLauncher(FakeLauncher):
+            def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+                self.calls.append((project, repo, number, kind, agent, title, author))
+                if number == 12:
+                    current = store.claim_of(repo, number)
+                    store.release(repo, number, agent, current.epoch, now=now)
+                    store.claim(repo, number, "drive-other-12", "host-1", now=now)
+                    raise RuntimeError("launch refused")
+                return f"{agent}-unit"
+
+        launcher = ReclaimingLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 0)
+        self.assertEqual((rows[1].verdict, rows[1].code), ("skip", "area"))
+        self.assertIn("drive-other-12", rows[1].reason)
+        self.assertIsNone(store.claim_of("app", 34))
+
+    def test_a_failed_release_keeps_its_synthetic_holder(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open")])
+        self.addCleanup(store.close)
+        labels = ("area:ci",)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=labels),
+            ("blue", "app", 34): row(number=34, labels=labels),
+        }
+        real_release = store.release
+
+        def failing_release(repo, number, agent, epoch, *, now):
+            if number == 12:
+                raise board.StoreError("release refused")
+            return real_release(repo, number, agent, epoch, now=now)
+
+        store.release = failing_release
+
+        class FlakyLauncher(FakeLauncher):
+            def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+                self.calls.append((project, repo, number, kind, agent, title, author))
+                if number == 12:
+                    raise RuntimeError("launch refused")
+                return f"{agent}-unit"
+
+        launcher = FlakyLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 0)
+        self.assertEqual((rows[1].verdict, rows[1].code), ("skip", "area"))
+        self.assertIsNotNone(store.claim_of("app", 12))
+        self.assertIsNone(store.claim_of("app", 34))
+
+    def test_removing_one_synthetic_keeps_another_holder(self):
+        store = stored(self.db, [("app", 12, "open"), ("app", 34, "open"), ("app", 56, "open")])
+        self.addCleanup(store.close)
+        area_rows = {
+            ("blue", "app", 12): row(number=12, labels=("area:docs",)),
+            ("blue", "app", 34): row(number=34, labels=("area:ci",)),
+            ("blue", "app", 56): row(number=56, labels=("area:ci",)),
+        }
+
+        class FlakyLauncher(FakeLauncher):
+            def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+                self.calls.append((project, repo, number, kind, agent, title, author))
+                if number == 12:
+                    raise RuntimeError("launch refused")
+                return f"{agent}-unit"
+
+        launcher = FlakyLauncher()
+        rows, started, _ = claim_loop(
+            store,
+            [gated_start(number=12), gated_start(number=34), gated_start(number=56)],
+            area_rows,
+            launcher=launcher,
+        )
+        self.assertEqual(started, 1)
+        self.assertEqual((rows[0].verdict, rows[0].code), ("skip", "launch"))
+        self.assertEqual((rows[1].verdict, rows[1].code), ("start", ""))
+        self.assertEqual((rows[2].verdict, rows[2].code), ("skip", "area"))
+        self.assertIsNone(store.claim_of("app", 12))
+        self.assertIsNotNone(store.claim_of("app", 34))
+        self.assertIsNone(store.claim_of("app", 56))
 
     def test_a_missing_in_pass_row_refuses_fail_closed(self):
         store = stored(self.db, [("app", 12, "open")])
