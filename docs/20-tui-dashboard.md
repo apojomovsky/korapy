@@ -61,8 +61,9 @@ Panels, and the exact fields each one formats (no panel computes
 a value the API did not send):
 
 - **Quota and resource header.** One line per fact, all read from
-  the snapshot document: `fleet_header` (`host`, `now_iso`,
-  `agents_live`, `agents_stale`, `agents_finished`); `quota`
+  the snapshot document: `fleet_header` (`host`, `now` (epoch),
+  `tz_offset_s`, `now_iso`, `agents_live`, `agents_stale`,
+  `agents_finished`); `quota`
   (per provider `state`, each window `used_pct` and `resets_at`,
   plus `stale`, `read_at`, `source` and `read_failed` shown in
   words when set, never as a computed zero); `capacity`
@@ -250,12 +251,14 @@ The wire shape is not one happy-path struct per section: the
 API's degraded shapes are part of the contract, so `model.rs`
 names them explicitly. Every section that can fail carries an
 untagged error variant: any section, including `fleet_header`
-and `agents` (neither is in `snapshot.ERROR_SECTIONS`, which
-names only the sections the health roll-up checks, so doctor-row
-detection in section 1.1 tests each section body for the
-`{"error": ...}` shape itself, through one helper in `model.rs`),
-may arrive as exactly `{"error": ...}` and must deserialize as
-that variant, never as a parse failure. The panel sections carry
+(which sits outside `snapshot.ERROR_SECTIONS`, as do `attention`
+and `plan`, while `agents` is in it alongside `quota`,
+`capacity`, `resources`, `disk` and `drive`, the exact set the
+health roll-up checks, so doctor-row detection in section 1.1
+tests each section body for the `{"error": ...}` shape itself,
+through one helper in `model.rs`), may arrive as exactly
+`{"error": ...}` and must deserialize as that variant, never as
+a parse failure. The panel sections carry
 their unknown shapes too: `attention` with `state` unknown sends
 the string `unknown` for `needs_decision`, `ready_to_merge`,
 `research`, `coordinator_handled` and `items` (`dashboard.attention`),
@@ -330,12 +333,12 @@ Schema change, detected two ways and handled before rendering:
 Exit behavior of the TUI process itself: `q` and `Ctrl-C` exit
 0 with the terminal restored (raw mode and the alternate screen
 are torn down on every exit path, including a panic hook, so a
-crash never leaves a broken terminal); a bad flag or an
-unreachable-at-startup address is not an exit at all (section
-2.4 above keeps the program up and retrying). PROPOSED exit 4
-for a usage error only (an unknown flag or a non-numeric
-`--poll-s`), matching the korapy exit code convention that 4 is
-configuration or usage; the TUI has no other exit codes in
+crash never leaves a broken terminal). A usage error (an unknown
+flag or a non-numeric `--poll-s`) exits 4 at startup before the
+UI loop starts, matching the korapy exit code convention that 4
+is configuration or usage. An unreachable server, including at
+startup, is not an exit at all: section 2.4 above keeps the
+program up and retrying. The TUI has no other exit codes in
 version 1 because it decides nothing a script branches on.
 
 ## 3. Build and gating
