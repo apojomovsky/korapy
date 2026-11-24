@@ -895,4 +895,13 @@ details.finished table.agents {
     color: var(--muted);
     font-size: 0.8125rem;
   }
+
+  /* The header row hides in this layout, so the bare running-for
+  duration names itself here: the idle cell beside it already
+  self-names ("idle 4h" from formatIdle, with the last-seen age on
+  its tooltip), so a second generated label would only duplicate
+  and misname it. Narrow only; desktop keeps its header row. */
+  table.agents td.c-running::before {
+    content: "running for: ";
+  }
 }
