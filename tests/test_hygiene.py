@@ -451,6 +451,13 @@ class DeclaredRootsCase(unittest.TestCase):
         with self.assertRaisesRegex(settings.SettingsError, r"\[hygiene\.x\]"):
             hygiene.declared_roots(rules, root=None, env=self.env)
 
+    def test_root_none_with_two_dir_rules_refuses_naming_the_first(self):
+        rules = hygiene.check_table({"zeta": dir_rule(), "alpha": dir_rule()}, "korapy.toml")
+        with self.assertRaisesRegex(
+            settings.SettingsError, r"\[hygiene\.alpha\] needs the ops root"
+        ):
+            hygiene.declared_roots(rules, root=None, env=self.env)
+
     def test_root_none_with_image_only_reads_as_no_roots(self):
         rules = hygiene.check_table({"x": image_rule()}, "korapy.toml")
         self.assertEqual(hygiene.declared_roots(rules, root=None, env=self.env), {})
@@ -469,6 +476,18 @@ class DeclaredRootsCase(unittest.TestCase):
         env["KORAPY_CACHE"] = self.ops
         rules = hygiene.check_table({"x": dir_rule(path="main")}, "korapy.toml")
         with self.assertRaisesRegex(settings.SettingsError, "clone"):
+            hygiene.declared_roots(rules, root=self.ops, env=env)
+
+    def test_root_equal_to_the_second_of_two_clones_is_refused(self):
+        with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "acme"\nclone.path = "main"\n'
+                '[[repo]]\nname = "beta"\nclone.path = "second"\n'
+            )
+        env = dict(self.env)
+        env["KORAPY_CACHE"] = self.ops
+        rules = hygiene.check_table({"x": dir_rule(path="second")}, "korapy.toml")
+        with self.assertRaisesRegex(settings.SettingsError, r"clone of repo 'beta'"):
             hygiene.declared_roots(rules, root=self.ops, env=env)
 
 
