@@ -1830,5 +1830,74 @@ class MissingReviewRecordsTest(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
+class BlockedByGateTest(unittest.TestCase):
+    def blocked(self, extra, states, number=7, repo="app"):
+        candidate = drive.GateInput(
+            project="blue",
+            request=request(repo=repo, number=number),
+            row=replace(row(repo=repo, number=number), extra=extra),
+            wait=1000.0,
+        )
+        return gate(candidate, blocked_states=states)
+
+    def test_open_dependency_skips_naming_the_blocker(self):
+        gated = self.blocked({"blocked_by": ["app#2"]}, {("app", 2): "open"})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("blocked by #2", gated.reason)
+        self.assertTrue(gated.reason.startswith("app#7:"))
+
+    def test_closed_dependency_proceeds(self):
+        gated = self.blocked({"blocked_by": ["app#2"]}, {("app", 2): "closed"})
+        self.assertEqual((gated.verdict, gated.code), ("start", ""))
+
+    def test_first_open_dependency_is_named(self):
+        gated = self.blocked(
+            {"blocked_by": ["app#2", "app#3"]},
+            {("app", 2): "closed", ("app", 3): "open"},
+        )
+        self.assertEqual(gated.verdict, "skip")
+        self.assertIn("blocked by #3", gated.reason)
+
+    def test_cross_repository_reference_blocks_fail_closed(self):
+        gated = self.blocked({"blocked_by": ["other/repo#5"]}, {("other/repo", 5): "closed"})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("other/repo#5", gated.reason)
+
+    def test_unknown_reference_blocks_as_not_found(self):
+        gated = self.blocked({"blocked_by": ["app#9"]}, {})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("blocked by #9", gated.reason)
+        self.assertIn("not found", gated.reason)
+
+    def test_raw_blocked_by_blocks_naming_the_text(self):
+        gated = self.blocked({"blocked_by": "someday maybe"}, {})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("someday maybe", gated.reason)
+
+    def test_malformed_blocked_by_blocks_fail_closed(self):
+        gated = self.blocked({"blocked_by": 5}, {})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+
+    def test_empty_and_missing_blocked_by_proceed(self):
+        self.assertEqual(self.blocked({"blocked_by": []}, {}).verdict, "start")
+        self.assertEqual(self.blocked({}, {}).verdict, "start")
+
+    def test_missing_states_map_blocks_fail_closed(self):
+        candidate = drive.GateInput(
+            project="blue",
+            request=request(number=7),
+            row=replace(row(number=7), extra={"blocked_by": ["app#2"]}),
+            wait=1000.0,
+        )
+        gated = gate(candidate)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("blocked by #2", gated.reason)
+
+    def test_plan_names_the_blocker(self):
+        gated = self.blocked({"blocked_by": ["app#2"]}, {("app", 2): "open"})
+        text = drive.render([gated], label="drive", plan=True)
+        self.assertIn("blocked by #2", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -75,6 +75,12 @@ class BootstrapLabel(NamedTuple):
 #: exposes a general label write, so any other name is refused.
 NEEDS_DECISION = "needs-decision"
 
+#: A ticket carrying this label must run on real hardware: no agent
+#: takes it. The ready-made policy holds it with the other
+#: human-owned labels; korapy never adds or removes it, so the label
+#: joins no bootstrap set and no adapter write.
+NEEDS_HARDWARE = "needs-hardware"
+
 #: A ticket carrying this label is a research question, not a change:
 #: it starts with the research worker prompt and finishes as a
 #: Findings comment, never a pull request.

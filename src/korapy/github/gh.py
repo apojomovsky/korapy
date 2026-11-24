@@ -932,6 +932,42 @@ def body_linked_issue_refs(
     return pairs + [p for p in refs_issue_refs(body, default_repo) if p not in pairs]
 
 
+#: Lines of an issue body that declare dependencies: any line
+#: containing "depends on", case-insensitive.
+_DEPENDS_LINE_RE = re.compile(r"^.*\bdepends on\b.*$", re.IGNORECASE | re.MULTILINE)
+
+#: A bare issue ref: `#N`, not preceded by a word character or a slash
+#: (so neither the tail of a word nor of an `owner/repo#N` qualifier).
+_DEPENDS_REF_RE = re.compile(r"(?<![\w/])#(\d+)\b")
+
+
+def depends_on(body: str | None) -> tuple[int, ...]:
+    """Issue numbers named on `Depends on` lines, first-seen order. Pure.
+
+    Only lines containing "depends on" (case-insensitive) contribute,
+    and only their bare `#N` refs: a qualified `owner/repo#N` on such
+    a line reads as nothing here (the board's `Blocked by` column
+    carries cross-repository refs). Duplicates collapse to their first
+    appearance; a missing or empty body reads as no dependencies.
+    """
+    found = [
+        int(n)
+        for line in _DEPENDS_LINE_RE.findall(body or "")
+        for n in _DEPENDS_REF_RE.findall(line)
+    ]
+    return tuple(dict.fromkeys(found))
+
+
+def depends_blocked_by(repo: str, body: str | None) -> list[str]:
+    """`Depends on` refs as qualified `repo#N` blocked-by entries. Pure.
+
+    The one qualifier both tracker modes share: bare numbers from
+    `depends_on` resolve against the tracker's own repo, so the gate
+    reads them in the same `owner/repo#N` shape the board column uses.
+    """
+    return [f"{repo}#{number}" for number in depends_on(body)]
+
+
 def is_merged_pull(payload) -> bool:
     """Whether a pull-request payload reports a merged pull.
 

@@ -695,3 +695,33 @@ class PacerChargeTest(unittest.TestCase):
                 self.assertEqual(json.load(handle)["tokens"], -2.0)
             with self.assertRaises(gh.GhError):
                 pacer.acquire(cost=1.0)
+
+
+class DependsOnTest(unittest.TestCase):
+    def test_reads_only_depends_on_lines(self):
+        body = "See #9 for context.\nDepends on #3 and #4\ndepends on: #3"
+        self.assertEqual(gh.depends_on(body), (3, 4))
+
+    def test_two_depends_on_lines_combine_in_first_seen_order(self):
+        body = "Depends on #8\nSome text in between.\nDepends on #5 and #8"
+        self.assertEqual(gh.depends_on(body), (8, 5))
+
+    def test_match_is_case_insensitive(self):
+        self.assertEqual(gh.depends_on("DEPENDS ON #5"), (5,))
+
+    def test_bare_mentions_outside_depends_on_lines_are_ignored(self):
+        self.assertEqual(gh.depends_on("See #9 for context.\nFixes #10"), ())
+
+    def test_empty_and_missing_bodies_read_as_no_dependencies(self):
+        self.assertEqual(gh.depends_on(""), ())
+        self.assertEqual(gh.depends_on(None), ())
+
+    def test_qualified_refs_on_the_line_are_not_bare_refs(self):
+        self.assertEqual(gh.depends_on("Depends on example/demo#3"), ())
+
+    def test_depends_blocked_by_qualifies_with_the_tracker_repo(self):
+        self.assertEqual(
+            gh.depends_blocked_by("acme/app", "Depends on #3 and #4"),
+            ["acme/app#3", "acme/app#4"],
+        )
+        self.assertEqual(gh.depends_blocked_by("acme/app", "no deps here"), [])

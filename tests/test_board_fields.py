@@ -141,8 +141,11 @@ class TrackerExtraTest(unittest.TestCase):
         found = ghtracker.GithubTracker(run).item("acme/app", 7)
         extra = found.extra
         assert isinstance(extra, dict)
-        for concept in ("priority", "area", "pool", "board_status", "blocked_by"):
+        for concept in ("priority", "area", "pool", "board_status"):
             self.assertNotIn(concept, extra)
+        # The body's Depends on refs ride the same payload, so the
+        # default body (no Depends on line) reads as no block.
+        self.assertEqual(extra["blocked_by"], [])
         self.assertEqual(
             (
                 extra["milestone"],
@@ -163,7 +166,12 @@ class TrackerExtraTest(unittest.TestCase):
         second = adapter.item("acme/app", 8)
         assert isinstance(first.extra, dict)
         assert isinstance(second.extra, dict)
-        empty = {"milestone": None, "milestone_due": None, "milestone_closed": None}
+        empty = {
+            "milestone": None,
+            "milestone_due": None,
+            "milestone_closed": None,
+            "blocked_by": [],
+        }
         self.assertEqual((first.extra, second.extra), (empty, empty))
         self.assertIsNot(first.extra, second.extra)
 
