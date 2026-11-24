@@ -973,6 +973,39 @@ def _first_float(text):
         return None
 
 
+def _meminfo_fields(text):
+    """Meminfo fields as token lists, empty when the text is not a string."""
+    if not isinstance(text, str):
+        return {}
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip().split()
+    return fields
+
+
+def _mem_total_kb(fields):
+    """Positive `MemTotal` in kB from parsed fields, or None when unknown."""
+    try:
+        total = float(fields["MemTotal"][0])
+    except (KeyError, ValueError, IndexError):
+        return None
+    return total if total > 0 else None
+
+
+def mem_total_mb(text):
+    """Host total memory in MB from meminfo text, or None when unknown.
+
+    The one resolver for this fact for total-only readers: the heavy
+    ledger host descriptor reads through here, and the paired meminfo
+    reader (`_meminfo_kb`) shares the same `_mem_total_kb` guard, so a
+    non-positive or unparsable `MemTotal` reads as unknown everywhere,
+    never as a negative or zero total.
+    """
+    total = _mem_total_kb(_meminfo_fields(text))
+    return None if total is None else round(total / 1024, 1)
+
+
 def _meminfo_kb(text):
     """`(total_kb, available_kb)` from meminfo text, or None when missing.
 
@@ -980,18 +1013,15 @@ def _meminfo_kb(text):
     absolute megabytes both divide from this reading, so the pressure
     line and the dashboard gauge can never disagree on garbage.
     """
-    if not isinstance(text, str):
+    fields = _meminfo_fields(text)
+    total = _mem_total_kb(fields)
+    if total is None:
         return None
-    fields = {}
-    for line in text.splitlines():
-        key, _, value = line.partition(":")
-        fields[key.strip()] = value.strip().split()
     try:
-        total = float(fields["MemTotal"][0])
         available = float(fields["MemAvailable"][0])
     except (KeyError, ValueError, IndexError):
         return None
-    if total <= 0 or available < 0:
+    if available < 0:
         return None
     return (total, available)
 

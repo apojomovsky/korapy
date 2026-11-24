@@ -470,6 +470,28 @@ class HostInfoCase(HeavyCase):
         )
         self.assertEqual(info, {"cores": 8, "mem_mb": 16384.0, "python": "3.11"})
 
+    def test_non_positive_mem_total_reads_as_unknown(self):
+        for meminfo in (
+            "MemTotal:       -16777216 kB\nMemAvailable: 8000000 kB\n",
+            "MemTotal:       0 kB\nMemAvailable: 8000000 kB\n",
+        ):
+            with self.subTest(meminfo=meminfo):
+                info = heavy.host_info(
+                    read=lambda path, text=meminfo: text,
+                    cpu_count=8,
+                    python_version="3.11",
+                )
+                self.assertIsNone(info["mem_mb"])
+                self.assertEqual(info["cores"], 8)
+
+    def test_duplicate_mem_total_last_wins_like_resources(self):
+        info = heavy.host_info(
+            read=lambda path: "MemTotal: 8000000 kB\nMemTotal: 16777216 kB\n",
+            cpu_count=8,
+            python_version="3.11",
+        )
+        self.assertEqual(info["mem_mb"], 16384.0)
+
     def test_missing_core_count_defaults_to_the_live_count(self):
         def boom(path):
             raise OSError("gone")
