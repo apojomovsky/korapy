@@ -32,9 +32,9 @@ def empty_pr_index():
 def _production_forge():
     """The live forge over the production `gh` runner."""
     from korapy.github import forge as ghforge
-    from korapy.github.gh import paced_run
+    from korapy.github.gh import paced_run_with_reset_wait
 
-    return ghforge.GithubForge(paced_run)
+    return ghforge.GithubForge(paced_run_with_reset_wait)
 
 
 def live_pr_index(repo, _forge=None):

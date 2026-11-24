@@ -72,7 +72,7 @@ class FakePacer:
         self.charged = []
         self.cooldowns = []
 
-    def acquire(self, cost=gh.GRAPHQL_CALL_COST):
+    def acquire(self, cost=gh.GRAPHQL_CALL_COST, resource=None):
         if self.error is not None:
             raise self.error
         self.acquired.append(cost)

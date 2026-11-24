@@ -195,8 +195,13 @@ def run(args: list[str], timeout: float | None = GH_TIMEOUT_S, paced: bool = Fal
     # interactive Ctrl-C no longer lands on `gh` directly (it exits on
     # the closing pipe instead).
     env = dict(os.environ, **{PACED_MARKER: "1"}) if paced else None
+    # A paced call asks for the rate-limit headers (`gh api -i`): this
+    # subprocess seam is the one place they are captured, split off
+    # the body, and noted on the shared bucket, so every paced caller
+    # (REST and GraphQL alike) learns what the provider reported.
+    child_args = _include_args(args) if paced else list(args)
     proc = subprocess.Popen(
-        ["gh", *args],
+        ["gh", *child_args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -214,6 +219,8 @@ def run(args: list[str], timeout: float | None = GH_TIMEOUT_S, paced: bool = Fal
     finally:
         with _active_lock:
             _active_procs.discard(proc)
+    if paced:
+        stdout = _note_run_headers(child_args, stdout or "")
     if proc.returncode != 0:
         err = (stderr or "").strip()
         raise GhError(
@@ -281,6 +288,12 @@ GRAPHQL_MAX_COOLDOWN_S = 3600.0
 #: Secondary costs of REST calls (1 for GET/HEAD, 5 for mutative verbs).
 REST_READ_COST = 1.0
 REST_WRITE_COST = 5.0
+#: The primary points a full GitHub budget reports (5000 per hour for
+#: both REST core and GraphQL): `note_reported` maps a reported
+#: remaining count from these points onto bucket units.
+REPORTED_LIMIT = 5000.0
+#: The pacer state key per reported resource ("rest" is the REST word).
+_RESOURCE_KEYS = {"core": "core_tokens", "rest": "core_tokens", "graphql": "graphql_tokens"}
 #: A paced wait naps in slices this long, so a stop request ends it within
 #: one slice; systemd's stop timeout is 90 s.
 _PACING_NAP_S = 5.0
@@ -329,10 +342,10 @@ class GraphqlPacer:
         self.now = now
         self.sleep = sleep
 
-    def acquire(self, cost: float = GRAPHQL_CALL_COST) -> None:
+    def acquire(self, cost: float = GRAPHQL_CALL_COST, resource: str = "graphql") -> None:
         waited = 0.0
         while True:
-            wait = self._update(lambda state, now: self._take(state, now, cost))
+            wait = self._update(lambda state, now: self._take(state, now, cost, resource))
             if wait <= 0.0:
                 return
             if stop_requested():
@@ -382,6 +395,31 @@ class GraphqlPacer:
 
         self._update(change)
 
+    def note_reported(self, resource: str, remaining: float, reset_epoch: float) -> None:
+        """Fold one reported remaining count in, downward only.
+
+        The provider's count is the authority, mapped from its 5000
+        points onto bucket units: a balance drops to the mapped count
+        when that is lower, and never rises to it (a stale high read
+        must not grant a burst). One resource's report never touches
+        the other's balance; a zero remaining pushes the shared
+        cooldown to the reported reset. `resource` is "core" (REST,
+        "rest" accepted) or "graphql".
+        """
+        key = _RESOURCE_KEYS.get(resource)
+        if key is None:
+            raise ValueError(f"unknown rate limit resource {resource!r}")
+        mapped = min(self.capacity, max(0.0, float(remaining)) * self.capacity / REPORTED_LIMIT)
+
+        def change(state, now):
+            if mapped < state[key]:
+                state[key] = mapped
+            if remaining <= 0:
+                state["cooldown_until"] = max(state["cooldown_until"], float(reset_epoch))
+            return 0.0
+
+        self._update(change)
+
     def cooldown_remaining(self) -> float:
         """Seconds of shared cooldown left, 0 when calls may proceed.
 
@@ -394,13 +432,16 @@ class GraphqlPacer:
 
         return self._update(peek)
 
-    def _take(self, state, now, cost):
+    def _take(self, state, now, cost, resource="graphql"):
         if state["cooldown_until"] > now:
             return state["cooldown_until"] - now
-        if state["tokens"] >= cost:
-            state["tokens"] -= cost
-            return 0.0
-        return (cost - state["tokens"]) * 60.0 / self.refill_per_min
+        key = _RESOURCE_KEYS.get(resource, "graphql_tokens")
+        short = max(cost - state["tokens"], cost - state[key], 0.0)
+        if short > 0.0:
+            return short * 60.0 / self.refill_per_min
+        state["tokens"] -= cost
+        state[key] -= cost
+        return 0.0
 
     def _update(self, change) -> float:
         try:
@@ -411,9 +452,10 @@ class GraphqlPacer:
                     now = self.now()
                     state = self._read(now)
                     elapsed = max(0.0, now - state["updated"])
-                    state["tokens"] = min(
-                        self.capacity, state["tokens"] + elapsed * self.refill_per_min / 60.0
-                    )
+                    refill = elapsed * self.refill_per_min / 60.0
+                    state["tokens"] = min(self.capacity, state["tokens"] + refill)
+                    for key in ("core_tokens", "graphql_tokens"):
+                        state[key] = min(self.capacity, state[key] + refill)
                     state["updated"] = now
                     wait = change(state, now)
                     self._write(state)
@@ -432,6 +474,10 @@ class GraphqlPacer:
                 "updated": float(raw["updated"]),
                 "cooldown_until": float(raw["cooldown_until"]),
                 "backoff_s": float(raw.get("backoff_s", 0.0)),
+                # New per-resource keys: an old state file lacks them
+                # and reads as a full bucket, never as corrupt state.
+                "core_tokens": float(raw.get("core_tokens", self.capacity)),
+                "graphql_tokens": float(raw.get("graphql_tokens", self.capacity)),
             }
         except FileNotFoundError:
             return {
@@ -439,6 +485,8 @@ class GraphqlPacer:
                 "updated": now,
                 "cooldown_until": 0.0,
                 "backoff_s": 0.0,
+                "core_tokens": self.capacity,
+                "graphql_tokens": self.capacity,
             }
         except (OSError, ValueError, KeyError, TypeError):
             # Unreadable state may hide a cooldown another process just wrote,
@@ -448,6 +496,8 @@ class GraphqlPacer:
                 "updated": now,
                 "cooldown_until": now + GRAPHQL_COOLDOWN_S,
                 "backoff_s": GRAPHQL_COOLDOWN_S,
+                "core_tokens": self.capacity,
+                "graphql_tokens": self.capacity,
             }
 
     def _write(self, state: dict) -> None:
@@ -520,6 +570,78 @@ def graphql_args(query: str, variables: dict) -> list[str]:
     return args
 
 
+def split_rate_limit_headers(text: str) -> tuple[str, dict[str, str]]:
+    """Split a `gh api -i` answer into `(body, headers)`.
+
+    Header names are lower-cased. An answer with no header block (a
+    fake runner, a non-`api` call) returns itself with no headers.
+    """
+    if not text or not text.startswith("HTTP/"):
+        return text or "", {}
+    cuts = [(text.find(sep), len(sep)) for sep in ("\r\n\r\n", "\n\n")]
+    cuts = [(at, size) for at, size in cuts if at >= 0]
+    if not cuts:
+        return text, {}
+    at, size = min(cuts)
+    headers: dict[str, str] = {}
+    for line in text[:at].splitlines()[1:]:
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip().lower()] = value.strip()
+    return text[at + size :], headers
+
+
+def _note_run_headers(args: list[str], text: str) -> str:
+    """Note one subprocess answer's headers on the shared bucket.
+
+    Returns the body with the header block split off. Best-effort: a
+    bucket that cannot be written never breaks a call that already
+    answered, so every failure here keeps the body and moves on.
+    """
+    body, headers = split_rate_limit_headers(text or "")
+    if not headers:
+        return body
+    try:
+        remaining = float(headers["x-ratelimit-remaining"])
+        reset = float(headers["x-ratelimit-reset"])
+    except (KeyError, ValueError):
+        return body
+    resource = headers.get("x-ratelimit-resource") or ("graphql" if "graphql" in args else "core")
+    try:
+        _pacer().note_reported(resource, remaining, reset)
+    except Exception:
+        pass
+    return body
+
+
+def _note_rate_limit_headers(pacer, text: str, default_resource: str) -> str:
+    """Note one answer's reported rate limit on `pacer`; return its body.
+
+    Only an answer carrying both reported headers moves the pacer, and
+    only through `note_reported` (downward only). A pacer double with
+    no such method (older test fakes) simply keeps the body.
+    """
+    body, headers = split_rate_limit_headers(text or "")
+    if not headers:
+        return body
+    try:
+        remaining = float(headers["x-ratelimit-remaining"])
+        reset = float(headers["x-ratelimit-reset"])
+    except (KeyError, ValueError):
+        return body
+    note = getattr(pacer, "note_reported", None)
+    if callable(note):
+        note(headers.get("x-ratelimit-resource") or default_resource, remaining, reset)
+    return body
+
+
+def _include_args(args: list[str]) -> list[str]:
+    """`args` with `-i` after `api`, so the seam sees the rate headers."""
+    if args and args[0] == "api" and "-i" not in args and "--include" not in args:
+        return ["api", "-i", *args[1:]]
+    return list(args)
+
+
 def graphql(query: str, run=None, pacer=None, **variables) -> dict:
     """Run a GraphQL query and return its `data` payload, paced by the
     machine-wide bucket. A mutation costs GRAPHQL_MUTATION_COST, a
@@ -538,10 +660,13 @@ def graphql(query: str, run=None, pacer=None, **variables) -> dict:
     active_run = globals()["run"] if run is None else run
     args = graphql_args(query, variables)
     cost = GRAPHQL_MUTATION_COST if re.search(r"\bmutation\b", query) else GRAPHQL_CALL_COST
-    active_pacer.acquire(cost=cost)
+    active_pacer.acquire(cost=cost, resource="graphql")
     try:
-        payload = json.loads(active_run(args, paced=True))
+        payload = json.loads(
+            _note_rate_limit_headers(active_pacer, active_run(args, paced=True), "graphql")
+        )
     except GhError as err:
+        _note_rate_limit_headers(active_pacer, err.output, "graphql")
         if is_rate_limited(str(err)):
             active_pacer.cooldown(retry_after_s(str(err)))
         raise
@@ -579,13 +704,80 @@ def paced_run(
     # The parameter shadows the module's `run`: fall back to it by name,
     # so tests patching the module attribute still steer the default.
     active_run = globals()["run"] if run is None else run
-    active_pacer.acquire(cost=cost)
+    active_pacer.acquire(cost=cost, resource="core")
     try:
-        return active_run(args, timeout=timeout, paced=True)
+        return _note_rate_limit_headers(
+            active_pacer, active_run(args, timeout=timeout, paced=True), "core"
+        )
     except GhError as err:
+        _note_rate_limit_headers(active_pacer, err.output, "core")
         if is_rate_limited(str(err)):
             active_pacer.cooldown(retry_after_s(str(err)))
         raise
+
+
+class _ResetWaitPacer:
+    """One pacer as the reset-wait retry sees it: no guessed cooldown.
+
+    `paced_run` sets the shared cooldown from the seconds a rate-limit
+    message happens to name; a retry-managed caller instead waits for
+    the reported reset, which is the authority, and a long guess must
+    not make its retried `acquire` die on the pacing cap before the
+    reset arrives. Every other pacer duty delegates unchanged, so the
+    bucket still charges and still learns reported counts. Callers on
+    plain `paced_run` keep setting the shared cooldown as before.
+    """
+
+    def __init__(self, pacer):
+        self._pacer = pacer
+
+    def acquire(self, *args, **kwargs):
+        return self._pacer.acquire(*args, **kwargs)
+
+    def charge(self, *args, **kwargs):
+        return self._pacer.charge(*args, **kwargs)
+
+    def cooldown(self, seconds):
+        return None
+
+    def note_reported(self, *args, **kwargs):
+        note = getattr(self._pacer, "note_reported", None)
+        if callable(note):
+            return note(*args, **kwargs)
+        return None
+
+
+def paced_run_with_reset_wait(
+    args: list[str],
+    cost: float = REST_READ_COST,
+    timeout: float | None = GH_TIMEOUT_S,
+    run=None,
+    pacer=None,
+    budget_s: float | None = None,
+    now=None,
+    sleep=None,
+) -> str:
+    """`paced_run` under the reset-wait retry (docs/19, section 1).
+
+    Every retried call runs the full `paced_run`, so its pacer nap
+    counts against the same wall-clock bound the retry measures. This
+    is the runner the forge and tracker adapters are wired with in
+    production, so an in-process caller waits the way a script would.
+    `budget_s` defaults to the one reader of
+    `github.retry_max_wait_s`; tests inject a fake clock and sleep.
+    """
+    from korapy.github.retry import retry_max_wait_s, run_with_reset_wait
+
+    active_pacer = _ResetWaitPacer(_pacer() if pacer is None else pacer)
+    return run_with_reset_wait(
+        lambda call_args: paced_run(
+            call_args, cost=cost, timeout=timeout, run=run, pacer=active_pacer
+        ),
+        list(args),
+        budget_s=retry_max_wait_s() if budget_s is None else budget_s,
+        now=time.time if now is None else now,
+        sleep=time.sleep if sleep is None else sleep,
+    )
 
 
 def pacer_cooldown_remaining() -> float:

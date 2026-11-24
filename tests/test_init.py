@@ -328,6 +328,9 @@ TAIL = """# Defaults: uncomment to override.
 # git.commits.conventional = true  # enforce Conventional Commits
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
 #
+# [github]
+# github.retry_max_wait_s = 1800  # seconds a GitHub call may wait out a rate limit for its reset before giving up (exit 3)
+#
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
 # hub.host_id = ""  # this host's operator-assigned hub id (empty means unregistered, hub mode refused)
@@ -493,6 +496,9 @@ commits.conventional = false
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
+#
+# [github]
+# github.retry_max_wait_s = 1800  # seconds a GitHub call may wait out a rate limit for its reset before giving up (exit 3)
 #
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats

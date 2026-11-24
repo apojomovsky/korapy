@@ -14,7 +14,7 @@ from korapy import boardstatus
 from korapy import tracker as iface
 from korapy.github import gh
 from korapy.github.board import BoardReader, BoardSchema, BoardTracker, GithubBoardProvisioner
-from korapy.github.gh import paced_run
+from korapy.github.gh import paced_run_with_reset_wait
 from korapy.github.tracker import GithubTracker
 
 #: The tracker variants one ``[[repo]]`` entry may name. ``settings``
@@ -412,7 +412,7 @@ def build_tracker(
     without a board table are refused, never run as label mode.
     """
     if variant == "labels":
-        return GithubTracker(paced_run if run is None else run)
+        return GithubTracker(paced_run_with_reset_wait if run is None else run)
     if variant == "board":
         if board is None:
             raise ValueError(

@@ -156,6 +156,12 @@ class FakeForge:
             pr = self.pulls[(repo, number)]
         except KeyError:
             raise forge.ForgeError(f"no such PR: {repo}#{number}") from None
+        if pr.state == forge.MERGED:
+            if pr.head_sha != head_sha:
+                raise forge.ForgeRefused(f"PR {number} head moved: want {head_sha}")
+            if pr.merge_sha is None:
+                raise forge.ForgeRefused(f"PR {number} is merged with no recorded merge sha")
+            return pr.merge_sha
         if pr.state != forge.OPEN:
             raise forge.ForgeRefused(f"PR {number} is {pr.state}, nothing to merge")
         if pr.head_sha != head_sha:
@@ -511,8 +517,17 @@ class MergeShaTest(unittest.TestCase):
         )
         self.assertEqual(self.sha_of(payload), MERGE_SHA)
 
-    def test_merged_pr_without_a_sha_is_forge_error(self):
-        for raw in (None, "short", 7):
+    def test_merged_pr_without_a_sha_reads_as_none(self):
+        payload = pr_payload(
+            state="closed",
+            merged=True,
+            merged_at="2026-10-01T00:00:00Z",
+            merge_commit_sha=None,
+        )
+        self.assertIsNone(self.sha_of(payload))
+
+    def test_merged_pr_with_a_malformed_sha_is_forge_error(self):
+        for raw in ("short", 7):
             with self.subTest(raw=raw):
                 payload = pr_payload(
                     state="closed",
@@ -581,8 +596,38 @@ class MergeSeamTest(unittest.TestCase):
             ],
         )
 
-    def test_merged_pr_refuses_without_merging(self):
+    def test_merged_at_the_pinned_head_returns_the_sha_without_a_put(self):
         run = MergeRun([self.merged_pr()], None)
+        sha = ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
+        self.assertEqual(sha, MERGE_SHA)
+        self.assertEqual(len(run.calls), 1)
+
+    def test_merged_at_the_pinned_head_merge_commit_checks_the_parents(self):
+        run = MergeRun([self.merged_pr(), self.commit()], None)
+        sha = ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
+        self.assertEqual(sha, MERGE_SHA)
+        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(run.calls[1], ["api", f"repos/acme/lib/commits/{MERGE_SHA}"])
+
+    def test_merged_merge_commit_without_the_head_parent_is_unverified(self):
+        run = MergeRun([self.merged_pr(), self.commit(parents=(BASE_SHA, OTHER_SHA))], None)
+        with self.assertRaises(forge.ForgeError) as ctx:
+            ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
+        self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
+        self.assertEqual(len(run.calls), 2)
+
+    def test_merged_with_a_moved_head_refuses_without_merging(self):
+        payload = self.merged_pr()
+        payload["head"]["sha"] = OTHER_SHA
+        run = MergeRun([payload], None)
+        with self.assertRaises(forge.ForgeRefused):
+            ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
+        self.assertEqual(len(run.calls), 1)
+
+    def test_merged_with_no_recorded_sha_refuses_without_merging(self):
+        payload = self.merged_pr()
+        payload["merge_commit_sha"] = None
+        run = MergeRun([payload], None)
         with self.assertRaises(forge.ForgeRefused):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
         self.assertEqual(len(run.calls), 1)
@@ -763,6 +808,15 @@ class FakeForgeMergeTest(unittest.TestCase):
 
     def test_merge_refuses_a_closed_pr(self):
         fake = FakeForge(pulls=[make_pr(state="closed")])
+        with self.assertRaises(forge.ForgeRefused):
+            fake.merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
+
+    def test_merge_of_a_merged_pr_at_the_pin_returns_its_sha(self):
+        fake = FakeForge(pulls=[make_pr(state="merged", merge_sha=MERGE_SHA)])
+        self.assertEqual(fake.merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash"), MERGE_SHA)
+
+    def test_merge_of_a_merged_pr_with_no_sha_refuses(self):
+        fake = FakeForge(pulls=[make_pr(state="merged", merge_sha=None)])
         with self.assertRaises(forge.ForgeRefused):
             fake.merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
 

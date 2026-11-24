@@ -94,9 +94,9 @@ class Seams(NamedTuple):
 def production_seams() -> Seams:
     """The real seams. Only the CLI builds them; tests never call this."""
     from korapy.github import tracker as ghtracker
-    from korapy.github.gh import paced_run
+    from korapy.github.gh import paced_run_with_reset_wait
 
-    live = ghtracker.GithubTracker(paced_run)
+    live = ghtracker.GithubTracker(paced_run_with_reset_wait)
 
     def labels_fn(kind, repo, number):
         # A PR is an item in the same issues feed, so both kinds read one way.
