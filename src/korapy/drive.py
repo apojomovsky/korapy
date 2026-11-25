@@ -551,6 +551,44 @@ def area_refusal(candidate, holders, *, prefix, hold_until_merged=True, fail_ope
     return None
 
 
+def blocked_refusal(row, states=None) -> str | None:
+    """The blocked-by skip reason for a candidate's row, else None. Pure.
+
+    `row` is the candidate's row and `states` maps `(repo, number)` to
+    the stored ticket state; a missing map reads every ref as
+    unresolvable, failing closed. A same-repo ref blocks while its
+    ticket is anything but closed (an unknown ticket reads as not
+    found, also blocking, so a dependency the sync never stored never
+    starts); a ref to another repository blocks whatever that ticket
+    says, named in full; an unparseable entry blocks naming its text.
+    The reason names the ticket and the blocker, so the `--plan`
+    table, the journal and the dashboard read the same words.
+    """
+    extra = row.extra if isinstance(row.extra, dict) else {}
+    refs = extra.get("blocked_by")
+    if not refs:
+        return None
+    ref = f"{row.repo}#{row.number}"
+    if isinstance(refs, str):
+        return f"{ref}: blocked by {refs}, start refused"
+    if not isinstance(refs, (list, tuple)):
+        return f"{ref}: blocked by {refs!r}, start refused"
+    for entry in refs:
+        if not isinstance(entry, str):
+            return f"{ref}: blocked by {entry!r}, start refused"
+        name, sep, number = entry.rpartition("#")
+        if not sep or not name or not number.isdigit():
+            return f"{ref}: blocked by {entry}, start refused"
+        if name != row.repo:
+            return f"{ref}: blocked by {entry} (another repository), start refused"
+        state = (states or {}).get((name, int(number)))
+        if state == "closed":
+            continue
+        detail = state if isinstance(state, str) and state else "not found"
+        return f"{ref}: blocked by #{number} ({detail}), start refused"
+    return None
+
+
 def gate(
     candidate,
     *,
@@ -571,6 +609,7 @@ def gate(
     area_prefix="",
     area_hold_until_merged=True,
     area_fail_open=False,
+    blocked_states=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -578,7 +617,10 @@ def gate(
     a merged linked pull for every kind before external ownership,
     then external, withdrawn: the merged branch only fires on rows the
     pass listed pulls for, so an external row the listing skipped logs
-    externally owned, never merged), then claim
+    externally owned, never merged), then the dependency block (a
+    stored `blocked_by` ref to an open same-repo ticket, or to another
+    repository or an unresolvable ref, skips with code `blocked`,
+    naming the blocker; closed same-repo tickets release it), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
     role, outcome)} for the newest finished entry per ticket), then the
@@ -672,6 +714,9 @@ def gate(
         )
     if row.external:
         return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
+    refused = blocked_refusal(row, blocked_states)
+    if refused is not None:
+        return _skip(candidate, request.kind, "blocked", refused)
     if request.kind == "review" and iface.RESEARCH in (row.labels or ()):
         return _skip(
             candidate,
@@ -2205,7 +2250,11 @@ def pulls_check_needed(row, *, hold_label) -> bool:
     labels = tuple(row.labels or ())
     if hold.labels_held(labels, hold_label):
         return False
-    if iface.NEEDS_DECISION in labels or "needs-triage" in labels:
+    if (
+        iface.NEEDS_DECISION in labels
+        or iface.NEEDS_TRIAGE in labels
+        or iface.NEEDS_HARDWARE in labels
+    ):
         return False
     holder = row.agent or ""
     if not holder:
@@ -2734,7 +2783,10 @@ def _gate_all(
     None reads every row as unclaimed) scopes the merged-pull check to
     merges newer than the claim start, and bounds the closed-pull
     listing to the same cutoff, so every merge the scope could fire
-    on is listed. `pulls_max_calls` (None reads
+    on is listed. The dependency block resolves every stored
+    `blocked_by` ref against the same rows the gate reads, so a
+    blocked ticket skips with its blocker named and `--plan` shows
+    why with no tracker contact. `pulls_max_calls` (None reads
     the `drive.pulls_max_calls` host setting) caps the listing calls
     for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
@@ -2938,6 +2990,7 @@ def _gate_all(
     def floor_of(name):
         return admission.bounds(limits.projects.get(name))[0]
 
+    blocked_states = {key: crow.state for key, crow in by_key.items()}
     stop_starts = False
     gated_rows = []
     for candidate in order(candidates, milestone_first=milestone_projects):
@@ -2987,6 +3040,7 @@ def _gate_all(
             area_prefix=area_prefix,
             area_hold_until_merged=area_hold_until_merged,
             area_fail_open=area_fail_open,
+            blocked_states=blocked_states,
         )
         if suffix:
             verdict = replace(verdict, reason=verdict.reason + suffix)

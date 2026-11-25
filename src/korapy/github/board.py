@@ -526,7 +526,7 @@ class BoardReader:
             raise _fail(f"bad board content repo {repo!r}")
         texts, selects = self._node_values(by_field, node)
         item, milestone = self._issues.read_issue(repo, number)
-        extra = self._concepts(selects, texts, milestone)
+        extra = self._concepts(selects, texts, milestone, body=item.body, repo=repo)
         return item._replace(
             updated_at=max(board_time, item.updated_at),
             agent=texts.get("agent", ""),
@@ -566,7 +566,7 @@ class BoardReader:
             return None, None, None
         return concept, "select", _checked_option(entry, concept)
 
-    def _concepts(self, selects, texts, milestone):
+    def _concepts(self, selects, texts, milestone, *, body="", repo=""):
         """Board values plus the milestone as the reading's ``extra``.
 
         `milestone` is the ``(title, due_on, closed)`` facts the single
@@ -581,7 +581,12 @@ class BoardReader:
         config's ``priority_map`` for priority and through display
         names for the other columns; an option id the map no longer
         names leaves the concept absent, so the merge keeps the stored
-        value.
+        value. `body` is the issue's body from that same read and
+        `repo` its tracker repo: the body's `Depends on` refs join the
+        board's `Blocked by` cell (a raw cell stays raw, failing
+        closed), and an empty body with no cell clears the stored
+        block, so both modes read dependencies through the one
+        `depends_on` reader with no new call.
         """
         extra = {}
         if "board_status" in selects:
@@ -594,8 +599,15 @@ class BoardReader:
             extra["area"] = selects["area"][1]
         if "pool" in selects:
             extra["pool"] = selects["pool"][1]
+        body_refs = gh.depends_blocked_by(repo, body) if repo else []
         if "blocked_by" in texts:
-            extra["blocked_by"] = parse_blocked_by(texts["blocked_by"])
+            base = parse_blocked_by(texts["blocked_by"])
+            if isinstance(base, str):
+                extra["blocked_by"] = base
+            else:
+                extra["blocked_by"] = base + [ref for ref in body_refs if ref not in base]
+        else:
+            extra["blocked_by"] = body_refs
         title, due, closed = milestone
         extra["milestone"] = title
         extra["milestone_due"] = due
