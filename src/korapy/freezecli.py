@@ -59,8 +59,20 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
             owned_pause=owned,
         )
         if owned:
-            with open(pause_file, "w", encoding="utf-8") as handle:
-                handle.write(freeze.pause_text(reason) + "\n")
+            try:
+                created_pause = os.open(pause_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                owned = False
+                freeze.write_freeze(
+                    freeze_file,
+                    reason=reason,
+                    until=list(args.until or ()),
+                    now=now,
+                    owned_pause=False,
+                )
+            else:
+                with os.fdopen(created_pause, "w", encoding="utf-8") as handle:
+                    handle.write(freeze.pause_text(reason) + "\n")
     except OSError as problem:
         _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
         print(f"korapy freeze: cannot write the freeze state: {problem}", file=err)
