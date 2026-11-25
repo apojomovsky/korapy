@@ -577,10 +577,11 @@ class BoardReader:
         spends no per-item REST call. Anything the snapshot cannot prove
         current reads live instead: a missing row (first sync), a stale
         row (the issue changed, or changed between the feed and this
-        poll), a non-issue row, a node whose issue time is unreadable,
-        or a row whose milestone triple is incomplete. A corrupt snapshot
-        row never reaches here: the sync step falls back to live reads
-        before the poll runs.
+        poll), a pull-request node (the store never keeps pull-request
+        rows, so the snapshot cannot cover one), a node whose issue time
+        is unreadable, or a row whose milestone triple is partial. A
+        corrupt snapshot row never reaches here: the sync step falls
+        back to live reads before the poll runs.
         """
         if not stored:
             return None
@@ -591,11 +592,16 @@ class BoardReader:
             return None
         extra = row.extra if isinstance(row.extra, dict) else {}
         # A stored row either names the whole milestone triple or none
-        # of it: both writers always carry all three keys, and the merge
-        # drops the cleared encoding, so an absent triple is an
-        # unmilestoned issue, exactly what a live read would carry. A
-        # partial triple predates the contract and is re-read live once,
-        # which heals it, instead of dropping a concept it half names.
+        # of it. Both writers always emit all three keys, and the merge
+        # drops the cleared encoding, so an absent triple is the steady
+        # state of an unmilestoned issue, exactly what a live read would
+        # carry: reusing it keeps the quiet-board bound, and a live read
+        # would store the same absence back. A milestoned issue always
+        # leaves at least its title behind (every writer since the
+        # single-key era names it, and a valued key survives the merge),
+        # so only a partial triple can hide a milestone, and it predates
+        # the contract: it is re-read live once, which heals it, instead
+        # of dropping a concept it half names.
         have = [key in extra for key in _MILESTONE_KEYS]
         if any(have) and not all(have):
             return None

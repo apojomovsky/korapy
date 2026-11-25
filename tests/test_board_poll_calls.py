@@ -6,10 +6,10 @@ items drained the shared hourly REST budget on every pass. The poll now
 reuses the stored issue facts for an item whose issue has not changed
 since the last pass, keyed by the issue's ``updated_at`` carried on the
 board node itself, and reads live exactly the items the snapshot cannot
-cover: first sightings, changed issues, and rows the snapshot cannot
-parse. Fakes only: canned GraphQL pages and REST payloads at the
-injected ``run`` seam, a temporary store, no network, no real state
-dir.
+cover: first sightings, changed issues, pull-request nodes (the store
+keeps no pull-request rows), and rows the snapshot cannot parse. Fakes
+only: canned GraphQL pages and REST payloads at the injected ``run``
+seam, a temporary store, no network, no real state dir.
 """
 
 import json
@@ -22,6 +22,7 @@ from korapy import board as store
 from korapy import sync
 from korapy import tracker as iface
 from korapy.github import board as boardreader
+from korapy.github.tracker import GithubTracker
 from korapy.trackers import BoardBackedTracker
 from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
@@ -37,7 +38,7 @@ from tests.test_board_reader import (
 from tests.test_board_sync import FakeBoardReader
 from tests.test_board_sync import REPO as SYNC_REPO
 from tests.test_board_sync import schema as sync_schema
-from tests.test_tracker import item_payload, reading
+from tests.test_tracker import item_payload, pull_payload, reading
 
 REPO = "example/demo"
 ISSUE_T = "2026-10-28T12:00:00Z"
@@ -84,8 +85,15 @@ def stored_row(number, updated_at=T0, extra=None, kind="issue"):
     )
 
 
-def node(number, board_time=ISSUE_T, issue_time=ISSUE_T, values=()):
-    return item_node(number, repo=REPO, updated=board_time, values=values, issue_updated=issue_time)
+def node(number, board_time=ISSUE_T, issue_time=ISSUE_T, values=(), typename="Issue"):
+    return item_node(
+        number,
+        repo=REPO,
+        updated=board_time,
+        values=values,
+        issue_updated=issue_time,
+        typename=typename,
+    )
 
 
 def poll_with(run, nodes, stored, max_pages=10, page_size=100):
@@ -178,6 +186,94 @@ class UnchangedSkipTest(unittest.TestCase):
         found, _ = poll_with(run, [node(1)], stored)
         self.assertEqual(single_issue_numbers(run), [])
         self.assertEqual(found[0].title, "Title 1")
+        # An absent triple reuses as unmilestoned: both writers always
+        # emit all three keys and the merge drops the cleared encoding,
+        # so absence is the steady state of an unmilestoned issue, not an
+        # unknown the gate must re-read.
+        self.assertIsNone(found[0].extra["milestone"])
+        self.assertIsNone(found[0].extra["milestone_due"])
+        self.assertIsNone(found[0].extra["milestone_closed"])
+
+    def test_unmilestoned_row_cleared_by_merge_still_reuses(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-board-steady-")
+        self.addCleanup(tmp.cleanup)
+        st = store.open_store(os.path.join(tmp.name, "board.sqlite"))
+        self.addCleanup(st.close)
+        st.upsert_item(
+            store.Item(
+                repo=REPO,
+                number=4,
+                title="Title 4",
+                body="Body 4",
+                tracker_updated_at=T0,
+                extra={"milestone": None, "milestone_due": None, "milestone_closed": None},
+            ),
+            operators=["alice"],
+            now=T0,
+        )
+        row, _ = st.item(REPO, 4, now=T0)
+        # The merge drops the cleared encoding, so the stored row names
+        # no triple at all.
+        self.assertNotIn("milestone", row.extra)
+        run = BoardFakeRun()
+        found, _ = poll_with(run, [node(4)], {(row.repo, row.number): row})
+        self.assertEqual(single_issue_numbers(run), [])
+        self.assertEqual(found[0].title, "Title 4")
+        self.assertIsNone(found[0].extra["milestone"])
+
+    def test_milestone_keys_agree_across_writers_and_gate(self):
+        parsed = GithubTracker(BoardFakeRun())._parse(
+            REPO,
+            item_payload(
+                9,
+                milestone={
+                    "title": "M1",
+                    "due_on": "2026-12-05T00:00:00Z",
+                    "state": "closed",
+                },
+            ),
+        )
+        self.assertLessEqual(set(boardreader._MILESTONE_KEYS), set(parsed.extra or {}))
+        reader = boardreader.BoardReader(config(), BoardFakeRun(), pacer=FakePacer())
+        concepts = reader._concepts(
+            {}, {}, ("M1", "2026-12-05T00:00:00Z", True), body="", repo=REPO
+        )
+        self.assertLessEqual(set(boardreader._MILESTONE_KEYS), set(concepts))
+        # The gate's fabricated tuple rides the same positions the live
+        # readers fill: a reused triple lands on the same keys.
+        run = BoardFakeRun()
+        stored = {
+            (REPO, 9): stored_row(
+                9,
+                extra={
+                    "milestone": "M1",
+                    "milestone_due": "2026-12-05T00:00:00Z",
+                    "milestone_closed": True,
+                },
+            )
+        }
+        found, _ = poll_with(run, [node(9)], stored)
+        self.assertEqual(single_issue_numbers(run), [])
+        self.assertEqual(found[0].extra["milestone"], "M1")
+        self.assertEqual(found[0].extra["milestone_due"], "2026-12-05T00:00:00Z")
+        self.assertIs(found[0].extra["milestone_closed"], True)
+
+    def test_pull_request_node_reads_live_every_pass(self):
+        run = BoardFakeRun()
+        run.add_rest(f"repos/{REPO}/issues/9", item_payload(9, pull_request={}, updated_at=ISSUE_T))
+        run.add_rest(f"repos/{REPO}/pulls/9", pull_payload(9, fork=False))
+        stored = {(REPO, 1): stored_row(1)}
+        found, _ = poll_with(run, [node(9, typename="PullRequest")], stored)
+        self.assertEqual([item.kind for item in found], ["pr"])
+        # A second identical pass costs the same again: the store keeps
+        # no pull-request rows, so the snapshot never covers one. Each
+        # card costs its issue read plus its fork lookup.
+        poll_with(run, [node(9, typename="PullRequest")], stored)
+        paths = [args[1] for args, _ in run.calls if args[1] != "graphql"]
+        self.assertEqual(
+            paths,
+            [f"repos/{REPO}/issues/9", f"repos/{REPO}/pulls/9"] * 2,
+        )
 
     def test_duplicate_nodes_for_one_issue_share_the_snapshot_row(self):
         run = BoardFakeRun()
@@ -351,6 +447,36 @@ class QuietPassBudgetTest(unittest.TestCase):
         row, _ = self.store.item(REPO, 7, now=T0 + 300)
         self.assertEqual(row.title, "Raced title")
         self.assertEqual(row.extra["milestone"], "M1")
+
+    def test_same_second_edit_serves_stale_then_feed_heals(self):
+        numbers = [1, 2, 3]
+        self.feed_entries = [
+            item_payload(n, updated_at=ISSUE_T, node_id=f"NODE_{n}") for n in numbers
+        ]
+        self.adopt_entries = [
+            {"number": n, "node_id": f"NODE_{n}", "state": "open"} for n in numbers
+        ]
+        self.singles = {str(n): self.feed_entries[n - 1] for n in numbers}
+        nodes = [node(n) for n in numbers]
+        self.script_pass(nodes)
+        self.sync_pass(nodes, T0)
+
+        # An edit landing in the stored second keeps the node's issue
+        # time covered, so the poll serves the stale stored facts and
+        # spends no per-item call; the feed, which lists inclusively,
+        # redelivers the edit in the same pass and heals the row.
+        edited = item_payload(2, title="Edited title", updated_at=ISSUE_T, node_id="NODE_2")
+        self.singles["2"] = edited
+        self.feed_changed = [edited]
+        calls_before = len(self.fake.calls)
+        self.script_pass(nodes)
+        _, board_result = self.sync_pass(nodes, T0 + 300)
+        fresh = self.fake.calls[calls_before:]
+        singles = [args[1] for args, _ in fresh if _SINGLE_RE.fullmatch(args[1])]
+        self.assertEqual(board_result.errors, ())
+        self.assertEqual(singles, [])
+        row, _ = self.store.item(REPO, 2, now=T0 + 300)
+        self.assertEqual(row.title, "Edited title")
 
 
 class SnapshotWiringTest(unittest.TestCase):
