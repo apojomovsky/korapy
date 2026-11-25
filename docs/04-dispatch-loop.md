@@ -166,8 +166,9 @@ again still selects. A research ticket is selected like
 any other, but asks for kind `research` (see section 5). A ticket
 naming dependencies is still requested: the gate refuses it with the
 blocker named (step 1 below), so `drive --plan` shows why instead of
-a silent withdrawal. Dependencies come from `Depends on #N` lines in
-the issue body (first-seen order, bare refs only), stored as the
+a silent withdrawal. Dependencies come from `Depends on` lines in
+the issue body (first-seen order, bare `#N` refs plus qualified
+`repo#N` and `owner/repo#N` refs as written), stored as the
 row's `blocked_by` refs at sync time alongside the board's `Blocked
 by` column in board mode; both modes read the already-fetched body,
 so the pass spends no new GitHub calls. Weight is the board priority rank,
@@ -816,7 +817,7 @@ is tested through the seam its production code already injects:
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
-| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start | pure policy call over fixture rows |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, `blocked`-label, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start; `blocked_by` rows are requested and refused by the gate with the blocker named | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |

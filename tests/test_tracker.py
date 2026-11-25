@@ -356,6 +356,13 @@ class DependsOnExtraTest(unittest.TestCase):
         found = self.adapter.item("acme/app", 7)
         self.assertEqual((found.extra or {})["blocked_by"], [])
 
+    def test_qualified_body_refs_ride_through_for_the_gate(self):
+        self.gh.add(
+            "repos/acme/app/issues/7", item_payload(7, body="Work.\nDepends on other/repo#5")
+        )
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], ["other/repo#5"])
+
     def test_body_comes_from_the_issue_read_without_a_new_call(self):
         self.gh.add("repos/acme/app/issues/7", item_payload(7, body="Work.\nDepends on #3"))
         found = self.adapter.item("acme/app", 7)

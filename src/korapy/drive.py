@@ -2243,7 +2243,11 @@ def pulls_check_needed(row, *, hold_label) -> bool:
     labels = tuple(row.labels or ())
     if hold.labels_held(labels, hold_label):
         return False
-    if iface.NEEDS_DECISION in labels or "needs-triage" in labels:
+    if (
+        iface.NEEDS_DECISION in labels
+        or iface.NEEDS_TRIAGE in labels
+        or iface.NEEDS_HARDWARE in labels
+    ):
         return False
     holder = row.agent or ""
     if not holder:

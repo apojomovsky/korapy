@@ -24,7 +24,7 @@ from korapy import eligibility, tracker
 #: never selected. Module constants on purpose: one place, and no
 #: configuration surface in version one. `needs-hardware` marks a
 #: ticket for real hardware, never an agent.
-HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, "needs-triage")
+HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, tracker.NEEDS_TRIAGE)
 """Labels that hold a ticket for a human; a row carrying any is never selected."""
 
 #: Standalone title word that holds a ticket for a human. The match is a

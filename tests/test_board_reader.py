@@ -1059,6 +1059,15 @@ class PollDependsOnBodyTest(PollItemsTest):
         )
         self.assertEqual(found.extra["blocked_by"], ["example/demo#3"])
 
+    def test_qualified_body_refs_join_the_board_blocked_by(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [text_value("F_blocked", "Blocked by", "  ")],
+            body="Work.\nDepends on other/repo#5",
+        )
+        self.assertEqual(found.extra["blocked_by"], ["other/repo#5"])
+
     def test_raw_board_blocked_by_stays_raw_when_the_body_names_deps(self):
         run = BoardFakeRun()
         found = self.poll_one(

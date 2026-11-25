@@ -1220,6 +1220,9 @@ class PullsCheckNeededTest(unittest.TestCase):
         self.assertFalse(self.check(board_item(labels=["needs-decision"])))
         self.assertFalse(self.check(board_item(labels=["needs-triage"])))
 
+    def test_a_hardware_only_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(labels=["needs-hardware"])))
+
     def test_a_ticket_claimed_by_a_managed_agent_needs_the_check(self):
         self.assertTrue(self.check(board_item(agent="drive-host-1-abc-7")))
 
@@ -1873,6 +1876,16 @@ class BlockedByGateTest(unittest.TestCase):
         gated = self.blocked({"blocked_by": "someday maybe"}, {})
         self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
         self.assertIn("someday maybe", gated.reason)
+
+    def test_whole_list_with_a_non_string_entry_blocks(self):
+        gated = self.blocked({"blocked_by": [5]}, {})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("5", gated.reason)
+
+    def test_whole_list_with_an_unresolvable_entry_blocks(self):
+        gated = self.blocked({"blocked_by": ["someday"]}, {})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "blocked"))
+        self.assertIn("someday", gated.reason)
 
     def test_malformed_blocked_by_blocks_fail_closed(self):
         gated = self.blocked({"blocked_by": 5}, {})

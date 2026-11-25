@@ -294,13 +294,14 @@ class ConstantsTest(unittest.TestCase):
     def test_hold_labels_match_tracker_needs_decision(self):
         self.assertEqual(
             policies.HOLD_LABELS,
-            ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, "needs-triage"),
+            ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, tracker.NEEDS_TRIAGE),
         )
 
     def test_hold_labels_reference_tracker_constant(self):
         source = inspect.getsource(policies)
         self.assertIn("tracker.NEEDS_DECISION", source)
         self.assertIn("tracker.NEEDS_HARDWARE", source)
+        self.assertIn("tracker.NEEDS_TRIAGE", source)
 
     def test_constants_have_docstrings(self):
         check_constant_docstrings(

@@ -75,6 +75,10 @@ class BootstrapLabel(NamedTuple):
 #: exposes a general label write, so any other name is refused.
 NEEDS_DECISION = "needs-decision"
 
+#: A ticket carrying this label waits for triage to a repository: no
+#: agent takes it until a human routes it.
+NEEDS_TRIAGE = "needs-triage"
+
 #: A ticket carrying this label must run on real hardware: no agent
 #: takes it. The ready-made policy holds it with the other
 #: human-owned labels; korapy never adds or removes it, so the label
@@ -99,7 +103,7 @@ RESEARCHED = "researched"
 #: answered; the `priority:*` names follow `PRIORITIES` in rank order.
 BOOTSTRAP_LABELS = (
     BootstrapLabel("ready", "marks an issue an agent may take"),
-    BootstrapLabel("needs-triage", "waiting for triage to a repository"),
+    BootstrapLabel(NEEDS_TRIAGE, "waiting for triage to a repository"),
     BootstrapLabel(NEEDS_DECISION, "waiting on a human decision"),
     BootstrapLabel("hold", "held for a human; resume refuses while present"),
     BootstrapLabel(RESEARCH, "a research question, answered by a Findings comment"),
