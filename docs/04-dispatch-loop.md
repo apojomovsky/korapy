@@ -160,12 +160,17 @@ returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, `needs-hardware`, or
 `needs-triage` label, and no standalone `HOLD` word in the title),
 carrying no `blocked` label, not already `researched`, and with no
-open linked pull request and no linked pull merged since the claim
+linked pull merged since the claim
 start (by merge time, falling back to the last-update time when the
 listing carries no merge time), claimed or not: in-flight rows stay
 requested so the loop never withdraws them by omission, while a
 ticket whose work landed during its claim stays withdrawn so no new
-round starts on landed work. A pull merged before the claim start
+round starts on landed work. An open linked pull never withdraws a
+row here: the gate already refuses the fresh start while the pull is
+open, routes a finished worker's claim to a reviewer takeover, and
+grades an approving record as merge-ready, so selecting keeps the row
+visible for those verdicts instead of hiding it. A pull merged before
+the claim start
 reads as landed-before-this-round, so a reopened ticket picked up
 again still selects. A research ticket is selected like
 any other, but asks for kind `research` (see section 5). A ticket
@@ -244,9 +249,12 @@ Each row also carries its pull times from that one listing (the merge
 time, falling back to the last-update time when the listing carries
 no merge time) and its claim start from the store, so the policy and
 the gate scope old merges against the same times. `basic`'s own pull
-filter refuses a ticket with an open linked pull or a linked pull
+filter refuses a ticket with a linked pull
 merged since the claim start, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
+An open linked pull is the gate's call alone: the policy selects the
+row and the gate refuses the fresh start, takes over for a reviewer,
+or grades the record as merge-ready.
 The `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md)) caps the listing calls
 per pass: repositories past the cap leave their tickets unreadable, and
 the gate refuses those starts, failing closed like an unreadable
