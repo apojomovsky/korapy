@@ -202,7 +202,46 @@ def with_honest_quota(quota_view):
     return out
 
 
-def attention(events):
+def _doctor_field(row, name):
+    """One doctor check field from a dict row or a `Check` object (pure)."""
+    if isinstance(row, dict):
+        return row.get(name)
+    return getattr(row, name, None)
+
+
+def _doctor_failing(doctor_view):
+    """The failing doctor rows for the attention band (pure).
+
+    `doctor_view` is the last recorded doctor result: a list of check
+    rows (dicts or `doctor.Check` values), None when no run has been
+    recorded, or the exception reading the record raised. Only `fail`
+    rows count; each carries its name, detail and fix text, with a
+    missing part reading `unknown`. No reading, a broken reading or a
+    wrong-shaped one reads `"unknown"`, never a reassuring empty list
+    and never an error that would mask the event rows beside it.
+    """
+    if doctor_view is None or isinstance(doctor_view, Exception):
+        return "unknown"
+    if not isinstance(doctor_view, (list, tuple)):
+        return "unknown"
+
+    def _text(row, name):
+        value = _doctor_field(row, name)
+        return value if isinstance(value, str) and value else "unknown"
+
+    failing = []
+    for row in doctor_view:
+        if not isinstance(row, dict) and not hasattr(row, "status"):
+            continue
+        if _doctor_field(row, "status") != "fail":
+            continue
+        failing.append(
+            {"name": _text(row, "name"), "detail": _text(row, "detail"), "fix": _text(row, "fix")}
+        )
+    return failing
+
+
+def attention(events, doctor_view=None):
     """The attention band from unresolved event rows (pure).
 
     `events` is `coordevents.unresolved` rows, None when uncollected,
@@ -212,10 +251,13 @@ def attention(events):
     ref and one line of evidence. `research` carries the answered
     research findings, each with its ref and the finding's first line.
     `coordinator_handled` counts the rows
-    the coordinator owns (`coordinator-review`). Failing doctor rows
-    are not part of this band: they need their own reader, which a
-    later change adds.
+    the coordinator owns (`coordinator-review`). `doctor_failing`
+    carries the failing rows of the last recorded doctor run, each
+    with its fix text, through the one reader `_doctor_failing`; the
+    two sources fail independently, so a missing doctor record reads
+    `unknown` beside healthy event rows and the reverse.
     """
+    failing = _doctor_failing(doctor_view)
     if events is None:
         return {
             "state": "unknown",
@@ -223,6 +265,7 @@ def attention(events):
             "ready_to_merge": "unknown",
             "research": "unknown",
             "coordinator_handled": "unknown",
+            "doctor_failing": failing,
             "items": "unknown",
         }
     if isinstance(events, Exception):
@@ -232,6 +275,7 @@ def attention(events):
             "ready_to_merge": [],
             "research": [],
             "coordinator_handled": 0,
+            "doctor_failing": failing,
             "items": [],
             "error": str(events) or repr(events),
         }
@@ -242,6 +286,7 @@ def attention(events):
             "ready_to_merge": [],
             "research": [],
             "coordinator_handled": 0,
+            "doctor_failing": failing,
             "items": [],
             "error": f"attention events is {type(events).__name__}, want a list of rows",
         }
@@ -272,6 +317,7 @@ def attention(events):
         "ready_to_merge": merges,
         "research": findings,
         "coordinator_handled": handled,
+        "doctor_failing": failing,
         "items": list(needs) + list(merges) + list(findings),
     }
 

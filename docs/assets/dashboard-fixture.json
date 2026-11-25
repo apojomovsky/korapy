@@ -229,7 +229,30 @@
   "ready_to_merge": [],
   "research": [],
   "coordinator_handled": 0,
+  "doctor_failing": [
+   {
+    "name": "deps:example-tool",
+    "detail": "example-tool is not installed",
+    "fix": "install example-tool, then run `korapy doctor` again"
+   }
+  ],
   "items": []
+ },
+ "peek": {
+  "repo-a#41": {
+   "state": "ready",
+   "lines": [
+    {
+     "at": "2026-11-07T19:40:16-03:00",
+     "text": "-> Running the suite | {\"command\": \"make test\"}"
+    },
+    {
+     "at": "2026-11-07T19:41:16-03:00",
+     "text": "Tests pass. Opening the PR."
+    }
+   ],
+   "truncated": false
+  }
  },
  "plan": {
   "state": "ready",
