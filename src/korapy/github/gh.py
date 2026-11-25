@@ -364,16 +364,20 @@ class GraphqlPacer:
             self.sleep(nap)
             waited += nap
 
-    def charge(self, cost: float) -> None:
+    def charge(self, cost: float, resource: str = "graphql") -> None:
         """Deduct `cost` without waiting, for a call that goes through anyway.
 
         A call whose wait exceeded the cap still hit the API, so it must still
         draw on the bucket. The balance may go negative, down to -capacity, so
-        the debt stays bounded and later callers wait it off.
+        the debt stays bounded and later callers wait it off. The debt lands
+        on the caller's resource sub-balance (and the legacy shared tally),
+        so later callers of the same resource wait it off.
         """
+        key = _RESOURCE_KEYS.get(resource, "graphql_tokens")
 
         def take(state, now):
             state["tokens"] = max(-self.capacity, state["tokens"] - cost)
+            state[key] = max(-self.capacity, state[key] - cost)
             return 0.0
 
         self._update(take)
@@ -435,8 +439,12 @@ class GraphqlPacer:
     def _take(self, state, now, cost, resource="graphql"):
         if state["cooldown_until"] > now:
             return state["cooldown_until"] - now
+        # Spending is isolated per resource: only the resource's own
+        # sub-balance gates, so a REST burst never drains GraphQL
+        # headroom (docs/19 section 5). The shared tally still records
+        # every spend, but nothing waits on it.
         key = _RESOURCE_KEYS.get(resource, "graphql_tokens")
-        short = max(cost - state["tokens"], cost - state[key], 0.0)
+        short = max(cost - state[key], 0.0)
         if short > 0.0:
             return short * 60.0 / self.refill_per_min
         state["tokens"] -= cost
@@ -596,22 +604,18 @@ def _note_run_headers(args: list[str], text: str) -> str:
 
     Returns the body with the header block split off. Best-effort: a
     bucket that cannot be written never breaks a call that already
-    answered, so every failure here keeps the body and moves on.
+    answered, so every failure here keeps the body and moves on. The
+    injectable `_note_rate_limit_headers` does the parsing, so the
+    unknown-resource fallback cannot diverge from the paced callers.
     """
     body, headers = split_rate_limit_headers(text or "")
     if not headers:
         return body
+    default = "graphql" if "graphql" in args else "core"
     try:
-        remaining = float(headers["x-ratelimit-remaining"])
-        reset = float(headers["x-ratelimit-reset"])
-    except (KeyError, ValueError):
-        return body
-    resource = headers.get("x-ratelimit-resource") or ("graphql" if "graphql" in args else "core")
-    try:
-        _pacer().note_reported(resource, remaining, reset)
+        return _note_rate_limit_headers(_pacer(), text or "", default)
     except Exception:
-        pass
-    return body
+        return body
 
 
 def _note_rate_limit_headers(pacer, text: str, default_resource: str) -> str:

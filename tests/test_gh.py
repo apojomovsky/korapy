@@ -757,6 +757,22 @@ class NoteReportedTest(unittest.TestCase):
             # The other resource still paces.
             pacer.acquire(cost=1.0, resource="graphql")
 
+    def test_spending_one_resource_leaves_the_other(self):
+        # Isolation, not reports: draining REST must not move the
+        # GraphQL gate, and draining GraphQL must not move the REST one.
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp, capacity=4.0, max_wait_s=0.0)
+            pacer.acquire(cost=4.0, resource="core")
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0, resource="core")
+            pacer.acquire(cost=1.0, resource="graphql")
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp, capacity=4.0, max_wait_s=0.0)
+            pacer.acquire(cost=4.0, resource="graphql")
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0, resource="graphql")
+            pacer.acquire(cost=1.0, resource="core")
+
 
 class HeaderCaptureTest(unittest.TestCase):
     class RecordingPacer:
@@ -851,6 +867,29 @@ class HeaderCaptureTest(unittest.TestCase):
             # default instead of raising out of a successful call.
             self.assertEqual(state["core_tokens"], 60.0)
             self.assertEqual(state["graphql_tokens"], gh.GRAPHQL_CAPACITY)
+
+    def test_the_subprocess_seam_shares_the_same_unknown_resource_fallback(self):
+        headers = (
+            "HTTP/2 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 2500\r\n"
+            "x-ratelimit-reset: 2000\r\nx-ratelimit-resource: search\r\n\r\n"
+        )
+        notes = []
+
+        class Pacer:
+            def note_reported(self, resource, remaining, reset_epoch):
+                # Like the real pacer: an unknown resource refuses.
+                if resource not in ("core", "rest", "graphql"):
+                    raise ValueError(f"unknown rate limit resource {resource!r}")
+                notes.append((resource, remaining, reset_epoch))
+
+        with (
+            mock.patch("subprocess.Popen", return_value=_popen(stdout=headers + '{"ok": true}')),
+            mock.patch.object(gh, "_pacer", return_value=Pacer()),
+        ):
+            self.assertEqual(gh.run(["api", "repos/acme/lib"], paced=True), '{"ok": true}')
+        # One parser serves every paced caller, so the report lands on
+        # the default instead of being dropped.
+        self.assertEqual(notes, [("core", 2500, 2000.0)])
 
 
 class DefaultBudgetTest(unittest.TestCase):

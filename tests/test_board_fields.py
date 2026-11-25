@@ -90,7 +90,7 @@ class FakePacer:
     def acquire(self, cost=gh.GRAPHQL_CALL_COST, resource=None):
         self.acquired.append(cost)
 
-    def charge(self, cost):
+    def charge(self, cost, resource="graphql"):
         self.charged.append(cost)
 
     def cooldown(self, seconds):

@@ -69,16 +69,20 @@ class FakePacer:
     def __init__(self, error=None):
         self.error = error
         self.acquired = []
+        self.resources = []
         self.charged = []
+        self.charged_resources = []
         self.cooldowns = []
 
     def acquire(self, cost=gh.GRAPHQL_CALL_COST, resource=None):
         if self.error is not None:
             raise self.error
         self.acquired.append(cost)
+        self.resources.append(resource)
 
-    def charge(self, cost):
+    def charge(self, cost, resource="graphql"):
         self.charged.append(cost)
+        self.charged_resources.append(resource)
 
     def cooldown(self, seconds):
         self.cooldowns.append(seconds)
@@ -161,6 +165,24 @@ class CostTest(unittest.TestCase):
         # API-backed subcommands of the same entry points are still paced.
         self.assertEqual(ghshim.cost_for(["auth", "login"]), 1.0)
         self.assertEqual(ghshim.cost_for(["extension", "install"]), 5.0)
+
+
+class ResourceForTest(unittest.TestCase):
+    def test_graphql_argv_spends_graphql(self):
+        self.assertEqual(
+            ghshim.resource_for(["api", "graphql", "-f", "query={ viewer { login } }"]), "graphql"
+        )
+        self.assertEqual(ghshim.resource_for(["api", "graphql"]), "graphql")
+
+    def test_rest_and_other_argv_spends_core(self):
+        for argv in (
+            ["api", "repos/acme/lib"],
+            ["api", "repos/acme/lib", "-X", "PUT", "-f", "a=b"],
+            ["pr", "view", "12"],
+            ["issue", "list"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(ghshim.resource_for(argv), "core")
 
 
 class RedactionTest(unittest.TestCase):
@@ -457,6 +479,28 @@ class PacingCapTest(unittest.TestCase):
         self.assertTrue(capped)
         self.assertEqual(pacer.charged, [5.0])
         self.assertGreaterEqual(waited, 0.0)
+
+    def test_before_attributes_each_call_to_its_resource(self):
+        # Shimmed REST traffic must spend the core sub-balance, never
+        # GraphQL headroom (docs/19 section 5).
+        for argv, want in (
+            (["api", "repos/acme/lib"], "core"),
+            (["pr", "view", "12"], "core"),
+            (["api", "graphql", "-f", "query={ viewer { login } }"], "graphql"),
+        ):
+            with self.subTest(argv=argv):
+                pacer = FakePacer()
+                with mock.patch.object(gh, "_pacer", return_value=pacer):
+                    _, capped = ghshim.pace_before(3.0, ghshim.resource_for(argv))
+                self.assertFalse(capped)
+                self.assertEqual(pacer.resources, [want])
+
+    def test_cap_path_charges_the_same_resource(self):
+        pacer = FakePacer(error=gh.GhError("unavailable", "x"))
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            _, capped = ghshim.pace_before(5.0, "core")
+        self.assertTrue(capped)
+        self.assertEqual(pacer.charged_resources, ["core"])
 
     def test_capped_call_stays_capped_when_the_charge_cannot_be_written(self):
         # The state dir is a regular file, so acquire and charge both fail.

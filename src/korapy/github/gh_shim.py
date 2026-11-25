@@ -193,7 +193,7 @@ def main(argv=None):
     capped = False
     if cost is not None:
         try:
-            _, capped = ghshim.pace_before(cost)
+            _, capped = ghshim.pace_before(cost, ghshim.resource_for(args))
         except Exception:
             # Pacing is best-effort: a broken bucket must never break gh.
             capped = False
