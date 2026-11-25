@@ -109,6 +109,35 @@ class FreezeStartTest(unittest.TestCase):
             self.assertEqual(handle.read(), "operator break\n")
         self.assertFalse(read_json(self.paths["freeze_file"])["owned_pause"])
 
+    def test_start_adopts_an_operator_pause_written_after_the_check(self):
+        from unittest import mock
+
+        from korapy import freeze
+
+        real_write = freeze.write_freeze
+
+        def intervening(path, **kwargs):
+            result = real_write(path, **kwargs)
+            if not os.path.exists(self.paths["pause_file"]):
+                with open(self.paths["pause_file"], "w", encoding="utf-8") as handle:
+                    handle.write("operator break\n")
+            return result
+
+        with mock.patch.object(freeze, "write_freeze", intervening):
+            code, _, _, _ = self.run_start(start_args(), [0])
+        self.assertEqual(code, 0)
+        with open(self.paths["pause_file"], encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "operator break\n")
+        self.assertFalse(read_json(self.paths["freeze_file"])["owned_pause"])
+        out, err_io = io.StringIO(), io.StringIO()
+        code = freezecli.cmd_freeze(end_args(), out=out, err=err_io, **self.paths)
+        err = err_io.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("left in place", err)
+        with open(self.paths["pause_file"], encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "operator break\n")
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+
     def test_start_refuses_a_bad_until_ref(self):
         code, _, err, sleeps = self.run_start(start_args(until=["bogus"]), [0])
         self.assertEqual(code, 4)
