@@ -85,8 +85,11 @@ class SelectionTest(unittest.TestCase):
     def test_external_claimed_ticket_is_skipped(self):
         self.assertEqual(selected([row(7, agent="drive-x", external=True)]), [])
 
-    def test_blocked_claimed_ticket_is_skipped(self):
-        self.assertEqual(selected([row(7, agent="drive-x", extra={"blocked_by": "app#3"})]), [])
+    def test_blocked_claimed_ticket_is_requested_for_the_gate(self):
+        self.assertEqual(
+            selected([row(7, agent="drive-x", extra={"blocked_by": "app#3"})]),
+            [("app", 7)],
+        )
         self.assertEqual(selected([row(7, agent="drive-x", labels=("blocked",))]), [])
 
     def test_claimed_ticket_with_an_open_linked_pull_is_requested(self):
@@ -120,8 +123,14 @@ class SelectionTest(unittest.TestCase):
     def test_hold_prefix_word_in_title_is_selected(self):
         self.assertEqual(selected([row(7, title="HOLDING the release")]), [("app", 7)])
 
-    def test_blocked_by_extra_is_skipped(self):
-        self.assertEqual(selected([row(7, extra={"blocked_by": "app#3"})]), [])
+    def test_blocked_by_extra_is_selected_and_named_by_the_gate(self):
+        self.assertEqual(selected([row(7, extra={"blocked_by": "app#3"})]), [("app", 7)])
+
+    def test_needs_hardware_label_is_skipped(self):
+        self.assertEqual(selected([row(7, labels=("needs-hardware",))]), [])
+
+    def test_claimed_ticket_with_a_needs_hardware_label_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("needs-hardware",))]), [])
 
     def test_empty_blocked_by_extra_is_selected(self):
         self.assertEqual(selected([row(7, extra={"blocked_by": ""})]), [("app", 7)])
@@ -165,7 +174,7 @@ class SelectionTest(unittest.TestCase):
             row(6),
             row(8, agent="drive-host-1--app-8", labels=("hold",)),
         ]
-        self.assertEqual(selected(rows), [("app", 1), ("app", 3), ("app", 6)])
+        self.assertEqual(selected(rows), [("app", 1), ("app", 3), ("app", 5), ("app", 6)])
 
 
 class WeightsTest(unittest.TestCase):
@@ -285,12 +294,14 @@ class ConstantsTest(unittest.TestCase):
     def test_hold_labels_match_tracker_needs_decision(self):
         self.assertEqual(
             policies.HOLD_LABELS,
-            ("hold", tracker.NEEDS_DECISION, "needs-triage"),
+            ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, tracker.NEEDS_TRIAGE),
         )
 
     def test_hold_labels_reference_tracker_constant(self):
         source = inspect.getsource(policies)
         self.assertIn("tracker.NEEDS_DECISION", source)
+        self.assertIn("tracker.NEEDS_HARDWARE", source)
+        self.assertIn("tracker.NEEDS_TRIAGE", source)
 
     def test_constants_have_docstrings(self):
         check_constant_docstrings(

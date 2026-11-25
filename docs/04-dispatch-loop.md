@@ -152,23 +152,31 @@ Ready-made policy: most projects need no policy code. The
 `korapy.policies` module ships `basic(rows, *, now)`, which a
 registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
-unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
-standalone `HOLD` word in the title), unblocked (empty
-`blocked_by` and no `blocked` label), not already `researched`, and with no linked pull
-merged since the claim start (by merge
-time, falling back to the last-update time when the listing carries
-no merge time), claimed or not: in-flight rows stay requested
-so the loop never withdraws them by omission, while a ticket whose
-work landed during its claim stays withdrawn so no new round starts
-on landed work. An open linked pull never withdraws a row here: the
-gate already refuses the fresh start while the pull is open, routes a
-finished worker's claim to a reviewer takeover, and grades an
-approving record as merge-ready, so selecting keeps the row visible
-for those verdicts instead of hiding it. A pull merged before the
-claim start reads as
-landed-before-this-round, so a reopened ticket picked up again still
-selects. A research ticket is selected like
-any other, but asks for kind `research` (see section 5). Weight is the board priority rank,
+unheld (no `hold`, `needs-decision`, `needs-hardware`, or
+`needs-triage` label, and no standalone `HOLD` word in the title),
+carrying no `blocked` label, not already `researched`, and with no
+linked pull merged since the claim
+start (by merge time, falling back to the last-update time when the
+listing carries no merge time), claimed or not: in-flight rows stay
+requested so the loop never withdraws them by omission, while a
+ticket whose work landed during its claim stays withdrawn so no new
+round starts on landed work. An open linked pull never withdraws a
+row here: the gate already refuses the fresh start while the pull is
+open, routes a finished worker's claim to a reviewer takeover, and
+grades an approving record as merge-ready, so selecting keeps the row
+visible for those verdicts instead of hiding it. A pull merged before
+the claim start
+reads as landed-before-this-round, so a reopened ticket picked up
+again still selects. A research ticket is selected like
+any other, but asks for kind `research` (see section 5). A ticket
+naming dependencies is still requested: the gate refuses it with the
+blocker named (step 1 below), so `drive --plan` shows why instead of
+a silent withdrawal. Dependencies come from `Depends on` lines in
+the issue body (first-seen order, bare `#N` refs plus qualified
+`repo#N` and `owner/repo#N` refs as written), stored as the
+row's `blocked_by` refs at sync time alongside the board's `Blocked
+by` column in board mode; both modes read the already-fetched body,
+so the pass spends no new GitHub calls. Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
@@ -282,7 +290,13 @@ Per-candidate gate order, cheapest first:
    (the row's stored `external` field, computed at sync time by
    `board.is_external`; the loop never re-derives it), or withdrawn
    by this pass's eligibility: skip with reason `merged` for the
-   first two. No new round of any kind starts on a ticket whose work
+   first two. A ticket whose stored `blocked_by` refs name an open
+   ticket in the same tracker repo skips with code `blocked`, naming
+   the blocker (`blocked by #N`, shown by `drive --plan` and the
+   dashboard); a ref to another repository or an unresolvable ref
+   fails closed the same way. A closed dependency releases the
+   ticket. Dependency bodies ride the already-fetched listing, so
+   the block costs no new GitHub calls. No new round of any kind starts on a ticket whose work
    landed during its claim, claimed or not, while a running unit is
    never stopped by this verdict. A pull merged before the claim
    start reads as landed-before-this-round, so a reopened ticket
@@ -766,8 +780,10 @@ never takes the drive lock.
 - Never started: external items, non-open tickets, held tickets
   (including unreadable labels, fail closed), tickets or linked PRs
   carrying the hold label, tickets carrying `needs-decision`,
-  tickets whose eligibility the project withdrew this pass, and
-  tickets whose repository the project does not drive (section 2).
+  tickets blocked on an open dependency (fail closed on cross-repo
+  and unresolvable refs), tickets whose eligibility the project
+  withdrew this pass, and tickets whose repository the project does
+  not drive (section 2).
   The loop checks these on every pass, not only at first claim: a
   label added mid-flight stops the next resume.
 - No deletion: the loop stops units (via the injected stop seam, which
@@ -809,7 +825,7 @@ is tested through the seam its production code already injects:
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
-| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start | pure policy call over fixture rows |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, `blocked`-label, open-pull rows stay withdrawn, as do merged-pull rows unless the pull merged before the claim start; `blocked_by` rows are requested and refused by the gate with the blocker named | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |

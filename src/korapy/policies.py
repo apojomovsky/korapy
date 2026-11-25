@@ -25,8 +25,9 @@ from korapy import eligibility, tracker
 
 #: Labels that hold a ticket for a human. A row carrying any of them is
 #: never selected. Module constants on purpose: one place, and no
-#: configuration surface in version one.
-HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, "needs-triage")
+#: configuration surface in version one. `needs-hardware` marks a
+#: ticket for real hardware, never an agent.
+HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, tracker.NEEDS_HARDWARE, tracker.NEEDS_TRIAGE)
 """Labels that hold a ticket for a human; a row carrying any is never selected."""
 
 #: Standalone title word that holds a ticket for a human. The match is a
@@ -53,26 +54,29 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unheld, unblocked, with no in-scope merged linked pull: a
-    missing or non-string title reads as empty and a non-tuple labels
-    value reads as none, so odd data selects or skips without raising.
-    Unreadable pulls (None) are never selected: a ticket whose links
-    the pass could not read fails closed here, as in the gate. An
-    in-scope merged linked pull means the work landed since the
-    current claim start (or with no claim behind it), so the ticket
-    stays withdrawn; a pull merged before the claim start reads as
-    landed-before-this-round and still selects, as does a pull closed
-    without merging. An open linked pull never withdraws here: the
-    gate already owns that decision (it refuses a fresh start while
-    the pull is open, routes a finished worker's claim to a reviewer
-    takeover, and grades an approving record as merge-ready), so a
-    second filter here would only hide the row before the gate can
-    refuse or route it, and would let the stuck sweep release a
-    finished worker's claim as merely withdrawn. A research row skips
-    both pulls checks, as in the gate: it finishes as a Findings
-    comment and never waits on a pull request. A researched row is
-    never selected: its Findings comment already finished it, so
-    selecting it would research it twice.
+    Open, unheld, with no in-scope merged linked pull, claimed or
+    not: a missing or non-string title reads as empty and a non-tuple
+    labels value reads as none, so odd data selects or skips without
+    raising. Unreadable pulls (None) are never selected: a ticket
+    whose links the pass could not read fails closed here, as in the
+    gate. An in-scope merged linked pull means the work landed since
+    the current claim start (or with no claim behind it), so the
+    ticket stays withdrawn; a pull merged before the claim start
+    reads as landed-before-this-round and still selects, as does a
+    pull closed without merging. An open linked pull never withdraws
+    here: the gate already owns that decision (it refuses a fresh
+    start while the pull is open, routes a finished worker's claim to
+    a reviewer takeover, and grades an approving record as
+    merge-ready), so a second filter here would only hide the row
+    before the gate can refuse or route it, and would let the stuck
+    sweep release a finished worker's claim as merely withdrawn. A
+    research row skips both pulls checks, as in the gate: it finishes
+    as a Findings comment and never waits on a pull request. A
+    researched row is never selected: its Findings comment already
+    finished it, so selecting it would research it twice. Dependency
+    blocks do not withdraw here: a row carrying `blocked_by` refs is
+    still requested, and the gate refuses it with the blocker named,
+    so `--plan` shows why.
     """
     if row.state != "open":
         return False
@@ -85,9 +89,6 @@ def _selectable(row: eligibility.TicketRow) -> bool:
         return False
     title = row.title if isinstance(row.title, str) else ""
     if _HOLD_TITLE_RE.search(title):
-        return False
-    extra = row.extra if isinstance(row.extra, dict) else {}
-    if extra.get("blocked_by"):
         return False
     if "blocked" in labels:
         return False
