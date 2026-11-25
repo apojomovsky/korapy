@@ -34,12 +34,22 @@ from korapy import paths
 REVIEWS_DIRNAME = "reviews"
 
 
+def _pairs(short_to_tracker):
+    """`(short, tracker)` pairs for a map or an iterable of pairs. Pure."""
+    if hasattr(short_to_tracker, "items"):
+        return list(short_to_tracker.items())
+    return [(short, tracker) for short, tracker in (short_to_tracker or ())]
+
+
 def local_repo(repo, short_to_tracker):
     """The session-dir repo name for a store key or entry name. Pure.
 
     `short_to_tracker` is the `{short [[repo]] name: tracker repo}`
     map (the drive pass builds it once per pass through its one
-    resolver; single-root callers through the shared per-repo map).
+    resolver; single-root callers through the shared per-repo map),
+    or an iterable of `(short, tracker)` pairs when two projects name
+    the same short for different tracker repos: pairs keep both
+    trackers, which a map keyed by the short name cannot.
     Records live beside the ticket's session dir, which is named for
     the short entry name, while the store and the loop key tickets by
     the tracker repo: this is the one place that spelling is decided,
@@ -53,10 +63,11 @@ def local_repo(repo, short_to_tracker):
     raises ValueError naming the key: the caller reports it, never an
     empty result from a swallowed lookup.
     """
+    pairs = _pairs(short_to_tracker)
     key = str(repo or "")
-    if key in short_to_tracker:
+    if any(short == key for short, _tracker in pairs):
         return key
-    for short, tracker in short_to_tracker.items():
+    for short, tracker in pairs:
         if tracker == key:
             return short
     if paths.plain_repo_name(key):

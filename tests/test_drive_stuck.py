@@ -1393,7 +1393,7 @@ class StopPathAgreementTest(unittest.TestCase):
         mapping = self.pass_map()
         with mock.patch.object(
             drive,
-            "production_repo_map",
+            "production_repo_maps",
             side_effect=AssertionError("the stop path must take the pass map"),
         ):
             self.assertEqual(self.owner(self.TRACKER, mapping), "blue")
