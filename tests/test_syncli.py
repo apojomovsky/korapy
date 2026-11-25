@@ -153,7 +153,7 @@ class ExitCodeTest(SyncRootCase):
             def board_schema(self):
                 raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
 
-            def poll(self, schema, *, after=None, max_pages=5):
+            def poll(self, schema, *, after=None, max_pages=5, stored=None):
                 return [], None
 
         code = self.run_sync(RejectingBoardTracker())

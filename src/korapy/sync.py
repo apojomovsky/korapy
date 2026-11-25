@@ -517,6 +517,23 @@ def _record_board_drift(store, reader, schema, repo, found, *, pulls, pulls_erro
     )
 
 
+def _stored_rows(store: board.Store, repo: str):
+    """``{(repo, number): stored row}`` for the board poll's snapshot, or None.
+
+    One bulk store read per pass: the poll reuses a row's issue facts
+    when they already cover the board node's own issue time, so an
+    unchanged issue costs no per-item REST call. A store that cannot be
+    listed (one corrupt row breaks the listing) reads as no snapshot at
+    all: the poll falls back to live reads, and the per-item upserts
+    report the corruption exactly as they do today.
+    """
+    try:
+        rows = store.items(repo=repo)
+    except board.StoreError:
+        return None
+    return {(row.repo, row.number): row for row in rows}
+
+
 def sync_board_repo(
     store: board.Store,
     reader,
@@ -579,7 +596,9 @@ def sync_board_repo(
     page_after = store.get_cursor(repo, BOARD_PAGE_NAME)
     try:
         before = iface.parse_cursor(old) if old is not None else None
-        found, resume = reader.poll(schema, after=page_after, max_pages=max_pages)
+        found, resume = reader.poll(
+            schema, after=page_after, max_pages=max_pages, stored=_stored_rows(store, repo)
+        )
     except iface.TrackerRejected as err:
         return SyncResult(0, old, (), refused=(f"{repo}: {err}",))
     except iface.TrackerError as err:

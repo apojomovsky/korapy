@@ -75,7 +75,7 @@ class FakeBoardTracker(FakeTracker):
     def board_poll_pages(self):
         return 5
 
-    def poll(self, schema, *, after=None, max_pages):
+    def poll(self, schema, *, after=None, max_pages, stored=None):
         self.board_calls.append(("poll", after, max_pages))
         if self.poll_error is not None:
             raise self.poll_error
@@ -496,6 +496,7 @@ class RealTrackerEndToEndTest(WiringCase):
                             "content": {
                                 "__typename": "Issue",
                                 "number": 7,
+                                "updatedAt": "2026-10-28T12:00:00Z",
                                 "repository": {"nameWithOwner": DEMO},
                             },
                             "fieldValues": {"nodes": [text_value("F_agent", "Agent", "agent-1")]},

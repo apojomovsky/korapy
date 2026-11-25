@@ -176,7 +176,9 @@ def date_value_on_mapped_field():
     }
 
 
-def item_node(number, repo="example/demo", updated=T1, values=(), typename="Issue"):
+def item_node(
+    number, repo="example/demo", updated=T1, values=(), typename="Issue", issue_updated=None
+):
     if typename == "DraftIssue":
         content = {"__typename": "DraftIssue", "title": "An idea"}
     else:
@@ -185,6 +187,8 @@ def item_node(number, repo="example/demo", updated=T1, values=(), typename="Issu
             "number": number,
             "repository": {"nameWithOwner": repo},
         }
+        if issue_updated is not None:
+            content["updatedAt"] = issue_updated
     return {
         "id": f"PVTI_{typename}-{number}",
         "updatedAt": updated,

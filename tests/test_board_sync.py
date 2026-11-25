@@ -40,8 +40,10 @@ class FakeBoardReader:
         self.page_size = page_size
         self.calls = []
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
-        self.calls.append({"schema": found_schema, "after": after, "max_pages": max_pages})
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
+        self.calls.append(
+            {"schema": found_schema, "after": after, "max_pages": max_pages, "stored": stored}
+        )
         if self.error is not None:
             raise self.error
         start = int(after) if after is not None else 0

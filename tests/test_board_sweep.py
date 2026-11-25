@@ -93,7 +93,7 @@ class FakeBoardTracker:
             raise self.schema_error
         return schema()
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
         if self.poll_error is not None:
             raise self.poll_error
         if self._pages is not None:
@@ -164,9 +164,9 @@ class WatchingBoardTracker(FakeBoardTracker):
         self._lock = lock
         self._seen = seen
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
         self._seen["held"] = self._lock.held
-        return super().poll(found_schema, after=after, max_pages=max_pages)
+        return super().poll(found_schema, after=after, max_pages=max_pages, stored=stored)
 
 
 class NoAdoptTracker(FakeBoardTracker):
@@ -182,7 +182,7 @@ class NeverAppearingTracker(FakeBoardTracker):
     forever without the round cap.
     """
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
         return [], None
 
     def adopt_missing(self, project_id, repo, present, *, limit, now):
