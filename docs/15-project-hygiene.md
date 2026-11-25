@@ -231,10 +231,13 @@ registry entry for the ticket is done, no live unit holds it
 (the `units.live_tickets` set over every registered
 `unit_prefix`, the `diskcli.production_live` precedent), and
 the newest mtime under the leaf is older than
-`retention_days`. Leaf names that do not parse as ticket dirs
-(`paths.parse_ticket_dirname`) are `UNPROVEN` keep rows:
+`retention_days`. Ticket identity is `paths.leaf_ticket`, the
+canonical identity `disk.py` apply uses for the same question:
+a `<ticket>/<role>-<gen>` leaf keys on its parent ticket, and a
+legacy leaf is its own ticket root. Leaves that do not resolve
+to a ticket are `UNPROVEN` keep rows:
 "has no registry entry: cannot prove nothing is lost".
-Leaves whose parsed repo differs from the rule's `repo` are
+Leaves whose ticket's repo differs from the rule's `repo` are
 skipped with a note ("belongs to repo `<other>`, rule is
 for `<repo>"), never candidates under this rule. A
 `reviews/` subtree is never a candidate; when a leaf holds
