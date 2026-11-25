@@ -12,7 +12,10 @@ carries the board priority rank so the drive loop orders heaviest first.
 A claimed row the project still wants is requested too: a `start`
 request on an already-claimed row is a gate no-op, so requesting
 in-flight rows changes no start verdict and only keeps the restart path
-open for them.
+open for them. A row with an open linked pull is requested like any
+other: the gate refuses the fresh start, so the request never launches
+one, and requesting keeps the row visible for the reviewer takeover and
+the merge-ready verdicts instead of withdrawing it by omission.
 """
 
 import re
@@ -50,20 +53,26 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unheld, unblocked, with no open or in-scope merged linked
-    pull, claimed or not: a missing or non-string title reads as empty
-    and a non-tuple labels value reads as none, so odd data selects or
-    skips without raising. Unreadable pulls (None) are never selected:
-    a ticket whose links the pass could not read fails closed here, as
-    in the gate. An in-scope merged linked pull means the work landed
-    since the current claim start (or with no claim behind it), so the
-    ticket stays withdrawn; a pull merged before the claim start
-    reads as landed-before-this-round and still selects, as does a
-    pull closed without merging. A research row skips both pulls
-    checks, as in the gate: it finishes as a Findings comment and
-    never waits on a pull request. A researched row is never selected:
-    its Findings comment already finished it, so selecting it would
-    research it twice.
+    Open, unheld, unblocked, with no in-scope merged linked pull: a
+    missing or non-string title reads as empty and a non-tuple labels
+    value reads as none, so odd data selects or skips without raising.
+    Unreadable pulls (None) are never selected: a ticket whose links
+    the pass could not read fails closed here, as in the gate. An
+    in-scope merged linked pull means the work landed since the
+    current claim start (or with no claim behind it), so the ticket
+    stays withdrawn; a pull merged before the claim start reads as
+    landed-before-this-round and still selects, as does a pull closed
+    without merging. An open linked pull never withdraws here: the
+    gate already owns that decision (it refuses a fresh start while
+    the pull is open, routes a finished worker's claim to a reviewer
+    takeover, and grades an approving record as merge-ready), so a
+    second filter here would only hide the row before the gate can
+    refuse or route it, and would let the stuck sweep release a
+    finished worker's claim as merely withdrawn. A research row skips
+    both pulls checks, as in the gate: it finishes as a Findings
+    comment and never waits on a pull request. A researched row is
+    never selected: its Findings comment already finished it, so
+    selecting it would research it twice.
     """
     if row.state != "open":
         return False
@@ -88,8 +97,7 @@ def _selectable(row: eligibility.TicketRow) -> bool:
         return False
     if eligibility.merged_pull(row) is not None:
         return False
-    pulls = row.pulls if isinstance(row.pulls, (tuple, list)) else ()
-    return all(getattr(pull, "state", "") != "open" for pull in pulls)
+    return True
 
 
 def _kind(row: eligibility.TicketRow) -> str:
