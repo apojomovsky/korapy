@@ -13,6 +13,7 @@ from korapy import tracker as iface
 from korapy.github import forge as ghforge
 from korapy.github.gh import (
     body_linked_issue_refs,
+    depends_blocked_by,
     is_merged_pull,
     is_rate_limited,
     retry_after_s,
@@ -315,16 +316,20 @@ class GithubTracker:
             status=field_value_of(labels, "status"),
             # The REST feed carries no board concepts (an absent board
             # key keeps the stored extra when the store merges by key),
-            # but the milestone rides along from the same payload: one
-            # more field on the existing listing, no new call. A missing
-            # milestone clears the stored one, like the board reader,
-            # and the closed flag rides only with a title: an
-            # unmilestoned reading carries an explicit None so the
-            # merge drops a stale stored flag instead of keeping it.
+            # but the milestone and the body's `Depends on` refs ride
+            # along from the same payload: two more fields on the
+            # existing listing, no new call. A missing milestone clears
+            # the stored one, like the board reader, and the closed flag
+            # rides only with a title: an unmilestoned reading carries
+            # an explicit None so the merge drops a stale stored flag
+            # instead of keeping it. The body's refs are always
+            # carried, so removing the last `Depends on` line clears a
+            # stored block instead of keeping it.
             extra={
                 "milestone": milestone_title,
                 "milestone_due": milestone_due,
                 "milestone_closed": milestone_closed if milestone_title is not None else None,
+                "blocked_by": depends_blocked_by(repo, body),
             },
         )
 
