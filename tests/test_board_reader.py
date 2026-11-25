@@ -828,7 +828,15 @@ class PollItemsTest(unittest.TestCase):
     def test_unknown_field_ids_are_ignored(self):
         run = BoardFakeRun()
         found = self.poll_one(run, [text_value("F_other", "Other", "x")])
-        self.assertEqual({k: v for k, v in found.extra.items() if k not in _MILESTONE_KEYS}, {})
+        rest = {
+            key: value
+            for key, value in found.extra.items()
+            if key not in _MILESTONE_KEYS + ("blocked_by",)
+        }
+        self.assertEqual(rest, {})
+        # The body is always read, even with no mapped fields: the
+        # default body names no dependencies, so nothing is blocked.
+        self.assertEqual(found.extra["blocked_by"], [])
 
     def test_extra_dicts_are_not_shared(self):
         run = BoardFakeRun()
@@ -885,7 +893,11 @@ class UnmappedKindsTest(unittest.TestCase):
         )
         self.assertEqual(found.agent, "agent-1")
         self.assertEqual(found.extra["priority"], "urgent")
-        self.assertEqual({k for k in found.extra if k not in _MILESTONE_KEYS}, {"priority"})
+        # The body key rides along regardless of the field mapping.
+        self.assertEqual(
+            {k for k in found.extra if k not in _MILESTONE_KEYS + ("blocked_by",)},
+            {"priority"},
+        )
 
     def test_date_value_on_a_mapped_field_id_is_skipped(self):
         run = BoardFakeRun()
@@ -897,7 +909,11 @@ class UnmappedKindsTest(unittest.TestCase):
         found = self.poll_one(run, unmapped_values())
         self.assertEqual(found.agent, "")
         self.assertEqual(found.status, "")
-        self.assertEqual({k for k in found.extra if k not in _MILESTONE_KEYS}, set())
+        # The body key rides along regardless of the field mapping.
+        self.assertEqual(
+            {k for k in found.extra if k not in _MILESTONE_KEYS + ("blocked_by",)},
+            set(),
+        )
 
     def test_malformed_values_of_mapped_kinds_still_fail_closed(self):
         field = {"__typename": "ProjectV2SingleSelectField", "id": "F_prio", "name": "Priority"}
@@ -1022,6 +1038,54 @@ class BlockedByParseTest(unittest.TestCase):
         self.assertEqual(boardreader.parse_blocked_by("a/b#0"), "a/b#0")
         self.assertEqual(boardreader.parse_blocked_by("a/b#"), "a/b#")
         self.assertEqual(boardreader.parse_blocked_by("a#1"), "a#1")
+
+
+class PollDependsOnBodyTest(PollItemsTest):
+    def test_body_depends_on_lines_join_the_board_blocked_by(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [text_value("F_blocked", "Blocked by", "other/repo#22")],
+            body="Work.\nDepends on #3",
+        )
+        self.assertEqual(found.extra["blocked_by"], ["other/repo#22", "example/demo#3"])
+
+    def test_body_depends_on_lines_fill_an_empty_board_cell(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [text_value("F_blocked", "Blocked by", "  ")],
+            body="Work.\nDepends on #3",
+        )
+        self.assertEqual(found.extra["blocked_by"], ["example/demo#3"])
+
+    def test_qualified_body_refs_join_the_board_blocked_by(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [text_value("F_blocked", "Blocked by", "  ")],
+            body="Work.\nDepends on other/repo#5",
+        )
+        self.assertEqual(found.extra["blocked_by"], ["other/repo#5"])
+
+    def test_raw_board_blocked_by_stays_raw_when_the_body_names_deps(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [text_value("F_blocked", "Blocked by", "someday maybe")],
+            body="Work.\nDepends on #3",
+        )
+        self.assertEqual(found.extra["blocked_by"], "someday maybe")
+
+    def test_body_without_depends_on_lines_leaves_no_blocked_by(self):
+        run = BoardFakeRun()
+        found = self.poll_one(run, [], body="Just work. See #9.")
+        self.assertEqual(found.extra["blocked_by"], [])
+
+    def test_board_item_without_a_body_derives_no_blocked_by(self):
+        run = BoardFakeRun()
+        found = self.poll_one(run, [], body="")
+        self.assertEqual(found.extra["blocked_by"], [])
 
 
 if __name__ == "__main__":
