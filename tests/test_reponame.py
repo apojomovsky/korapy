@@ -496,6 +496,53 @@ class LiveBlockersTest(unittest.TestCase):
         self.assertEqual(len(found), 3)
 
 
+class SharedShortNameRenameTest(unittest.TestCase):
+    """Per-project maps: a shared short name joins under its own project."""
+
+    MAPS = {"blue": {SHORT: OLD}, "green": {SHORT: "other/old"}}
+
+    def test_owners_use_each_projects_own_map(self):
+        from korapy import reponame
+
+        self.assertEqual(
+            reponame.project_owners(
+                {"blue": [SHORT], "green": [SHORT]}, self.MAPS, {"other/old", "other/new"}
+            ),
+            {"green"},
+        )
+
+    def test_a_live_entry_for_the_second_project_blocks_its_rename(self):
+        from korapy import reponame
+
+        found = reponame.live_blockers(
+            "other/old",
+            "other/new",
+            claims=[],
+            entries=[(entry("agent-1", project="green"), registry.LIVE)],
+            live_units=frozenset(),
+            mapping=self.MAPS,
+            owners={"green"},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("other/old#1", found[0])
+
+    def test_a_live_entry_for_the_first_project_does_not_block_the_second(self):
+        from korapy import reponame
+
+        self.assertEqual(
+            reponame.live_blockers(
+                "other/old",
+                "other/new",
+                claims=[],
+                entries=[(entry("agent-1", project="blue"), registry.LIVE)],
+                live_units=frozenset(),
+                mapping=self.MAPS,
+                owners={"green"},
+            ),
+            [],
+        )
+
+
 class CanonicalMatchesTest(unittest.TestCase):
     def test_same_name_matches(self):
         from korapy import reponame

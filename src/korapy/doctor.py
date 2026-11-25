@@ -1,8 +1,9 @@
 """Read-only health report: `korapy doctor`.
 
 One report over the checks that already exist, plus the host checks that do
-not. It changes nothing and installs nothing; a failing check prints the
-command a human would run, in the style of `korapy deps`.
+not. It installs nothing and changes no fleet state; its one write is
+recording the run itself (`doctorrecord`) for the dashboard. A failing
+check prints the command a human would run, in the style of `korapy deps`.
 
 Every external call comes through `Env`: `run` reads `loginctl` and the
 slice dumps, `list_fn` lists the systemd user units, and the rest arrives
@@ -1175,6 +1176,11 @@ def render(checks: Sequence[Check], json_mode: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+#: The last-run record lives in `doctorrecord`, the light module
+#: the snapshot layer reads through; this module only writes it (in
+#: `cmd_doctor`, converting `Check` rows to plain dicts once there).
+
+
 # ------------------------------------------------------------ production
 
 
@@ -2321,7 +2327,15 @@ def production_env() -> Env:
 
 
 def cmd_doctor(args: argparse.Namespace, make_env: Callable[[], Env]) -> int:
+    from korapy import doctorrecord
+
     checks = run_checks(make_env())
+    try:
+        doctorrecord.record_last_result(
+            [{"name": c.name, "status": c.status, "detail": c.detail, "fix": c.fix} for c in checks]
+        )
+    except OSError as err:
+        print(f"korapy doctor: cannot record the run for the dashboard: {err}", file=sys.stderr)
     sys.stdout.write(render(checks, json_mode=args.json))
     return exit_code(checks)
 
@@ -2329,7 +2343,8 @@ def cmd_doctor(args: argparse.Namespace, make_env: Callable[[], Env]) -> int:
 def add_parser(sub, make_env: Callable[[], Env]) -> None:
     """Register `korapy doctor` on the top-level subparsers."""
     parser = sub.add_parser(
-        "doctor", help="read-only health report for the core's own prerequisites"
+        "doctor",
+        help="health report for the core's own prerequisites (records the run for the dashboard)",
     )
     parser.add_argument("--json", action="store_true", help="one JSON document on stdout")
     parser.set_defaults(func=functools.partial(cmd_doctor, make_env=make_env))

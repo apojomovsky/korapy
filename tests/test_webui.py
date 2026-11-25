@@ -334,13 +334,15 @@ class SourceDiscipline(unittest.TestCase):
         # framework, no build step, no images. Ticket 651 adds the
         # data panels (derived states, plan band, honest quota,
         # sort menu, placeholders) and the caps with it:
-        # 82 KB a file, 170 KB total.
+        # 82 KB a file, 170 KB total. Ticket 669 adds the doctor row
+        # and the peek pane and the caps with it:
+        # 84 KB a file, 172 KB total.
         total = 0
         for name in WEB_FILES:
             size = len(web_bytes(name))
-            self.assertLessEqual(size, 82 * 1024, name)
+            self.assertLessEqual(size, 84 * 1024, name)
             total += size
-        self.assertLessEqual(total, 170 * 1024)
+        self.assertLessEqual(total, 172 * 1024)
 
     def test_poll_backoff_table_is_pinned(self):
         text = web_bytes("api.js").decode("utf-8")
@@ -351,7 +353,7 @@ class SourceDiscipline(unittest.TestCase):
 
     def test_every_poll_await_sits_inside_a_try(self):
         text = web_bytes("app.js").decode("utf-8")
-        for name in ("loadSnapshot", "loadConfig", "loadVersion", "loadTail"):
+        for name in ("loadSnapshot", "loadConfig", "loadVersion", "loadPeek"):
             sites = list(re.finditer(r"await\s+" + name + r"\s*\(", text))
             self.assertTrue(sites, name)
             for site in sites:
@@ -363,7 +365,7 @@ class SourceDiscipline(unittest.TestCase):
     def test_schedule_uses_the_shared_next_delay(self):
         app = web_bytes("app.js").decode("utf-8")
         self.assertIn("nextDelay(failures)", app)
-        # Word boundaries: the tail cadence TAIL_POLL_MS is an api.js
+        # Word boundaries: the peek cadence PEEK_POLL_MS is an api.js
         # import, not a number restated in app.js.
         self.assertIsNone(re.search(r"\bPOLL_MS\b", app))
         self.assertIsNone(re.search(r"\bBACKOFF_MS\b", app))

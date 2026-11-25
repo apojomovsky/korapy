@@ -201,6 +201,62 @@ class UpsertTest(TempStoreTest):
         item, _ = store.item("app", 7, now=1000.0)
         self.assertEqual(item.extra, extra)
 
+    def test_losing_a_milestone_clears_its_due_and_closed_flag(self):
+        # The due date and the closed flag are facts of the milestone,
+        # not of the ticket: a reading that clears the title alone must
+        # not leave them behind in the merged store row.
+        store = self.open()
+        store.upsert_item(
+            reading(
+                extra={
+                    "milestone": "M1",
+                    "milestone_due": "2026-11-30T00:00:00Z",
+                    "milestone_closed": True,
+                    "pool": "dispatch",
+                }
+            ),
+            operators=["alice"],
+            now=1000.0,
+        )
+        store.upsert_item(
+            reading(extra={"milestone": None}, tracker_updated_at=2000.0),
+            operators=["alice"],
+            now=2000.0,
+        )
+        item, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(item.extra, {"pool": "dispatch"})
+
+    def test_a_cleared_milestone_title_wins_over_a_carried_closed_flag(self):
+        # A contradictory reading (no milestone, but a closed flag
+        # beside it) still loses the milestone: the cleared title is
+        # the authority, so no stale flag survives the merge.
+        merged = board.merge_extra(
+            {"milestone": "M1", "milestone_due": "2026-11-30T00:00:00Z", "milestone_closed": True},
+            {"milestone": None, "milestone_due": "2026-12-31T00:00:00Z", "milestone_closed": True},
+        )
+        self.assertNotIn("milestone", merged)
+        self.assertNotIn("milestone_due", merged)
+        self.assertNotIn("milestone_closed", merged)
+
+    def test_losing_a_milestone_clears_it_in_every_cleared_encoding(self):
+        stored = {
+            "milestone": "M1",
+            "milestone_due": "2026-11-30T00:00:00Z",
+            "milestone_closed": True,
+        }
+        for clearing in ({"milestone": None}, {"milestone": []}, {"milestone": "  "}):
+            with self.subTest(clearing=clearing):
+                self.assertEqual(board.merge_extra(stored, clearing), {})
+
+    def test_changing_a_milestone_drops_the_old_due_and_closed_flag(self):
+        # A new title with no due date or flag of its own must not
+        # inherit the old milestone's facts.
+        merged = board.merge_extra(
+            {"milestone": "M1", "milestone_due": "2026-11-30T00:00:00Z", "milestone_closed": True},
+            {"milestone": "M2"},
+        )
+        self.assertEqual(merged, {"milestone": "M2"})
+
     def test_items_filters(self):
         store = self.open()
         store.upsert_item(
