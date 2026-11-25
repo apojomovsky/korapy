@@ -40,7 +40,7 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
         directory = os.path.dirname(freeze_file)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        created = os.open(freeze_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        created = os.open(freeze_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         os.close(created)
     except FileExistsError:
         print("korapy freeze: a freeze is already active", file=err)
@@ -60,7 +60,7 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
         )
         if owned:
             try:
-                created_pause = os.open(pause_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                created_pause = os.open(pause_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             except FileExistsError:
                 owned = False
                 freeze.write_freeze(
@@ -71,8 +71,15 @@ def cmd_start(args, *, live_total, sleep, now, out, err, freeze_file, pause_file
                     owned_pause=False,
                 )
             else:
-                with os.fdopen(created_pause, "w", encoding="utf-8") as handle:
-                    handle.write(freeze.pause_text(reason) + "\n")
+                try:
+                    with os.fdopen(created_pause, "w", encoding="utf-8") as handle:
+                        handle.write(freeze.pause_text(reason) + "\n")
+                except OSError:
+                    try:
+                        os.remove(pause_file)
+                    except OSError:
+                        pass
+                    raise
     except OSError as problem:
         _rollback(freeze_file, pause_file, freeze.pause_text(reason), owned, err)
         print(f"korapy freeze: cannot write the freeze state: {problem}", file=err)
@@ -114,7 +121,7 @@ def _rollback(freeze_file, pause_file, pause_text, owned, err):
     except OSError as problem:
         print(f"korapy freeze: cannot roll back {pause_file}: {problem}", file=err)
         return
-    if current in (pause_text + "\n", pause_text):
+    if current in (pause_text + "\n", pause_text) or (pause_text + "\n").startswith(current):
         try:
             os.remove(pause_file)
         except FileNotFoundError:
