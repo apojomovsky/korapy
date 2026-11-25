@@ -18,7 +18,7 @@ from typing import NamedTuple
 
 from korapy import tracker as iface
 from korapy.github import gh
-from korapy.github.tracker import GithubTracker
+from korapy.github.tracker import GithubTracker, field_value_of
 
 #: One page of board items; the maximum the endpoint serves.
 PAGE_SIZE = 100
@@ -66,8 +66,8 @@ _ITEMS = """query BoardItems($project: ID!, $after: String) {
           updatedAt
           content {
             __typename
-            ... on Issue { number repository { nameWithOwner } }
-            ... on PullRequest { number repository { nameWithOwner } }
+            ... on Issue { number updatedAt repository { nameWithOwner } }
+            ... on PullRequest { number updatedAt repository { nameWithOwner } }
           }
           fieldValues(first: 50) {
             nodes {
@@ -124,6 +124,11 @@ _READ_TYPENAMES = frozenset(
         "ProjectV2ItemFieldSingleSelectValue",
     }
 )
+
+#: The stored milestone keys one snapshot row must carry for the poll
+#: to reuse it. A row that predates one of them is re-read live once,
+#: which heals it, instead of silently dropping a concept it never named.
+_MILESTONE_KEYS = ("milestone", "milestone_due", "milestone_closed")
 
 
 def _want_kind(concept) -> str:
@@ -398,7 +403,9 @@ class BoardReader:
                 options[oid] = oname
         return FieldDef(id=node["id"], kind=kind, options=options)
 
-    def poll(self, schema: BoardSchema, *, after=None, max_pages) -> tuple[list, str | None]:
+    def poll(
+        self, schema: BoardSchema, *, after=None, max_pages, stored=None
+    ) -> tuple[list, str | None]:
         """Board items oldest first, plus the paging resume cursor.
 
         Pages with ``after`` until a short page or an empty ``pageInfo``
@@ -407,6 +414,13 @@ class BoardReader:
         result. A call stopped by ``max_pages`` returns what it fetched
         with the cursor to resume from; a call that reaches the end
         returns ``None`` so the next pass starts over from the head.
+
+        ``stored`` maps ``(repo, number)`` to the stored row's issue
+        facts: an item whose stored issue time already covers the node's
+        own issue time reuses those facts instead of a per-item REST
+        read (see ``_read_node``), so a pass over unchanged issues costs
+        no per-item call. ``None`` reads everything live, the way the
+        sweep plan does.
         """
         if max_pages < 1:
             raise ValueError(f"max_pages must be at least 1, got {max_pages!r}")
@@ -416,7 +430,7 @@ class BoardReader:
         for _ in range(max_pages):
             nodes, info = self._page(schema.project_id, fetch_after)
             for node in nodes:
-                found = self._read_node(by_field, node)
+                found = self._read_node(by_field, node, stored=stored)
                 if found is not None:
                     items.append(found)
             end, more = self._resume(info, len(nodes))
@@ -501,11 +515,14 @@ class BoardReader:
                 selects[concept] = value
         return texts, selects
 
-    def _read_node(self, by_field, node):
+    def _read_node(self, by_field, node, *, stored=None):
         """One board node as a ``TrackerItem``, ``None`` for a draft.
 
         Anything short of the full shape is a ``TrackerError``; a draft
         item (no issue behind it) is skipped, since it can never be a row.
+        An item whose issue the ``stored`` snapshot already covers at the
+        node's own issue time reuses those facts (see ``_cached_issue``)
+        instead of a per-item REST read; anything else reads live.
         """
         if not isinstance(node, dict):
             raise _fail(f"board item is not an object: {node!r}")
@@ -525,7 +542,11 @@ class BoardReader:
         if not isinstance(repo, str) or "/" not in repo:
             raise _fail(f"bad board content repo {repo!r}")
         texts, selects = self._node_values(by_field, node)
-        item, milestone = self._issues.read_issue(repo, number)
+        cached = self._cached_issue(stored, repo, number, content)
+        if cached is None:
+            item, milestone = self._issues.read_issue(repo, number)
+        else:
+            item, milestone = cached
         extra = self._concepts(selects, texts, milestone, body=item.body, repo=repo)
         return item._replace(
             updated_at=max(board_time, item.updated_at),
@@ -533,6 +554,81 @@ class BoardReader:
             status=texts.get("status", ""),
             extra=extra,
         )
+
+    def _content_time(self, content):
+        """One board node's own issue time as epoch seconds, else ``TrackerError``.
+
+        The node's ``updatedAt`` names the board item; the content's
+        names the issue behind it, which alone tells whether the stored
+        facts are still current. A missing or malformed time fails
+        closed like any other short-of-shape node.
+        """
+        try:
+            return iface.parse_cursor(content.get("updatedAt"))
+        except iface.TrackerError:
+            raise _fail(f"bad board content updatedAt {content.get('updatedAt')!r}") from None
+
+    def _cached_issue(self, stored, repo, number, content):
+        """``(TrackerItem, milestone)`` from the stored snapshot, or None.
+
+        The poll's cheap path: when the snapshot already holds this
+        issue at least as fresh as the node's own issue time, the stored
+        facts are current, so the reading reuses them and the poll
+        spends no per-item REST call. Anything the snapshot cannot prove
+        current reads live instead: a missing row (first sync), a stale
+        row (the issue changed, or changed between the feed and this
+        poll), a pull-request node (the store never keeps pull-request
+        rows, so the snapshot cannot cover one), a node whose issue time
+        is unreadable, or a row whose milestone triple is partial. A
+        corrupt snapshot row never reaches here: the sync step falls
+        back to live reads before the poll runs.
+        """
+        if not stored:
+            return None
+        row = stored.get((repo, number))
+        if row is None or getattr(row, "kind", "issue") != "issue":
+            return None
+        if row.tracker_updated_at < self._content_time(content):
+            return None
+        extra = row.extra if isinstance(row.extra, dict) else {}
+        # A stored row either names the whole milestone triple or none
+        # of it. Both writers always emit all three keys, and the merge
+        # drops the cleared encoding, so an absent triple is the steady
+        # state of an unmilestoned issue, exactly what a live read would
+        # carry: reusing it keeps the quiet-board bound, and a live read
+        # would store the same absence back. A milestoned issue always
+        # leaves at least its title behind (every writer since the
+        # single-key era names it, and a valued key survives the merge),
+        # so only a partial triple can hide a milestone, and it predates
+        # the contract: it is re-read live once, which heals it, instead
+        # of dropping a concept it half names.
+        have = [key in extra for key in _MILESTONE_KEYS]
+        if any(have) and not all(have):
+            return None
+        labels = tuple(row.labels or [])
+        item = iface.TrackerItem(
+            repo=row.repo,
+            number=row.number,
+            kind="issue",
+            title=row.title or "",
+            body=row.body or "",
+            state=row.state or "",
+            author=row.author or "",
+            labels=labels,
+            priority=row.priority or "",
+            assignees=tuple(row.assignees or []),
+            url=row.url or "",
+            updated_at=row.tracker_updated_at,
+            # Issues carry neither fork nor merge facts on the endpoint
+            # the live read uses (pull requests do, and the store holds
+            # no pull-request rows), so the stored copy is complete.
+            merged_at=0.0,
+            from_fork=False,
+            agent=field_value_of(labels, "agent"),
+            status=field_value_of(labels, "status"),
+            extra=None,
+        )
+        return item, tuple(extra.get(key) for key in _MILESTONE_KEYS)
 
     def _read_value(self, by_field, entry):
         """One field-value node as ``(concept, kind, value)``.

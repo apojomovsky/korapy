@@ -27,7 +27,7 @@ from tests.test_board_reader import (
     select_field,
     select_value,
 )
-from tests.test_tracker import pr_payload, reading
+from tests.test_tracker import ISO0, pr_payload, reading
 
 
 class DeriveTest(unittest.TestCase):
@@ -238,7 +238,7 @@ class BoardStepReader(FakeStatusReader):
     def changes(self, repo, cursor):
         return [], None
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
         return list(self._items), None
 
     def adopt_missing(self, project_id, repo, present, *, limit, now):
@@ -768,7 +768,12 @@ def status_schema_payload():
 
 
 def status_poll_node(status_id="opt-a", status_name="Available"):
-    return item_node(7, repo=REPO, values=[select_value("F_wf", "Status", status_id, status_name)])
+    return item_node(
+        7,
+        repo=REPO,
+        values=[select_value("F_wf", "Status", status_id, status_name)],
+        issue_updated=ISO0,
+    )
 
 
 class RealTrackerStatusTest(unittest.TestCase):
@@ -920,7 +925,7 @@ class RecordingReader(BoardStepReader):
         self._added_done = set()
         self._resume = resume
 
-    def poll(self, found_schema, *, after=None, max_pages=5):
+    def poll(self, found_schema, *, after=None, max_pages=5, stored=None):
         return list(self._items), self._resume
 
     def adopt_missing(self, project_id, repo, present, *, limit, now):

@@ -221,6 +221,48 @@ Why not audit only: the audit is bounded per pass by design and would let
 a hot board field lag for passes. The poll is the timely path; the audit
 is the backstop.
 
+Per-item REST gating: the poll spends no per-item REST call for an item
+whose issue has not changed since the last pass. The board query carries
+each issue's own `updatedAt` beside the board item's (same pages, no new
+call, on the separate GraphQL budget), and the sync step hands the poll a
+snapshot of the stored rows. A node whose stored issue time already covers
+the node's issue time reuses the stored title, body, labels, assignees and
+milestone triple, overlaid with the live board concepts, and advances the
+row to the max of the board and issue times, so a board-only edit still
+moves the row forward. Only what the snapshot cannot prove current reads
+live, exactly once each: a missing row (first sync), a stale row (the issue
+changed, or changed in the race between the feed and this poll), a
+pull-request node (the store keeps no pull-request rows, so the snapshot
+never covers one), a node whose issue time is unreadable, and a row whose
+milestone triple is partial. An absent triple reuses as unmilestoned on
+purpose: both writers always emit all three keys and the merge drops the
+cleared encoding, so absence is the steady state of an unmilestoned issue,
+and a milestoned issue always leaves at least its title behind. A store
+that cannot be listed reads as no snapshot at all: the poll falls back to
+live reads, and the per-item upserts report the corruption exactly as they
+do today. The skip keys on whole seconds, the provider's timestamp
+precision: an edit landing in the same second as the stored time reuses
+the stored facts until the feed, which lists inclusively, heals the row on
+the next pass.
+
+A quiet pass over a few-hundred-item board therefore costs the paged bulk
+listings only: the feed's one since-cursor page, the adopt listing's pages,
+and the pulls listing when Status is mapped (unmapped projects list
+nothing), with zero per-item reads. A 400-item issue board with no changes
+costs 6 REST calls (one feed since-page plus five adopt pages) where it
+used to cost one per item plus the same bulk pages. Boards holding
+pull requests are out of scope for that bound: each pull-request card
+still costs its issue read plus its fork lookup every pass. A first
+sync stocks the store through the feed's own bulk listing, so the board
+poll reuses those rows instead of reading everything a second time.
+
+Rejected alternatives: plumbing the feed's changed items into the poll
+would still need the stored facts for everything unchanged, while coupling
+the feed step to the board step; carrying every issue field in the GraphQL
+board query would duplicate the REST parse, giving two readers for one
+fact. The chosen rule keeps one parser (REST) and one freshness signal
+(the node's own issue time) for the skip.
+
 ## 4. Writes: the same outbox, the same race rules
 
 Decision: board writes go through the existing mirror and outbox with no
@@ -380,6 +422,10 @@ fails if either real one is touched:
 | Board poll pages with `after`, stops on short page; malformed page is `TrackerError`, never partial | fake `run` pages |
 | Board-only edit (issue `updated_at` unchanged) detected by poll and audit | fake `run`, temp store with aged row |
 | Board `updated_at` is the max of issue and board times; board cursor moves on its own reader only and is never compared with the feed cursor | fake `run` with split stamps, temp store cursors |
+| An unchanged issue costs no per-item REST call: a quiet 400-item issue-board pass costs 6 bulk calls, and one raced change is re-read exactly once | fake `run` call counts plus temp store, first stocked through the bulk listings |
+| First sync reuses the feed-stocked rows instead of reading every item again; a board-only edit skips REST and still moves the row forward | fake `run` with no per-item routes, temp store |
+| A same-second edit serves the stale stored facts with no per-item call, and the inclusive feed heals the row in the same pass | fake `run` call counts plus temp store |
+| A node with an unreadable issue time, a stale or partial-triple snapshot row, a pull-request node, and a corrupt store all read live, and the corruption is still reported; an absent triple reuses as unmilestoned | fake `run` payloads plus temp store with a corrupt row |
 | Cursor pair advances independently; failed board step keeps old cursor | fake `run` raising once |
 | `enqueue` refuses people-owned concepts; adapter has no write path for them | temp store |
 | Korapy-owned write round-trips through one text field per concept; repeat write leaves one label-free mutation | fake `run` recording mutations |
