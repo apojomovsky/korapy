@@ -105,8 +105,13 @@ row whose tracker repo is not one of the project's own `[[repo]]`
 entries (tracker spelling, through the one `driven_repos` resolver
 the rest of the pass reads), and drops any request naming such a
 repo. Two projects sharing a short entry name keep their own tracker
-repos: the scoping reads each root's own entries, never the
-first-winner pass map. A launch-path check refuses the pass with exit
+repos: the scoping reads each root's own entries, and every
+registry, unit and review-record join in the pass resolves a short
+name under its own project through the per-project pass maps
+(`production_repo_maps`), never a first-winner flat map. A ticket
+with no project to join on takes a shared short name's tracker only
+when every project naming it agrees, and otherwise keeps the short
+name so it matches no store row. A launch-path check refuses the pass with exit
 4 naming the repository if a foreign row ever reaches a claim, in
 case a future caller bypasses the filter. The review-record lookup
 reads only rows in a driven repository too, so a foreign row prints

@@ -304,6 +304,20 @@ def read_tail(repo: str, number: int, last: int) -> str:
     return out.getvalue()
 
 
+def read_peek(repo: str, number: int, last: int, role: str | None = None) -> dict:
+    """The ticket's peek document, through the one peek reader.
+
+    The production peek reader: `peek.peek_for_ticket` over the
+    session files, bounded on bytes and lines, with no quota-ledger
+    touch (the peek never calls `launch.tail`). A missing or
+    unreadable session reads `not-available` inside the document,
+    never an exception, so the handler answers it as a 200.
+    """
+    from korapy import peek
+
+    return peek.peek_for_ticket(repo, number, role, last=last)
+
+
 def read_project_events(project: str) -> list:
     """All event queue rows for one project, oldest first.
 
@@ -552,6 +566,7 @@ class _State:
         projects_fn: Callable[[], list] | None = None,
         tail_fn: Callable[[str, int, int], str] | None = None,
         tail_max: int = TAIL_MAX_DEFAULT,
+        peek_fn: Callable[[str, int, int, "str | None"], dict] | None = None,
         events_fn: Callable[[str], list] | None = None,
         journal_fn: Callable[[str], list] | None = None,
         max_streams: int = MAX_STREAMS_DEFAULT,
@@ -574,6 +589,7 @@ class _State:
         self.projects_fn = projects_fn
         self.tail_fn = tail_fn
         self.tail_max = tail_max
+        self.peek_fn = peek_fn
         self.events_fn = events_fn
         self.journal_fn = journal_fn
         self.max_streams = max_streams
@@ -947,6 +963,86 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "tail unavailable"})
         else:
             self._send_text(200, text)
+
+    def _serve_peek(self) -> None:
+        """The peek pane's document: bounded lines with local stamps.
+
+        Validation mirrors the tail route (the caller must know its
+        request is not what it asked), while a missing session is a
+        200 `not-available` document, never a 404: the pane states
+        the miss in its own words instead of an error body.
+        """
+        from korapy import peek as peek_module
+
+        query = self._query()
+        repo = query.get("repo") or None
+        raw_number = query.get("number")
+        if repo is None or raw_number is None:
+            self._send_json(400, {"error": "peek needs ?repo= and ?number="})
+            return
+        try:
+            number = int(raw_number)
+        except ValueError:
+            self._send_json(400, {"error": f"number {raw_number!r} is not an integer"})
+            return
+        limit = peek_module.MAX_LINES
+        raw_last = query.get("last")
+        if raw_last is not None:
+            try:
+                limit = int(raw_last)
+            except ValueError:
+                self._send_json(400, {"error": f"last {raw_last!r} is not an integer"})
+                return
+            if limit < 1:
+                self._send_json(400, {"error": f"last {raw_last!r} must be 1 or more"})
+                return
+        limit = min(limit, peek_module.MAX_LINES)
+        role = query.get("role") or None
+        reader = self.server_state.peek_fn or read_peek
+        try:
+            doc = reader(repo, number, limit, role)
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"korapy serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "peek unavailable"})
+            return
+        if not isinstance(doc, dict) or not isinstance(doc.get("lines", []), list):
+            print("korapy serve: peek reader returned a non-dict document", file=sys.stderr)
+            self._send_json(500, {"error": "peek unavailable"})
+            return
+        # The bound holds at the seam, whichever reader answered:
+        # newest `limit` lines, each stamp and text capped.
+        raw_lines = doc.get("lines") or []
+        kept = raw_lines[-limit:] if limit else []
+        lines = []
+        for row in kept:
+            if isinstance(row, dict):
+                at = row.get("at")
+                text = row.get("text")
+                lines.append(
+                    {
+                        "at": (at if isinstance(at, str) and at else "unknown")[
+                            : peek_module.STAMP_WIDTH
+                        ],
+                        "text": (text if isinstance(text, str) and text else "unknown")[
+                            : peek_module.LINE_WIDTH
+                        ],
+                    }
+                )
+            else:
+                lines.append({"at": "unknown", "text": "unknown"})
+        state = (
+            doc.get("state") if doc.get("state") in ("ready", "not-available") else "not-available"
+        )
+        self._send_json(
+            200,
+            {
+                "peek": {
+                    "state": state,
+                    "lines": lines,
+                    "truncated": bool(doc.get("truncated")) or len(raw_lines) > len(lines),
+                }
+            },
+        )
 
     def _serve_events(self) -> None:
         query = self._query()
@@ -1334,6 +1430,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_projects()
         elif path == "/v1/tail":
             self._serve_tail()
+        elif path == "/v1/peek":
+            self._serve_peek()
         elif path == "/v1/events":
             self._serve_events()
         elif path == "/v1/journal":
@@ -1404,6 +1502,7 @@ def make_server(
     projects_fn: Callable[[], list] | None = None,
     tail_fn: Callable[[str, int, int], str] | None = None,
     tail_max: int = TAIL_MAX_DEFAULT,
+    peek_fn: Callable[[str, int, int, "str | None"], dict] | None = None,
     events_fn: Callable[[str], list] | None = None,
     journal_fn: Callable[[str], list] | None = None,
     max_streams: int = MAX_STREAMS_DEFAULT,
@@ -1424,7 +1523,9 @@ def make_server(
     by default); `projects_fn` lists the registered projects
     (`projects.load_all` by default); `tail_fn` renders tail output
     (`read_tail` by default),
-    capped at `tail_max` lines; `events_fn` reads one project's event
+    capped at `tail_max` lines; `peek_fn` reads one ticket's peek
+    document (`read_peek` by default), bounded by the peek reader;
+    `events_fn` reads one project's event
     rows (`read_project_events` by default); `journal_fn` reads one
     project's logbook (`read_project_journal` by default). Past
     `max_streams` concurrent streams the next is shed with a 503; the
@@ -1457,6 +1558,7 @@ def make_server(
         projects_fn=projects_fn,
         tail_fn=tail_fn,
         tail_max=tail_max,
+        peek_fn=peek_fn,
         events_fn=events_fn,
         journal_fn=journal_fn,
         max_streams=max_streams,
@@ -1494,8 +1596,9 @@ def fixture_build(path: str) -> Callable[[], dict]:
 
     Fixture mode: the snapshot-derived routes answer the file instead
     of the live host, so the page can be developed, tested and
-    screenshotted without a running fleet. Board, tail, events and
-    journal still read the live host. A missing, corrupt or non-object
+    screenshotted without a running fleet. The peek route answers the
+    file's `peek` entry through `fixture_peek` as well; board, tail,
+    events and journal still read the live host. A missing, corrupt or non-object
     file raises `ServeError`, so a bad fixture fails closed at startup
     (exit 4) instead of serving half a page.
     """
@@ -1509,6 +1612,50 @@ def fixture_build(path: str) -> Callable[[], dict]:
     if not isinstance(doc, dict):
         raise ServeError(f"snapshot fixture {path} is not a JSON object")
     return lambda: doc
+
+
+def fixture_peek(path: str) -> Callable[[str, int, int, "str | None"], dict]:
+    """A peek reader answering a fixture file's `peek` entry.
+
+    Keys are `"<repo>#<number>"`; an unlisted ticket reads
+    `not-available`, like a live ticket with no session, so the page
+    shows the same miss offline. A fixture without a `peek` object
+    answers every ticket that way. The file loads once here (the
+    same fail-closed read as `fixture_build`), never per request.
+    """
+    from korapy import peek as peek_module
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except OSError as exc:
+        raise ServeError(f"cannot read snapshot fixture {path}: {exc}") from exc
+    except ValueError as exc:
+        raise ServeError(f"snapshot fixture {path} is not JSON: {exc}") from exc
+    table = doc.get("peek") if isinstance(doc, dict) else None
+    if not isinstance(table, dict):
+        table = {}
+
+    def reader(repo: str, number: int, last: int, role: str | None = None) -> dict:
+        found = table.get(f"{repo}#{number}")
+        if not isinstance(found, dict) or not isinstance(found.get("lines"), list):
+            return peek_module._not_available()
+        lines = [
+            {"at": row.get("at"), "text": row.get("text")}
+            if isinstance(row, dict)
+            else {"at": "unknown", "text": "unknown"}
+            for row in found["lines"]
+        ]
+        kept = lines[-last:] if last else []
+        return {
+            "state": found.get("state")
+            if found.get("state") in ("ready", "not-available")
+            else "ready",
+            "lines": kept,
+            "truncated": bool(found.get("truncated")) or len(kept) < len(lines),
+        }
+
+    return reader
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -1561,9 +1708,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except OSError as err:
         _err(f"cannot read state dir {state_dir}: {err}")
         return UNREACHABLE
+    peek_reader = None
     if args.snapshot_file is not None:
         try:
             build = fixture_build(args.snapshot_file)
+            peek_reader = fixture_peek(args.snapshot_file)
         except ServeError as err:
             _err(str(err))
             return USAGE
@@ -1577,6 +1726,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             allowed_origins=tuple(origins),
             token_required=remote,
             token_reader=lambda: read_token(token_path),
+            peek_fn=peek_reader,
             tail_max=resolved["serve.tail_max"],
             max_streams=resolved["serve.max_streams"],
             snapshot_ttl_s=resolved["serve.snapshot_ttl_s"],

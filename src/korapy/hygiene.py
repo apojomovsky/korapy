@@ -492,8 +492,10 @@ def _session_eligible(rule, entries, roots, notes):
 
     Symlink and escape drops read as notes, the directory precedent. A
     `reviews` record dir is never a candidate (review evidence is
-    append-only proof), and a leaf parsed for another repo is skipped
-    with a note, never a candidate under this rule. An unreadable
+    append-only proof), and a leaf whose ticket belongs to another
+    repo is skipped with a note, never a candidate under this rule.
+    Ticket identity is `paths.leaf_ticket`, so a `<ticket>/<role>-<gen>`
+    leaf keys on its parent ticket. An unreadable
     mtime is a `hygiene-session` keep row, the `disk.py` session
     precedent, never a `hygiene-dir` row.
     """
@@ -509,7 +511,7 @@ def _session_eligible(rule, entries, roots, notes):
                 f"dropped {found.path}: reviews record dirs are never candidates (rule {rule.name})"
             )
             continue
-        parsed = paths.parse_ticket_dirname(os.path.basename(found.path))
+        parsed = paths.leaf_ticket(found.path)
         if parsed is not None and parsed[0] != rule.repo:
             notes.append(
                 f"dropped {found.path}: belongs to repo {parsed[0]!r}, rule is for {rule.repo!r}"
@@ -535,10 +537,12 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
 
     The `disk.py` session proof unchanged: the registry entry for the
     ticket is done, no live unit holds it, and the newest mtime under
-    the leaf is older than `retention_days`. Leaf names that do not
-    parse as ticket dirs, or parse but hold no registry entry, are
-    `disk.UNPROVEN` keep rows. A `None` live set (the listing itself
-    failed) keeps every leaf with its reason, once noted.
+    the leaf is older than `retention_days`. Leaves that do not
+    resolve to a ticket through `paths.leaf_ticket`, or resolve but
+    hold no registry entry, are `disk.UNPROVEN` keep rows. A
+    `<ticket>/<role>-<gen>` leaf keys on its parent ticket. A `None`
+    live set (the listing itself failed) keeps every leaf with its
+    reason, once noted.
     """
     assert rule.retention_days is not None
     cutoff = now - rule.retention_days * DAY_S
@@ -547,7 +551,7 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
     for found in idle:
         assert found.mtime is not None
         name = os.path.basename(found.path)
-        parsed = paths.parse_ticket_dirname(name)
+        parsed = paths.leaf_ticket(found.path)
         ticket = None
         if parsed is not None:
             if parsed in done:
@@ -558,12 +562,15 @@ def _plan_session(rule, idle, *, now, entries, live, notes):
                         ticket = parsed
                         break
         if ticket is None:
+            label = name
+            if parsed is not None and name != f"{parsed[0]}-{parsed[1]}":
+                label = f"{name} (ticket {parsed[0]}-{parsed[1]})"
             rows.append(
                 Candidate(
                     disk.UNPROVEN,
                     found.path,
                     found.size,
-                    f"rule {rule.name}; session dir {name} has no registry entry: "
+                    f"rule {rule.name}; session dir {label} has no registry entry: "
                     "cannot prove nothing is lost",
                     False,
                 )

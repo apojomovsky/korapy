@@ -603,7 +603,8 @@ a held port exits 2 with the `--port` fix in the message.
 the live host, so the page can be developed and screenshotted
 without a running fleet; `docs/assets/dashboard-fixture.json` is a
 committed example. Board, tail, events and journal still read the
-live host in fixture mode.
+live host in fixture mode; the peek route answers the fixture's
+`peek` entry.
 
 The page is vanilla JS and CSS, no framework. A sticky strip names
 fleet counts, the loop state, quota freshness, host load per core and

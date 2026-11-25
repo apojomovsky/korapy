@@ -1562,6 +1562,27 @@ export function attentionItems(doc, nowMs) {
       items.push("research findings " + ref + ": " + findings);
     }
   }
+  // The failing doctor rows, from the last recorded run: the page
+  // never runs a check on its poll. The record fails independently
+  // of the event queue, so its rows render in every panel state;
+  // no record reads unknown.
+  if (panel !== null && panel !== undefined) {
+    const failing = panel.doctor_failing;
+    if (failing === "unknown" || failing === null || failing === undefined) {
+      items.push("doctor state is unknown: the last doctor run could not be read");
+    } else if (Array.isArray(failing)) {
+      for (const item of failing) {
+        const name =
+          item && typeof item.name === "string" && item.name !== "" ? item.name : "unknown";
+        const detail =
+          item && typeof item.detail === "string" && item.detail !== "" ? item.detail : "unknown";
+        const fix = item && typeof item.fix === "string" && item.fix !== "" ? item.fix : "unknown";
+        items.push("doctor " + name + " failing: " + detail + " (fix: " + fix + ")");
+      }
+    } else {
+      items.push("doctor state is unknown: the last doctor run could not be read");
+    }
+  }
   for (const [section, label] of [
     ["fleet_header", "fleet"],
     ["agents", "agents"],
@@ -1820,7 +1841,7 @@ export function renderDetail(row, { nowMs }) {
   const shown = agentText(info, nowMs);
   const lines = [
     el("h2", ticketTitle(info) + "  " + String(info.state)),
-    el("p", "One agent: every field the host records, then its activity tail.", {
+    el("p", "One agent: every field the host records, then its peek.", {
       class: "desc",
     }),
     el("p", shown.line),
@@ -1839,8 +1860,10 @@ export function renderDetail(row, { nowMs }) {
   copyButton.textContent = "copy link";
   lines.push(copyButton);
   const ticketed = hasTicket(info);
-  if (!ticketed) {
-    lines.push(el("p", "no ticket, no tail"));
+  if (ticketed) {
+    lines.push(el("p", "peek: read-only, bounded by the server"));
+  } else {
+    lines.push(el("p", "no ticket, no peek"));
   }
   document.getElementById("chips").hidden = true;
   document.getElementById("cards").hidden = true;
@@ -1878,33 +1901,48 @@ export function renderDetailMissing() {
   document.getElementById("detail").hidden = false;
 }
 
-// The tail pane is one text node, replaced per poll: memory stays
-// flat and no per-line nodes ever exist.
-export function renderTail(text) {
-  document.getElementById("tail").textContent = cleanText(text === null ? "" : String(text));
+// The peek pane is one text node, replaced per poll: memory stays
+// flat and no per-line nodes ever exist. Each line carries its
+// entry's stamp sliced to local wall-clock time; a peek with no
+// lines says not available, never an empty pane.
+export function renderPeek(lines) {
+  const rows = Array.isArray(lines) ? lines : [];
+  if (rows.length === 0) {
+    document.getElementById("tail").textContent = "not available";
+  } else {
+    document.getElementById("tail").textContent = cleanText(
+      rows
+        .map((row) => {
+          const at = row && row.at !== null && row.at !== undefined ? row.at : "unknown";
+          const text = row && row.text !== null && row.text !== undefined ? String(row.text) : "unknown";
+          return formatLocalTime(at) + "  " + text;
+        })
+        .join("\n"),
+    );
+  }
   document.getElementById("tail-state").textContent = "";
 }
 
-export function renderTailMissing() {
-  document.getElementById("tail").textContent = "nothing to show";
+export function renderPeekMissing() {
+  document.getElementById("tail").textContent = "not available";
   document.getElementById("tail-state").textContent = "";
 }
 
-export function renderTailFailed() {
-  document.getElementById("tail-state").textContent = "tail unavailable, retrying";
+export function renderPeekFailed() {
+  document.getElementById("tail-state").textContent = "peek unavailable, retrying";
 }
 
-export function renderTailLoading() {
+export function renderPeekLoading() {
   document.getElementById("tail").textContent = "";
-  document.getElementById("tail-state").textContent = "loading the tail";
+  document.getElementById("tail-state").textContent = "loading the peek";
 }
 
-export function renderTailPaused(paused) {
-  document.getElementById("tail-state").textContent = paused ? "tail paused" : "";
+export function renderPeekPaused(paused) {
+  document.getElementById("tail-state").textContent = paused ? "peek paused" : "";
 }
 
-export function renderTailButtons(paused, follow) {
-  document.getElementById("tail-pause").textContent = paused ? "tail: resume" : "tail: pause";
+export function renderPeekButtons(paused, follow) {
+  document.getElementById("tail-pause").textContent = paused ? "peek: resume" : "peek: pause";
   document.getElementById("tail-follow").textContent = follow ? "follow: on" : "follow: off";
 }
 

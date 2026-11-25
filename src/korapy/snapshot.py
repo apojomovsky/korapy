@@ -359,6 +359,7 @@ def build(
     drive_view=None,
     resources_view=None,
     events_view=None,
+    doctor_view=None,
 ):
     """The snapshot document from plain data (pure, except disk paths).
 
@@ -376,7 +377,10 @@ def build(
     like the capacity section. `events_view` is the `coordevents`
     unresolved rows (or the exception reading them raised); None reads
     the attention panel as `unknown`, never an error, since the panel
-    is additive and must not degrade the server. Sections fail
+    is additive and must not degrade the server. `doctor_view` is the
+    last recorded doctor checks (`doctorrecord.load_last_checks`), or the
+    exception reading them raised; None reads the band's doctor rows
+    as `unknown`. Sections fail
     independently: a broken one reads `{"error": ...}` while the rest
     still print.
     """
@@ -437,7 +441,7 @@ def build(
     else:
         drive = _section_error(ValueError(f"drive section is {type(drive_view).__name__}"))
     try:
-        attention = dashboard.attention(events_view)
+        attention = dashboard.attention(events_view, doctor_view)
     except Exception as exc:  # noqa: BLE001 - the panel never breaks the document
         attention = {"state": "error", "error": error_text(exc)}
     try:
@@ -688,6 +692,7 @@ def collect_kwargs() -> dict:
         accounts,
         admission,
         coordevents,
+        doctorrecord,
         drive,
         freeze,
         projects,
@@ -739,6 +744,10 @@ def collect_kwargs() -> dict:
         events_view = coordevents.unresolved()
     except Exception as exc:  # noqa: BLE001 - a broken queue reads unknown, never fatal
         events_view = exc
+    try:
+        doctor_view = doctorrecord.load_last_checks()
+    except Exception as exc:  # noqa: BLE001 - a broken record reads unknown, never fatal
+        doctor_view = exc
     pressure, pressure_notes = resources.read_pressure()
     notes = list(pressure_notes)
     try:
@@ -785,6 +794,7 @@ def collect_kwargs() -> dict:
         "drive_view": drive_view,
         "resources_view": resources_view,
         "events_view": events_view,
+        "doctor_view": doctor_view,
     }
 
 

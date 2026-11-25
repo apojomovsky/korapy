@@ -50,7 +50,10 @@ use plus `pressure`, which carries the host facts `ncpu`, `load_1min`,
 `attention` (needs-decision questions, ready-to-merge rows, answered
 research findings and the
 coordinator-handled count from the event queue, `unknown` when the
-queue has no reading) and `plan` (the next starts with their named
+queue has no reading, plus `doctor_failing`: the failing rows of the
+last recorded `korapy doctor` run with their fix text, through the
+one record reader in `doctorrecord`; `unknown` when no run has been
+recorded, so the poll never runs a check or a GitHub call) and `plan` (the next starts with their named
 waits, identical waits collapsed with a count and the ticket list,
 and the next-pass countdown, `unknown` when the drive journal has no
 reading).
@@ -106,6 +109,14 @@ the snapshot only summarizes:
   activity via `launch.tail`, plain text, bounded by a server side
   maximum (default 200 lines, see section 6). This is activity lines
   only, the same output `korapy tail` prints.
+- `GET /v1/peek?repo=&number=&role=&last=`: the selected agent's
+  peek document via the one bounded reader in `peek`: at most 50
+  lines and 32 KiB read from the end of the newest session file,
+  each line with its entry's timestamp carrying the local offset
+  and its tool call or text shortened to one capped line. A missing
+  or unreadable session answers 200 with `state: not-available`
+  (the pane states the miss, never an empty pane); in fixture mode
+  the route answers the fixture file's `peek` entry instead.
 - `GET /v1/stream?topics=&cursor=`: Server-Sent Events (section 2)
   over the journal, the event queue, and a snapshot generation
   counter. The `events` and `journal` topics follow one project
