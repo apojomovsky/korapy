@@ -758,16 +758,7 @@ def host_info(*, read=None, cpu_count=None, python_version=None):
         meminfo = reader("/proc/meminfo")
     except OSError:
         meminfo = None
-    total_mb = None
-    if isinstance(meminfo, str):
-        for line in meminfo.splitlines():
-            key, _, rest = line.partition(":")
-            if key.strip() == "MemTotal":
-                try:
-                    total_mb = round(int(rest.split()[0]) / 1024, 1)
-                except (ValueError, IndexError):
-                    total_mb = None
-                break
+    total_mb = resources.mem_total_mb(meminfo)
     if cpu_count is None:
         cpu_count = os.cpu_count()
     if isinstance(cpu_count, bool):

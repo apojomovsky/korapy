@@ -891,6 +891,17 @@ class PressureParse(unittest.TestCase):
         self.assertIsNone(reading.mem_total_mb)
         self.assertIsNone(reading.mem_available_mb)
 
+    def test_non_positive_total_reads_unknown_everywhere(self):
+        for meminfo in (
+            "MemTotal: -8000000 kB\nMemAvailable: 4400000 kB\n",
+            "MemTotal: 0 kB\nMemAvailable: 4400000 kB\n",
+        ):
+            with self.subTest(meminfo=meminfo):
+                reading = R.parse_pressure(LOADAVG, meminfo, 2)
+                self.assertIsNone(reading.mem_available_pct)
+                self.assertIsNone(reading.mem_total_mb)
+                self.assertIsNone(reading.mem_available_mb)
+
     def test_dict_carries_the_host_facts(self):
         found = R.pressure_dict(R.parse_pressure(LOADAVG, MEMINFO, 2))
         self.assertEqual(
