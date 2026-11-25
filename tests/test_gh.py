@@ -697,6 +697,213 @@ class PacerChargeTest(unittest.TestCase):
                 pacer.acquire(cost=1.0)
 
 
+class NoteReportedTest(unittest.TestCase):
+    def make_pacer(self, tmp, **kwargs):
+        return gh.GraphqlPacer(
+            os.path.join(tmp, "pacing.json"), now=lambda: 1000.0, sleep=lambda s: None, **kwargs
+        )
+
+    def read_state(self, tmp):
+        with open(os.path.join(tmp, "pacing.json")) as handle:
+            return json.load(handle)
+
+    def test_a_lower_report_drops_only_its_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp)
+            pacer.note_reported("core", 2500, 2000.0)
+            state = self.read_state(tmp)
+            # 2500 of 5000 reported points maps to half the bucket.
+            self.assertEqual(state["core_tokens"], 60.0)
+            self.assertEqual(state["graphql_tokens"], gh.GRAPHQL_CAPACITY)
+            self.assertEqual(state["cooldown_until"], 0.0)
+
+    def test_a_higher_report_never_raises_a_balance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp)
+            pacer.note_reported("graphql", 2500, 2000.0)
+            pacer.note_reported("graphql", 5000, 2000.0)
+            self.assertEqual(self.read_state(tmp)["graphql_tokens"], 60.0)
+
+    def test_zero_remaining_pushes_the_cooldown_to_the_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp)
+            pacer.note_reported("core", 0, 1600.0)
+            state = self.read_state(tmp)
+            self.assertEqual(state["core_tokens"], 0.0)
+            self.assertEqual(state["cooldown_until"], 1600.0)
+            self.assertEqual(pacer.cooldown_remaining(), 600.0)
+
+    def test_an_old_state_file_without_the_new_keys_paces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pacing.json")
+            with open(path, "w") as handle:
+                json.dump(
+                    {"tokens": 120.0, "updated": 1000.0, "cooldown_until": 0.0, "backoff_s": 0.0},
+                    handle,
+                )
+            pacer = self.make_pacer(tmp)
+            # No corrupt-state backoff: the missing keys read as full.
+            pacer.acquire(cost=1.0)
+            state = self.read_state(tmp)
+            self.assertEqual(state["core_tokens"], gh.GRAPHQL_CAPACITY)
+            self.assertEqual(state["graphql_tokens"], gh.GRAPHQL_CAPACITY - 1.0)
+
+    def test_acquire_waits_on_a_drained_resource_balance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp, max_wait_s=0.0)
+            pacer.note_reported("core", 0, 1000.0)
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0, resource="core")
+            # The other resource still paces.
+            pacer.acquire(cost=1.0, resource="graphql")
+
+    def test_spending_one_resource_leaves_the_other(self):
+        # Isolation, not reports: draining REST must not move the
+        # GraphQL gate, and draining GraphQL must not move the REST one.
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp, capacity=4.0, max_wait_s=0.0)
+            pacer.acquire(cost=4.0, resource="core")
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0, resource="core")
+            pacer.acquire(cost=1.0, resource="graphql")
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = self.make_pacer(tmp, capacity=4.0, max_wait_s=0.0)
+            pacer.acquire(cost=4.0, resource="graphql")
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0, resource="graphql")
+            pacer.acquire(cost=1.0, resource="core")
+
+
+class HeaderCaptureTest(unittest.TestCase):
+    class RecordingPacer:
+        def __init__(self):
+            self.acquired = []
+            self.notes = []
+            self.cooldowns = []
+
+        def acquire(self, cost=gh.GRAPHQL_CALL_COST, resource=None):
+            self.acquired.append(cost)
+
+        def cooldown(self, seconds):
+            self.cooldowns.append(seconds)
+
+        def note_reported(self, resource, remaining, reset_epoch):
+            self.notes.append((resource, remaining, reset_epoch))
+
+    HEADERS = (
+        "HTTP/2 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 2500\r\n"
+        "x-ratelimit-reset: 2000\r\nx-ratelimit-resource: core\r\n\r\n"
+    )
+
+    def test_the_subprocess_seam_adds_include_and_notes_the_headers(self):
+        notes = []
+
+        class Pacer:
+            def note_reported(self, resource, remaining, reset_epoch):
+                notes.append((resource, remaining, reset_epoch))
+
+        with (
+            mock.patch(
+                "subprocess.Popen", return_value=_popen(stdout=self.HEADERS + '{"ok": true}')
+            ) as spawn,
+            mock.patch.object(gh, "_pacer", return_value=Pacer()),
+        ):
+            out = gh.run(["api", "repos/acme/lib"], paced=True)
+        self.assertEqual(out, '{"ok": true}')
+        self.assertEqual(spawn.call_args[0][0], ["gh", "api", "-i", "repos/acme/lib"])
+        self.assertEqual(notes, [("core", 2500, 2000.0)])
+        # An unpaced call asks for no headers and notes nothing.
+        with mock.patch("subprocess.Popen", return_value=_popen(stdout="plain")) as spawn:
+            self.assertEqual(gh.run(["api", "repos/acme/lib"]), "plain")
+        self.assertEqual(spawn.call_args[0][0], ["gh", "api", "repos/acme/lib"])
+
+    def test_paced_run_notes_the_headers_of_an_injected_run(self):
+        seen = []
+
+        def run(args, **kwargs):
+            seen.append(list(args))
+            return self.HEADERS + '{"ok": true}'
+
+        pacer = self.RecordingPacer()
+        out = gh.paced_run(["api", "repos/acme/lib"], run=run, pacer=pacer)
+        self.assertEqual(out, '{"ok": true}')
+        self.assertEqual(seen, [["api", "repos/acme/lib"]])
+        self.assertEqual(pacer.notes, [("core", 2500, 2000.0)])
+
+    def test_paced_run_without_headers_returns_the_body_unchanged(self):
+        pacer = self.RecordingPacer()
+        out = gh.paced_run(["api", "x"], run=lambda args, **kw: "ok", pacer=pacer)
+        self.assertEqual(out, "ok")
+        self.assertEqual(pacer.notes, [])
+
+    def test_graphql_strips_headers_and_notes_graphql(self):
+        def run(args, **kwargs):
+            self.assertEqual(args[:2], ["api", "graphql"])
+            return self.HEADERS.replace("core", "graphql") + json.dumps({"data": {"x": 1}})
+
+        pacer = self.RecordingPacer()
+        self.assertEqual(gh.graphql("{x}", run=run, pacer=pacer), {"x": 1})
+        self.assertEqual(pacer.notes, [("graphql", 2500, 2000.0)])
+
+    def test_split_headers_tolerates_a_plain_body(self):
+        body, headers = gh.split_rate_limit_headers("plain")
+        self.assertEqual((body, headers), ("plain", {}))
+        body, headers = gh.split_rate_limit_headers(self.HEADERS + "body")
+        self.assertEqual(body, "body")
+        self.assertEqual(headers["x-ratelimit-remaining"], "2500")
+
+    def test_an_unknown_resource_falls_back_to_the_default(self):
+        headers = (
+            "HTTP/2 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 2500\r\n"
+            "x-ratelimit-reset: 2000\r\nx-ratelimit-resource: search\r\n\r\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = gh.GraphqlPacer(os.path.join(tmp, "pacing.json"), now=lambda: 1000.0)
+            body = gh._note_rate_limit_headers(pacer, headers + '{"ok": true}', "core")
+            self.assertEqual(body, '{"ok": true}')
+            with open(os.path.join(tmp, "pacing.json")) as handle:
+                state = json.load(handle)
+            # A resource the bucket never heard of folds into the
+            # default instead of raising out of a successful call.
+            self.assertEqual(state["core_tokens"], 60.0)
+            self.assertEqual(state["graphql_tokens"], gh.GRAPHQL_CAPACITY)
+
+    def test_the_subprocess_seam_shares_the_same_unknown_resource_fallback(self):
+        headers = (
+            "HTTP/2 200\r\nx-ratelimit-limit: 5000\r\nx-ratelimit-remaining: 2500\r\n"
+            "x-ratelimit-reset: 2000\r\nx-ratelimit-resource: search\r\n\r\n"
+        )
+        notes = []
+
+        class Pacer:
+            def note_reported(self, resource, remaining, reset_epoch):
+                # Like the real pacer: an unknown resource refuses.
+                if resource not in ("core", "rest", "graphql"):
+                    raise ValueError(f"unknown rate limit resource {resource!r}")
+                notes.append((resource, remaining, reset_epoch))
+
+        with (
+            mock.patch("subprocess.Popen", return_value=_popen(stdout=headers + '{"ok": true}')),
+            mock.patch.object(gh, "_pacer", return_value=Pacer()),
+        ):
+            self.assertEqual(gh.run(["api", "repos/acme/lib"], paced=True), '{"ok": true}')
+        # One parser serves every paced caller, so the report lands on
+        # the default instead of being dropped.
+        self.assertEqual(notes, [("core", 2500, 2000.0)])
+
+
+class DefaultBudgetTest(unittest.TestCase):
+    def test_the_retry_bound_resolves_once_per_process(self):
+        from korapy.github import retry
+
+        self.addCleanup(gh.reset_default_budget_s)
+        gh.reset_default_budget_s()
+        with mock.patch.object(retry, "retry_max_wait_s", return_value=77) as resolve:
+            self.assertEqual(gh._default_budget_s(), 77)
+            self.assertEqual(gh._default_budget_s(), 77)
+            self.assertEqual(resolve.call_count, 1)
+
+
 class DependsOnTest(unittest.TestCase):
     def test_reads_only_depends_on_lines(self):
         body = "See #9 for context.\nDepends on #3 and #4\ndepends on: #3"

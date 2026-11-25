@@ -110,11 +110,17 @@ def _merge_sha(payload, number, state):
     """The merge commit SHA once merged, else ``None``.
 
     An open PR may carry a preview merge commit; only a merged PR
-    reports the SHA the verify step ties to the pinned head.
+    reports the SHA the verify step ties to the pinned head. A merged
+    PR with no recorded SHA reads as ``None`` (a malformed non-null
+    one is still a shape error): the merge verb fails closed on the
+    ``None`` instead of returning a SHA it cannot name.
     """
     if state != forge.MERGED:
         return None
-    return _sha(payload.get("merge_commit_sha"), f"PR {number} merge sha")
+    recorded = payload.get("merge_commit_sha")
+    if recorded is None:
+        return None
+    return _sha(recorded, f"PR {number} merge sha")
 
 
 def _merge_parent_shas(payload, number):
@@ -487,6 +493,7 @@ class GithubForge:
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
         owner, name = repo.split("/", 1)
+        # Outside the reset-wait retry: this one GraphQL read stays paced only (tracked by #739).
         try:
             data = gh.graphql(
                 _THREADS_QUERY,
@@ -550,6 +557,18 @@ class GithubForge:
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
         _sha(head_sha, "head sha")
         current = self.pull_request(repo, number)
+        if current.state == forge.MERGED:
+            # Merge-if-not-merged: already landed at the pinned head
+            # converges on the recorded SHA instead of refusing, so a
+            # retried merge returns instead of doubling. A moved head
+            # or a missing SHA fails closed as a refusal.
+            if current.head_sha != head_sha:
+                raise forge.ForgeRefused(f"PR {number} head moved: want {head_sha}")
+            if current.merge_sha is None:
+                raise forge.ForgeRefused(f"PR {number} is merged with no recorded merge sha")
+            if method == "merge":
+                self._check_merge_parents(repo, number, current.merge_sha, head_sha)
+            return current.merge_sha
         if current.state != forge.OPEN:
             raise forge.ForgeRefused(f"PR {number} is {current.state}, nothing to merge")
         if current.head_sha != head_sha:

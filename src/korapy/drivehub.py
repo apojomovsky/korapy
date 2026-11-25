@@ -22,7 +22,7 @@ from korapy import hub as hubmod
 from korapy import merge
 from korapy import paths, projects, quota, settings, syncli, trackers, units
 from korapy.github import forge as ghforge
-from korapy.github.gh import paced_run
+from korapy.github.gh import paced_run_with_reset_wait
 
 
 class HubMode:
@@ -442,7 +442,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             quota_pool,
             override=quota_refresh_override,
         )
-        forge = ghforge.GithubForge(paced_run)
+        forge = ghforge.GithubForge(paced_run_with_reset_wait)
 
         def record_research_event(project, repo, number, findings_body):
             from korapy import coordevents

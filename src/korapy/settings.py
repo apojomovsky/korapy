@@ -88,6 +88,7 @@ PROVIDERS = (
     "korapy.disk",
     "korapy.drive",
     "korapy.freeze",
+    "korapy.github.retry",
     "korapy.hold",
     "korapy.hub",
     "korapy.launch",

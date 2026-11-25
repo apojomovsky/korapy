@@ -64,12 +64,14 @@ def _git(args, cwd):
         return None
 
 
-def _production_forge():
-    """The live forge over the production `gh` runner."""
+def _production_forge(budget_s=None):
+    """The live forge over the production `gh` runner, waiting out resets."""
     from korapy.github import forge as ghforge
-    from korapy.github.gh import paced_run
+    from korapy.github.gh import paced_run_with_reset_wait
 
-    return ghforge.GithubForge(paced_run)
+    if budget_s is None:
+        return ghforge.GithubForge(paced_run_with_reset_wait)
+    return ghforge.GithubForge(lambda args: paced_run_with_reset_wait(args, budget_s=budget_s))
 
 
 def cmd_merge(args: argparse.Namespace, forge=None) -> int:
@@ -105,7 +107,12 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
     except merge.MergeError as err:
         _err(f"korapy merge: {err}")
         return USAGE
-    adapter = forge if forge is not None else _production_forge()
+    if forge is not None:
+        adapter = forge
+    else:
+        from korapy.github.retry import retry_max_wait_s
+
+        adapter = _production_forge(budget_s=retry_max_wait_s(resolved))
     try:
         result = merge.run_merge(
             ticket_repo,

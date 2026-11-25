@@ -187,8 +187,13 @@ class Forge(Protocol):
         ``method`` is ``"squash"`` or ``"merge"``: the verb resolves it
         from the project's ``merge.method`` setting and carries it here.
         Anything else is ``ForgeError``. Refuses with ``ForgeRefused``
-        unless the PR is open at ``head_sha``. Raises ``ForgeError``
-        when the forge is unreachable or answers something unusable.
+        unless the PR is open at ``head_sha``, with one exception: a
+        PR already merged at the pinned head (merge-if-not-merged)
+        returns its recorded merge SHA instead of refusing, so a
+        retried merge converges; a merged PR whose head moved past
+        the pin, or with no recorded merge SHA, still refuses.
+        Raises ``ForgeError`` when the forge is unreachable or
+        answers something unusable.
         Only the adapters call ``gh`` or know provider shapes. For a
         merge commit the adapter verifies the merge commit's parents
         include ``head_sha``; anything else is unverified

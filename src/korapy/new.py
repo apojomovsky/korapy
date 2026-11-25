@@ -412,17 +412,17 @@ def _kept_line(target, rel, template):
 def _production_forge():
     """The live forge over the production `gh` runner."""
     from korapy.github import forge as ghforge
-    from korapy.github.gh import paced_run
+    from korapy.github.gh import paced_run_with_reset_wait
 
-    return ghforge.GithubForge(paced_run)
+    return ghforge.GithubForge(paced_run_with_reset_wait)
 
 
 def _production_tracker():
     """The live tracker over the production `gh` runner."""
     from korapy.github import tracker as ghtracker
-    from korapy.github.gh import paced_run
+    from korapy.github.gh import paced_run_with_reset_wait
 
-    return ghtracker.GithubTracker(paced_run)
+    return ghtracker.GithubTracker(paced_run_with_reset_wait)
 
 
 def _production_provisioner_factory():

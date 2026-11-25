@@ -175,6 +175,7 @@ what it means. Do not edit this table by hand.
 | `git.branch` | `'{type}/{issue}-{slug}'` | branch name template |
 | `git.commits.conventional` | `True` | enforce Conventional Commits |
 | `git.worktrees` | `'.worktrees/'` | worktree root, relative to the clone |
+| `github.retry_max_wait_s` | `1800` | seconds a GitHub call may wait out a rate limit for its reset before giving up (exit 3) |
 | `hub.heartbeat_s` | `30` | seconds between hub heartbeats |
 | `hub.host_id` | `''` | this host's operator-assigned hub id (empty means unregistered, hub mode refused) |
 | `hub.lease_ttl_s` | `90` | seconds a hub claim grant stays valid |

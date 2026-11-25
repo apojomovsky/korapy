@@ -189,6 +189,20 @@ def short_argv(argv):
     return words
 
 
+def resource_for(argv):
+    """Shared-bucket resource a `gh` call spends: `"graphql"` or `"core"`.
+
+    Next to `cost_for`: a GraphQL call spends the GraphQL sub-balance,
+    anything else the REST one, so a REST burst never drains GraphQL
+    headroom. Local-only calls also read as `"core"`; they cost nothing,
+    so the resource never reaches the bucket.
+    """
+    words = [str(word) for word in (argv or [])]
+    if _is_graphql(words):
+        return "graphql"
+    return "core"
+
+
 def cost_for(argv):
     """Shared-bucket cost of a `gh` call, or None when it never hits the API.
 
@@ -433,9 +447,12 @@ def _is_local(first, rest):
     return bool(rest) and rest[0] in allowed
 
 
-def pace_before(cost):
+def pace_before(cost, resource="graphql"):
     """Take `cost` points from the shared bucket; (waited_s, capped).
 
+    `resource` is the `resource_for` word for the same argv, threaded
+    through to `acquire` (and to `charge` on the cap path), so shimmed
+    REST traffic spends the core sub-balance, never GraphQL headroom.
     Waits rather than fails, like `GraphqlPacer.acquire`. When the wait
     would exceed the pacer's cap the call goes through anyway, `capped` is
     true, and the cost is still charged (the balance may go negative), so
@@ -445,11 +462,11 @@ def pace_before(cost):
     pacer = gh._pacer()
     start = time.monotonic()
     try:
-        pacer.acquire(cost=cost)
+        pacer.acquire(cost=cost, resource=resource)
         return time.monotonic() - start, False
     except gh.GhError:
         try:
-            pacer.charge(cost)
+            pacer.charge(cost, resource=resource)
         except gh.GhError:
             pass
         return time.monotonic() - start, True
