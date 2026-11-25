@@ -320,10 +320,14 @@ policy needs no writing:
 eligibility = "korapy.policies:basic"
 ```
 
-It selects open, unheld, unblocked tickets with no open linked pull
-and no linked pull merged since the claim start (a ticket whose
+It selects open, unheld, unblocked tickets with no linked pull
+merged since the claim start (a ticket whose
 work landed during its claim stays withdrawn, so no new
-round starts on landed work), weighted by board priority. The same file carries the project's slot
+round starts on landed work), weighted by board priority. A ticket
+with an open linked pull stays selected: the gate refuses the fresh
+start on it, routes a finished worker to a reviewer takeover, and
+grades an approving record as merge-ready, so the row stays visible
+instead of reading as withdrawn. The same file carries the project's slot
 `floor` and `ceiling`: with the host total full, a project below its
 floor still starts, and a project at its ceiling does not.
 
@@ -599,7 +603,8 @@ a held port exits 2 with the `--port` fix in the message.
 the live host, so the page can be developed and screenshotted
 without a running fleet; `docs/assets/dashboard-fixture.json` is a
 committed example. Board, tail, events and journal still read the
-live host in fixture mode.
+live host in fixture mode; the peek route answers the fixture's
+`peek` entry.
 
 The page is vanilla JS and CSS, no framework. A sticky strip names
 fleet counts, the loop state, quota freshness, host load per core and

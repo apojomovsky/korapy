@@ -91,13 +91,30 @@ def prune_backups(directory, keep=BACKUP_KEEP):
     return removed
 
 
+def _short_mapped(project, short, mapping):
+    """Whether `short` resolves for `project` under `mapping`. Pure.
+
+    Per-project maps resolve under the named project (an unknown
+    project only when every project agrees on the tracker); a flat
+    map resolves by name. An ambiguous shared short with no project
+    reads as unmapped, so the fail-closed rule decides.
+    """
+    if drive._is_project_maps(mapping):
+        if project and project in mapping:
+            return short in mapping[project]
+        trackers = {shorts[short] for shorts in mapping.values() if short in shorts}
+        return len(trackers) == 1
+    return short in (mapping or {})
+
+
 def project_owners(project_shorts, mapping, wanted):
     """`{project names}` with a short name resolving into ``wanted``.
 
-    Pure over ``{project: [shorts]}`` and the merged short-to-tracker
+    Pure over ``{project: [shorts]}`` and the short-to-tracker
     mapping: the rename's owners are the projects whose config still
-    names the repo. A short-name collision across projects over-names
-    rather than under-names, so the rename fails closed.
+    names the repo. Each project resolves under its own map when the
+    mapping is per-project, so a short-name collision across projects
+    names exactly the projects feeding the renamed repo.
     """
     mapping = dict(mapping or {})
     wanted = set(wanted)
@@ -105,7 +122,7 @@ def project_owners(project_shorts, mapping, wanted):
         project
         for project, shorts in (project_shorts or {}).items()
         for short in shorts
-        if mapping.get(short) in wanted
+        if drive._project_tracker_key(project, (short, 0), mapping)[0] in wanted
     }
 
 
@@ -170,8 +187,8 @@ def live_blockers(old, new, *, claims, entries, live_units, mapping, owners=None
         for project, short, live_number in parts:
             if live_number != number:
                 continue
-            if short in mapping:
-                tracker_repo, _ = drive._tracker_key((short, live_number), mapping)
+            if _short_mapped(project, short, mapping):
+                tracker_repo, _ = drive._project_tracker_key(project, (short, live_number), mapping)
                 if tracker_repo == claim_repo:
                     found.append(f"claim {claim_repo}#{number} by {agent} is held by a live unit")
                     break
@@ -185,12 +202,12 @@ def live_blockers(old, new, *, claims, entries, live_units, mapping, owners=None
         if ticket is None:
             continue
         short, number = ticket
-        if short in mapping:
-            tracker_repo, _ = drive._tracker_key(ticket, mapping)
+        project = (item_entry.get("ticket") or {}).get("project") or None
+        if _short_mapped(project, short, mapping):
+            tracker_repo, _ = drive._project_tracker_key(project, ticket, mapping)
             if tracker_repo in wanted:
                 found.append(f"agent {item_entry['id']} is {state} for {tracker_repo}#{number}")
             continue
-        project = (item_entry.get("ticket") or {}).get("project") or None
         related = number in claim_numbers or item_entry.get("id") in claim_agents
         if _unmapped_blocks(project=project, owners=owners, related=related):
             found.append(

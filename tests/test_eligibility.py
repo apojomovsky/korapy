@@ -562,7 +562,10 @@ class ForProjectTest(unittest.TestCase):
             },
         )
         self.assertIsNone(outcome.skipped)
-        self.assertEqual(outcome.requests, [])
+        self.assertEqual(
+            [(request.repo, request.number) for request in outcome.requests],
+            [("app", 7)],
+        )
 
     def test_a_project_without_a_map_sees_no_pulls(self):
         project = projects.Project(

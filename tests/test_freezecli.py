@@ -138,6 +138,109 @@ class FreezeStartTest(unittest.TestCase):
             self.assertEqual(handle.read(), "operator break\n")
         self.assertFalse(os.path.exists(self.paths["freeze_file"]))
 
+    def test_start_creates_the_pause_with_a_plain_file_mode(self):
+        code, _, _, _ = self.run_start(start_args(), [0])
+        self.assertEqual(code, 0)
+        mode = os.stat(self.paths["pause_file"]).st_mode
+        self.assertEqual(mode & 0o111, 0)
+        self.assertEqual(mode & 0o600, 0o600)
+
+    def test_pause_write_failure_leaves_no_orphan_pause(self):
+        from unittest import mock
+
+        real_fdopen = os.fdopen
+
+        class FailingHandle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, text):
+                raise OSError("disk full")
+
+        def failing_fdopen(fd, *args, **kwargs):
+            if kwargs.get("encoding") == "utf-8":
+                os.close(fd)
+                return FailingHandle()
+            return real_fdopen(fd, *args, **kwargs)
+
+        with mock.patch("os.fdopen", failing_fdopen):
+            code, _, err, _ = self.run_start(start_args(), [0])
+        self.assertEqual(code, 4)
+        self.assertIn("disk full", err)
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+        self.assertFalse(os.path.exists(self.paths["pause_file"]))
+
+    def test_pause_write_and_first_removal_failure_still_rolls_back(self):
+        from unittest import mock
+
+        real_fdopen = os.fdopen
+        real_remove = os.remove
+        attempts = {"pause": 0}
+
+        class FailingHandle:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, text):
+                raise OSError("disk full")
+
+        def failing_fdopen(fd, *args, **kwargs):
+            if kwargs.get("encoding") == "utf-8":
+                os.close(fd)
+                return FailingHandle()
+            return real_fdopen(fd, *args, **kwargs)
+
+        def flaky_remove(path, *args, **kwargs):
+            if path == self.paths["pause_file"]:
+                attempts["pause"] += 1
+                if attempts["pause"] == 1:
+                    raise OSError("pause busy")
+            return real_remove(path, *args, **kwargs)
+
+        with (
+            mock.patch("os.fdopen", failing_fdopen),
+            mock.patch("os.remove", flaky_remove),
+        ):
+            code, _, err, _ = self.run_start(start_args(), [0])
+        self.assertEqual(code, 4)
+        self.assertIn("disk full", err)
+        self.assertGreaterEqual(attempts["pause"], 2)
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+        self.assertFalse(os.path.exists(self.paths["pause_file"]))
+
+    def test_adoption_rewrite_failure_rolls_back_and_keeps_operator_pause(self):
+        from unittest import mock
+
+        from korapy import freeze
+
+        real_write = freeze.write_freeze
+        calls = {"count": 0}
+
+        def flaky(path, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise OSError("cannot rewrite the freeze")
+            result = real_write(path, **kwargs)
+            if not os.path.exists(self.paths["pause_file"]):
+                with open(self.paths["pause_file"], "w", encoding="utf-8") as handle:
+                    handle.write("operator break\n")
+            return result
+
+        with mock.patch.object(freeze, "write_freeze", flaky):
+            code, _, err, _ = self.run_start(start_args(), [0])
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(code, 4)
+        self.assertIn("cannot rewrite the freeze", err)
+        self.assertFalse(os.path.exists(self.paths["freeze_file"]))
+        with open(self.paths["pause_file"], encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "operator break\n")
+
     def test_start_refuses_a_bad_until_ref(self):
         code, _, err, sleeps = self.run_start(start_args(until=["bogus"]), [0])
         self.assertEqual(code, 4)

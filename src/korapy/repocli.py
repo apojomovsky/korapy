@@ -319,7 +319,7 @@ def cmd_repo(args: argparse.Namespace) -> int:
         return USAGE
     try:
         registered = projects.load_all()
-        mapping = drive.production_repo_map(registered)
+        mapping = drive.production_repo_maps(registered)
         project_shorts = {project.name: settings.repo_names(project.root) for project in registered}
         cfg = registry.config()
     except (settings.SettingsError, projects.ProjectsError, board.StoreError) as problem:
