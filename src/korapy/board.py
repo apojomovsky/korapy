@@ -319,22 +319,49 @@ def effective_priority(label_priority, extra):
     return label_priority or ""
 
 
+#: The milestone concepts in a reading's ``extra``: one milestone, so
+#: one fact in three keys. The due date and the closed flag describe
+#: the titled milestone, never the ticket on their own.
+_MILESTONE_KEYS = ("milestone", "milestone_due", "milestone_closed")
+
+
+def _cleared(value):
+    """Whether one carried value is the cleared encoding. Pure."""
+    return value is None or (isinstance(value, list) and not value)
+
+
 def merge_extra(stored, reading):
     """The stored board concepts plus one reading's carried keys.
 
     A reading overwrites only the concepts it carries: an absent key
     keeps the stored value, while the cleared encoding removes the key
     whatever the stored type (None or an empty list both clear, whether
-    the stored value is a scalar or a list). A reading that is not a
-    dict carries nothing. Pure."""
+    the stored value is a scalar or a list). One exception: the
+    milestone keys are one fact, so a reading that clears the title
+    (or carries a blank one) clears the whole milestone, due date and
+    closed flag included, even when it carries neither (or carries a
+    stale flag beside the cleared title), and a reading that names a
+    different milestone drops a stored due date or flag it does not
+    carry, because those keys describe the titled milestone and a
+    ticket that loses or changes its milestone must not keep the old
+    one's facts. A reading that is not a dict carries nothing. Pure."""
     merged = dict(stored)
     if not isinstance(reading, dict):
         return merged
     for key, value in reading.items():
-        if value is None or (isinstance(value, list) and not value):
+        if _cleared(value):
             merged.pop(key, None)
         else:
             merged[key] = value
+    if "milestone" in reading:
+        title = reading["milestone"]
+        if _cleared(title) or (isinstance(title, str) and not title.strip()):
+            for key in _MILESTONE_KEYS:
+                merged.pop(key, None)
+        elif title != stored.get("milestone"):
+            for key in _MILESTONE_KEYS[1:]:
+                if key not in reading:
+                    merged.pop(key, None)
     return merged
 
 
