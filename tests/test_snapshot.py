@@ -308,6 +308,7 @@ class FullDocument(unittest.TestCase):
                     "ready_to_merge": "unknown",
                     "research": "unknown",
                     "coordinator_handled": "unknown",
+                    "doctor_failing": "unknown",
                     "items": "unknown",
                 },
                 "plan": {
