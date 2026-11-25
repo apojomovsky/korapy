@@ -133,7 +133,7 @@ class BuilderKeyTest(RepoKeyCase):
 
     def test_entries_for_an_unmapped_name_keep_their_short_key(self):
         self.register_done(UNIT, at=OLD)
-        with mock.patch.object(drive, "production_repo_map", return_value={}):
+        with mock.patch.object(drive, "production_repo_maps", return_value={}):
             states, _, tickets, finished_for = self.builders()
         self.assertEqual(tickets, {UNIT: (SHORT, NUMBER)})
         self.assertEqual(finished_for, {(SHORT, NUMBER): (UNIT, "worker", "ok")})
@@ -145,7 +145,7 @@ class OneMapPerPassTest(RepoKeyCase):
         self.register_done(UNIT_R1, at=OLD)
         with mock.patch.object(
             drive,
-            "production_repo_map",
+            "production_repo_maps",
             side_effect=AssertionError("the pass must build the map once"),
         ):
             states, _, tickets = drive.production_stuck_inputs(
@@ -169,7 +169,7 @@ class OneMapPerPassTest(RepoKeyCase):
             mock.patch.object(drive.units, "list_units", return_value=list(listed)),
             mock.patch.object(
                 drive,
-                "production_repo_map",
+                "production_repo_maps",
                 side_effect=AssertionError("the pass must build the map once"),
             ),
         ):
@@ -207,7 +207,7 @@ class OneMapPerPassTest(RepoKeyCase):
             mock.patch.object(drive.launch, "admission_state", return_value=triples),
             mock.patch.object(
                 drive,
-                "production_repo_map",
+                "production_repo_maps",
                 side_effect=AssertionError("the pass must build the map once"),
             ),
         ):
@@ -222,7 +222,7 @@ class OneMapPerPassTest(RepoKeyCase):
             mock.patch.object(drive.launch, "admission_state", return_value=triples),
             mock.patch.object(
                 drive,
-                "production_repo_map",
+                "production_repo_maps",
                 side_effect=AssertionError("the pass must build the map once"),
             ),
         ):
@@ -262,7 +262,7 @@ class OneMapPerPassTest(RepoKeyCase):
             mock.patch.object(drive, "production_orphan_inputs", side_effect=fake_orphan),
             mock.patch.object(
                 drive,
-                "production_repo_map",
+                "production_repo_maps",
                 side_effect=AssertionError("the pass must build the map once"),
             ),
         ):
@@ -289,6 +289,112 @@ class OneMapPerPassTest(RepoKeyCase):
         self.assertEqual(code, 0, err.getvalue())
         self.assertEqual(seen.get("mapping"), {SHORT: TRACKER})
         self.assertIsNotNone(seen.get("registered"))
+
+
+OTHER = "other/app"
+GREEN_UNIT = "green-agent-app-416"
+GREEN_UNIT_R1 = "green-agent-app-416-r1"
+
+
+class SharedShortNameTest(RepoKeyCase):
+    """Two projects name `app` for different tracker repos: no collision."""
+
+    def setUp(self):
+        super().setUp()
+        self.other_root = os.path.join(self.tmp.name, "ops2")
+        os.makedirs(self.other_root)
+        with open(os.path.join(self.other_root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TOML.replace(TRACKER, OTHER))
+        self.both = list(self.registered) + [
+            projects_mod.Project(name="green", unit_prefix="green-agent-", root=self.other_root),
+        ]
+
+    def register_for(self, agent_id, project, *, at, done=False):
+        registry.register(
+            agent_id,
+            "muse",
+            ticket=registry.make_ticket(SHORT, NUMBER, project),
+            role="worker",
+            now=at,
+            path=self.regdir,
+        )
+        if done:
+            registry.done(agent_id, now=at + 1.0, path=self.regdir)
+
+    def test_per_project_maps_keep_each_projects_tracker(self):
+        self.assertEqual(
+            drive.production_repo_maps(self.both, git=dead_git),
+            {"blue": {SHORT: TRACKER}, "green": {SHORT: OTHER}},
+        )
+
+    def test_stuck_and_finished_keys_use_the_entry_project(self):
+        self.register_for(UNIT, "blue", at=OLD, done=True)
+        self.register_for(GREEN_UNIT, "green", at=OLD, done=True)
+        states, _, tickets = drive.production_stuck_inputs(
+            self.both, now=NOW, path=self.regdir, git=dead_git
+        )
+        self.assertEqual(tickets, {UNIT: (TRACKER, NUMBER), GREEN_UNIT: (OTHER, NUMBER)})
+        self.assertIn(UNIT, states)
+        finished = drive.production_finished_for(
+            self.both, now=NOW, cfg=self.cfg, path=self.regdir, git=dead_git
+        )
+        self.assertEqual(set(finished), {(TRACKER, NUMBER), (OTHER, NUMBER)})
+
+    def test_an_entry_without_a_project_never_takes_the_first_tracker(self):
+        registry.register(
+            UNIT,
+            "muse",
+            ticket=registry.make_ticket(SHORT, NUMBER),
+            role="worker",
+            now=NOW - 100.0,
+            path=self.regdir,
+        )
+        _, _, tickets = drive.production_stuck_inputs(
+            self.both, now=NOW, path=self.regdir, git=dead_git
+        )
+        self.assertEqual(tickets, {UNIT: (SHORT, NUMBER)})
+
+    def test_orphan_units_use_their_own_projects_tracker(self):
+        listed = {
+            "blue-agent-": [(UNIT_R1, "active", "running")],
+            "green-agent-": [(GREEN_UNIT_R1, "active", "running")],
+        }
+        with mock.patch.object(
+            drive.units, "list_units", side_effect=lambda prefix, run=None: list(listed[prefix])
+        ):
+            _present, live, _gone = drive.production_orphan_inputs(
+                self.both, now=NOW, path=self.regdir, git=dead_git
+            )
+        self.assertEqual(live, {(TRACKER, NUMBER), (OTHER, NUMBER)})
+
+    def test_the_admission_live_set_uses_each_triples_project(self):
+        triples = {("blue", SHORT, NUMBER), ("green", SHORT, NUMBER)}
+        with mock.patch.object(drive.launch, "admission_state", return_value=triples):
+            live = drive._default_live(self.both, git=dead_git)
+        self.assertEqual(live, {("blue", TRACKER, NUMBER), ("green", OTHER, NUMBER)})
+
+    def test_the_review_reader_sees_both_trackers_under_the_short_name(self):
+        seen = {}
+
+        def fake_reader(mapping, sessions_root=None):
+            seen["mapping"] = mapping
+            return lambda repo, number: None
+
+        with mock.patch.object(drive.reviewrecord, "store_reader", side_effect=fake_reader):
+            drive.production_review_reader(self.both, git=dead_git)
+        self.assertEqual(drive.reviewrecord.local_repo(TRACKER, seen["mapping"]), SHORT)
+        self.assertEqual(drive.reviewrecord.local_repo(OTHER, seen["mapping"]), SHORT)
+
+    def test_the_stuck_project_names_each_tracker_owner(self):
+        maps = drive.production_repo_maps(self.both, git=dead_git)
+        self.assertEqual(
+            drive.production_stuck_project(self.both, TRACKER, mapping=maps, git=dead_git),
+            "blue",
+        )
+        self.assertEqual(
+            drive.production_stuck_project(self.both, OTHER, mapping=maps, git=dead_git),
+            "green",
+        )
 
 
 class BrokenConfigTest(unittest.TestCase):
