@@ -1008,6 +1008,81 @@ class SessionPlanProofCase(unittest.TestCase):
         self.assertEqual(disk_mod.done_tickets(entries, NOW), {("acme", 8), ("acme", 9)})
 
 
+class SessionPlanRoleLeafCase(unittest.TestCase):
+    def test_role_leaves_under_a_ticket_root_are_safe_for_that_ticket(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {
+                "/sessions/acme-7": [
+                    leaf("/sessions/acme-7", "worker-1", mtime=NOW - 40 * DAY),
+                    leaf("/sessions/acme-7", "reviewer-1", mtime=NOW - 40 * DAY),
+                ]
+            },
+            entries=[finished_entry("acme", 7)],
+            live=set(),
+            roots={"acme-old": "/sessions/acme-7"},
+        )
+        self.assertEqual(
+            {(found.kind, found.path, found.safe) for found in candidates},
+            {
+                ("hygiene-session", "/sessions/acme-7/worker-1", True),
+                ("hygiene-session", "/sessions/acme-7/reviewer-1", True),
+            },
+        )
+
+    def test_role_leaf_with_an_open_entry_is_kept_for_its_ticket(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-7": [leaf("/sessions/acme-7", "worker-1", mtime=NOW - 40 * DAY)]},
+            entries=[live_entry("acme", 7)],
+            live=set(),
+            roots={"acme-old": "/sessions/acme-7"},
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "hygiene-session")
+        self.assertFalse(found.safe)
+        self.assertIn("still open", found.proof)
+
+    def test_role_leaf_with_a_live_unit_is_kept_for_its_ticket(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-7": [leaf("/sessions/acme-7", "worker-1", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("acme", 7)],
+            live={("acme", 7)},
+            roots={"acme-old": "/sessions/acme-7"},
+        )
+        (found,) = candidates
+        self.assertFalse(found.safe)
+        self.assertIn("live unit", found.proof)
+
+    def test_role_leaf_with_no_registry_entry_is_unproven_naming_its_ticket(self):
+        candidates, _notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/acme-7": [leaf("/sessions/acme-7", "worker-1", mtime=NOW - 40 * DAY)]},
+            entries=[],
+            live=set(),
+            roots={"acme-old": "/sessions/acme-7"},
+        )
+        (found,) = candidates
+        self.assertEqual(found.kind, "unproven")
+        self.assertFalse(found.safe)
+        self.assertIn("acme-7", found.proof)
+        self.assertIn("has no registry entry", found.proof)
+
+    def test_role_leaf_for_another_repo_is_skipped_with_a_note(self):
+        candidates, notes = session_plan(
+            {"acme-old": session_rule()},
+            {"/sessions/other-7": [leaf("/sessions/other-7", "worker-1", mtime=NOW - 40 * DAY)]},
+            entries=[finished_entry("other", 7)],
+            live=set(),
+            roots={"acme-old": "/sessions/other-7"},
+        )
+        self.assertEqual(candidates, ())
+        self.assertEqual(len(notes), 1)
+        self.assertIn("belongs to repo 'other'", notes[0])
+        self.assertIn("acme", notes[0])
+
+
 class SessionPlanScopeCase(unittest.TestCase):
     def test_other_repo_leaf_is_skipped_with_a_note(self):
         candidates, notes = session_plan(
