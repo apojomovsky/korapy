@@ -92,9 +92,9 @@ class SelectionTest(unittest.TestCase):
         )
         self.assertEqual(selected([row(7, agent="drive-x", labels=("blocked",))]), [])
 
-    def test_claimed_ticket_with_an_open_linked_pull_is_skipped(self):
+    def test_claimed_ticket_with_an_open_linked_pull_is_requested(self):
         pull = eligibility.LinkedPull(number=11, state="open")
-        self.assertEqual(selected([row(7, agent="drive-x", pulls=(pull,))]), [])
+        self.assertEqual(selected([row(7, agent="drive-x", pulls=(pull,))]), [("app", 7)])
 
     def test_hold_label_is_skipped(self):
         self.assertEqual(selected([row(7, labels=("hold",))]), [])
@@ -139,9 +139,9 @@ class SelectionTest(unittest.TestCase):
     def test_blocked_label_is_skipped(self):
         self.assertEqual(selected([row(7, labels=("blocked",))]), [])
 
-    def test_open_linked_pull_is_skipped(self):
+    def test_open_linked_pull_is_requested_for_the_gate_to_refuse(self):
         pull = eligibility.LinkedPull(number=11, state="open")
-        self.assertEqual(selected([row(7, pulls=(pull,))]), [])
+        self.assertEqual(selected([row(7, pulls=(pull,))]), [("app", 7)])
 
     def test_unreadable_linked_pulls_are_skipped_fail_closed(self):
         self.assertEqual(selected([row(7, pulls=None)]), [])

@@ -1237,7 +1237,8 @@ class LinkedPullAgreementTest(unittest.TestCase):
     """Policy and gate read the one tracker-sourced row pulls.
 
     A ticket with an open linked pull is startable by neither: the
-    policy selects nothing and the gate skips naming the pull.
+    policy requests it and the gate skips naming the pull, so the row
+    stays visible instead of reading as withdrawn.
     """
 
     def tracked_rows(self, state="open"):
@@ -1249,9 +1250,10 @@ class LinkedPullAgreementTest(unittest.TestCase):
         rows = eligibility.rows_from_items(items, pulls_by_key=found)
         return fake, rows
 
-    def test_an_open_linked_pull_is_not_startable_by_policy_or_gate(self):
+    def test_an_open_linked_pull_is_requested_but_not_startable(self):
         _, rows = self.tracked_rows()
-        self.assertEqual(policies.basic(rows, now=1000.0), [])
+        (request,) = policies.basic(rows, now=1000.0)
+        self.assertEqual((request.repo, request.number, request.kind), ("app", 7, "start"))
         gated = gate(entry(row_=rows[0]))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
@@ -1363,12 +1365,12 @@ class RealPullsChainTest(unittest.TestCase):
         _, _, _, rows = self.tracked_rows()
         self.assertEqual(rows["six"].pulls, ())
 
-    def test_policy_and_gate_withdraw_the_merged_ticket(self):
+    def test_only_the_merged_ticket_withdraws_the_open_one_is_requested(self):
         _, _, _, rows = self.tracked_rows()
         ordered = [rows["six"], rows["seven"], rows["eight"]]
         self.assertEqual(
             [(request.repo, request.number) for request in policies.basic(ordered, now=1000.0)],
-            [("app", 6)],
+            [("app", 6), ("app", 8)],
         )
         gated = gate(entry(number=7, row_=rows["seven"]))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
