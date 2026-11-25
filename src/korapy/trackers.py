@@ -146,7 +146,7 @@ class BoardBackedTracker(BoardTracker):
         rest_item, milestone = self._issues.read_issue(repo, number)
         by_field = {field.id: concept for concept, field in schema.fields.items()}
         board_time, texts, selects = self._node_item(by_field, node)
-        extra = self._concepts(selects, texts, milestone)
+        extra = self._concepts(selects, texts, milestone, body=rest_item.body, repo=repo)
         return rest_item._replace(
             updated_at=max(board_time, rest_item.updated_at),
             agent=texts.get("agent", ""),

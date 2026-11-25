@@ -165,8 +165,8 @@ def root_short_map(root, git):
     """`{short [[repo]] name: tracker repo}` for one ops root.
 
     The one shared single-root projection of `repo_operators`: both
-    the dispatch pass (`drive.production_repo_map`, across registered
-    roots) and the fail-soft `short_to_tracker` below build from here,
+    the dispatch pass (`drive.production_repo_maps`, per registered
+    root) and the fail-soft `short_to_tracker` below build from here,
     so the two builders cannot drift. A configuration problem raises
     `settings.SettingsError`, so strict callers refuse instead of
     joining against a guess.

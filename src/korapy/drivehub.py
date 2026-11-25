@@ -328,7 +328,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 resolved[project.root] = entries
             moment = time.time()
             try:
-                repo_map = drive.production_repo_map(registered, resolved=resolved)
+                repo_map = drive.production_repo_maps(registered, resolved=resolved)
                 planned_states, _, planned_tickets = drive.production_stuck_inputs(
                     registered, now=moment, mapping=repo_map
                 )
@@ -420,7 +420,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
         }
         moment = time.time()
         try:
-            repo_map = drive.production_repo_map(registered, resolved=resolved)
+            repo_map = drive.production_repo_maps(registered, resolved=resolved)
             stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
                 registered, now=moment, mapping=repo_map
             )

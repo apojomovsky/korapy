@@ -1161,6 +1161,48 @@ def body_linked_issue_refs(
     return pairs + [p for p in refs_issue_refs(body, default_repo) if p not in pairs]
 
 
+#: Lines of an issue body that declare dependencies: any line
+#: containing "depends on", case-insensitive.
+_DEPENDS_LINE_RE = re.compile(r"^.*\bdepends on\b.*$", re.IGNORECASE | re.MULTILINE)
+
+#: A dependency ref on a `Depends on` line: a bare `#N` or a qualified
+#: `repo#N` / `owner/repo#N`, as written. The lookbehind keeps the tail
+#: of a word from reading as a ref; a qualified match consumes its
+#: qualifier, so its `#N` tail never double-counts as a bare ref.
+_DEPENDS_REF_RE = re.compile(r"(?<![\w/])([\w.-]+(?:/[\w.-]+)?#\d+|#\d+)\b")
+
+
+def depends_on(body: str | None) -> tuple[str, ...]:
+    """Refs named on `Depends on` lines, first-seen order. Pure.
+
+    Only lines containing "depends on" (case-insensitive) contribute:
+    bare `#N` refs plus qualified `repo#N` and `owner/repo#N` refs,
+    each as written. A qualified ref stays qualified so the gate fails
+    closed on another repository; `depends_blocked_by` resolves the
+    bare ones against the tracker's own repo. Duplicates collapse to
+    their first appearance; a missing or empty body reads as no
+    dependencies.
+    """
+    found = [
+        match
+        for line in _DEPENDS_LINE_RE.findall(body or "")
+        for match in _DEPENDS_REF_RE.findall(line)
+    ]
+    return tuple(dict.fromkeys(found))
+
+
+def depends_blocked_by(repo: str, body: str | None) -> list[str]:
+    """`Depends on` refs as blocked-by entries. Pure.
+
+    The one qualifier both tracker modes share: bare `#N` refs from
+    `depends_on` resolve against the tracker's own repo, so the gate
+    reads them in the same `owner/repo#N` shape the board column uses.
+    Qualified refs ride through as written, and the gate fails closed
+    on any naming another repository.
+    """
+    return [ref if not ref.startswith("#") else f"{repo}#{ref[1:]}" for ref in depends_on(body)]
+
+
 def is_merged_pull(payload) -> bool:
     """Whether a pull-request payload reports a merged pull.
 

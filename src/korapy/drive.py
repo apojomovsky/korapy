@@ -551,6 +551,44 @@ def area_refusal(candidate, holders, *, prefix, hold_until_merged=True, fail_ope
     return None
 
 
+def blocked_refusal(row, states=None) -> str | None:
+    """The blocked-by skip reason for a candidate's row, else None. Pure.
+
+    `row` is the candidate's row and `states` maps `(repo, number)` to
+    the stored ticket state; a missing map reads every ref as
+    unresolvable, failing closed. A same-repo ref blocks while its
+    ticket is anything but closed (an unknown ticket reads as not
+    found, also blocking, so a dependency the sync never stored never
+    starts); a ref to another repository blocks whatever that ticket
+    says, named in full; an unparseable entry blocks naming its text.
+    The reason names the ticket and the blocker, so the `--plan`
+    table, the journal and the dashboard read the same words.
+    """
+    extra = row.extra if isinstance(row.extra, dict) else {}
+    refs = extra.get("blocked_by")
+    if not refs:
+        return None
+    ref = f"{row.repo}#{row.number}"
+    if isinstance(refs, str):
+        return f"{ref}: blocked by {refs}, start refused"
+    if not isinstance(refs, (list, tuple)):
+        return f"{ref}: blocked by {refs!r}, start refused"
+    for entry in refs:
+        if not isinstance(entry, str):
+            return f"{ref}: blocked by {entry!r}, start refused"
+        name, sep, number = entry.rpartition("#")
+        if not sep or not name or not number.isdigit():
+            return f"{ref}: blocked by {entry}, start refused"
+        if name != row.repo:
+            return f"{ref}: blocked by {entry} (another repository), start refused"
+        state = (states or {}).get((name, int(number)))
+        if state == "closed":
+            continue
+        detail = state if isinstance(state, str) and state else "not found"
+        return f"{ref}: blocked by #{number} ({detail}), start refused"
+    return None
+
+
 def gate(
     candidate,
     *,
@@ -571,6 +609,7 @@ def gate(
     area_prefix="",
     area_hold_until_merged=True,
     area_fail_open=False,
+    blocked_states=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -578,7 +617,10 @@ def gate(
     a merged linked pull for every kind before external ownership,
     then external, withdrawn: the merged branch only fires on rows the
     pass listed pulls for, so an external row the listing skipped logs
-    externally owned, never merged), then claim
+    externally owned, never merged), then the dependency block (a
+    stored `blocked_by` ref to an open same-repo ticket, or to another
+    repository or an unresolvable ref, skips with code `blocked`,
+    naming the blocker; closed same-repo tickets release it), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
     role, outcome)} for the newest finished entry per ticket), then the
@@ -672,6 +714,9 @@ def gate(
         )
     if row.external:
         return _skip(candidate, request.kind, "row", f"{ref}: externally owned, skipped")
+    refused = blocked_refusal(row, blocked_states)
+    if refused is not None:
+        return _skip(candidate, request.kind, "blocked", refused)
     if request.kind == "review" and iface.RESEARCH in (row.labels or ()):
         return _skip(
             candidate,
@@ -1513,14 +1558,17 @@ def _default_live(registered, *, mapping=None, git=None):
 
     Repos are store keys through the one short-to-tracker resolver, so
     the admission repo cap counts the same repo the gate request
-    names. A short name no entry maps keeps itself, exactly as before.
-    `mapping` is the pass's one short-to-tracker map; with none, this
+    names. Each triple resolves under its own project, so two projects
+    naming the same short name count their own tracker repos. A short
+    name no entry maps keeps itself, exactly as before.
+    `mapping` is the pass's one per-project short-to-tracker map (a
+    flat map reads as the project-less fallback); with none, this
     reads its own from the project roots through `git` (the origin
     seam, defaulting to the real runner).
     """
-    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
+    mapping = _resolved_maps(registered, mapping, syncli._git if git is None else git)
     return {
-        (project, *_tracker_key((repo, number), mapping))
+        (project, *_project_tracker_key(project, (repo, number), mapping))
         for project, repo, number in launch.admission_state(
             registered, units.list_units, registry.config(), ""
         )
@@ -1733,15 +1781,18 @@ def production_review_reader(registered, *, git, mapping=None):
 
     Returns the reader that finds each row's record under its short
     session dir, so the loop sees what the reviewer wrote. `mapping`
-    is the pass's one short-to-tracker map (`production_repo_map`):
-    every builder in one pass gets the same one, so a config edit
-    between them cannot make two joins disagree; with none, the
-    builder resolves its own. Raises SettingsError for bad registry
+    is the pass's one per-project short-to-tracker map
+    (`production_repo_maps`): every builder in one pass gets the same
+    one, so a config edit between them cannot make two joins disagree;
+    with none, the builder resolves its own. The reader itself is fed
+    `(short, tracker)` pairs, so a tracker repo from a project whose
+    short name another project also names still finds its record
+    under that short name. Raises SettingsError for bad registry
     or project settings, like the sibling production builders: the
     pass refuses instead of gating blind.
     """
-    mapping = _resolved_map(registered, mapping, git)
-    return reviewrecord.store_reader(mapping)
+    mapping = _resolved_maps(registered, mapping, git)
+    return reviewrecord.store_reader(_local_pairs(mapping))
 
 
 def _review_missing(holder, newest, reviews, key) -> bool:
@@ -2199,7 +2250,11 @@ def pulls_check_needed(row, *, hold_label) -> bool:
     labels = tuple(row.labels or ())
     if hold.labels_held(labels, hold_label):
         return False
-    if iface.NEEDS_DECISION in labels or "needs-triage" in labels:
+    if (
+        iface.NEEDS_DECISION in labels
+        or iface.NEEDS_TRIAGE in labels
+        or iface.NEEDS_HARDWARE in labels
+    ):
         return False
     holder = row.agent or ""
     if not holder:
@@ -2514,8 +2569,8 @@ def _read_inputs(
     (None, exit code) when the pass cannot proceed. A project whose
     policy or quota settings fail is not fatal here; that surfaces per
     project in `_gate_all`. `repo_map` is the pass's one
-    short-to-tracker map for the admission live set; with none, the
-    live set resolves its own.
+    per-project short-to-tracker map for the admission live set; with
+    none, the live set resolves its own.
     """
     try:
         items = store.items()
@@ -2728,7 +2783,10 @@ def _gate_all(
     None reads every row as unclaimed) scopes the merged-pull check to
     merges newer than the claim start, and bounds the closed-pull
     listing to the same cutoff, so every merge the scope could fire
-    on is listed. `pulls_max_calls` (None reads
+    on is listed. The dependency block resolves every stored
+    `blocked_by` ref against the same rows the gate reads, so a
+    blocked ticket skips with its blocker named and `--plan` shows
+    why with no tracker contact. `pulls_max_calls` (None reads
     the `drive.pulls_max_calls` host setting) caps the listing calls
     for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
@@ -2932,6 +2990,7 @@ def _gate_all(
     def floor_of(name):
         return admission.bounds(limits.projects.get(name))[0]
 
+    blocked_states = {key: crow.state for key, crow in by_key.items()}
     stop_starts = False
     gated_rows = []
     for candidate in order(candidates, milestone_first=milestone_projects):
@@ -2981,6 +3040,7 @@ def _gate_all(
             area_prefix=area_prefix,
             area_hold_until_merged=area_hold_until_merged,
             area_fail_open=area_fail_open,
+            blocked_states=blocked_states,
         )
         if suffix:
             verdict = replace(verdict, reason=verdict.reason + suffix)
@@ -3035,7 +3095,7 @@ def _pass(
     a live unit's row gates as still claimed here too; without it every
     finished reviewer row simulates as released. The production CLI
     supplies the host units. `repo_map` is the pass's one
-    short-to-tracker map, threaded to the admission live set.
+    per-project short-to-tracker map, threaded to the admission live set.
     `review_reader` feeds the gate's fix-round threshold from the
     session dirs (reads only, like the registry); with none the
     threshold sees no records, exactly as before. Only rows in a
@@ -4079,15 +4139,18 @@ def production_finished_for(
     `cfg` and `path` are the registry seams tests inject; production
     reads the host registry. `git` names the origin-lookup seam for
     entries without an explicit tracker repo. `mapping` is the pass's
-    one short-to-tracker map (`production_repo_map`): every builder in
-    one pass gets the same one, so a config edit between them cannot
-    make two joins disagree; with none, the builder resolves its own.
-    The role is `""` for entries that record none; the gate treats
-    only a known reviewer role as reviewed. The outcome is the `done`
-    outcome (`ok`, `failed` or `stopped`, `None` when the entry never
-    recorded one); the missing-record check fires only on `ok`.
+    one per-project short-to-tracker map (`production_repo_maps`):
+    every builder in one pass gets the same one, so a config edit
+    between them cannot make two joins disagree; with none, the
+    builder resolves its own. Each entry keys under the project its
+    ticket names, so two projects sharing a short name keep their own
+    tracker repos. The role is `""` for entries that record none; the
+    gate treats only a known reviewer role as reviewed. The outcome
+    is the `done` outcome (`ok`, `failed` or `stopped`, `None` when
+    the entry never recorded one); the missing-record check fires
+    only on `ok`.
     """
-    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
+    mapping = _resolved_maps(registered, mapping, syncli._git if git is None else git)
     found: dict = {}
     for entry, state in registry.visible(now, cfg, path):
         if state != registry.FINISHED:
@@ -4095,7 +4158,7 @@ def production_finished_for(
         ticket = registry.ticket_of(entry)
         if ticket is None:
             continue
-        key = _tracker_key(ticket, mapping)
+        key = _project_tracker_key(_entry_project(entry), ticket, mapping)
         at = entry.get("ended_at") or entry.get("last_seen") or 0
         prior = found.get(key)
         if prior is not None and prior[3] >= at:
@@ -4493,36 +4556,57 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
 
 
-def production_repo_map(registered, *, git=None, resolved=None):
-    """`{short [[repo]] name: tracker repo}` across registered roots.
+def production_repo_maps(registered, *, git=None, resolved=None):
+    """`{project name: {short [[repo]] name: tracker repo}}` over the roots.
 
     The one resolver for the tracker repo behind a registry entry's
     short ticket repo: each root resolves through the shared
-    `syncli.root_short_map`, and the first project naming a short
-    name wins.
+    `syncli.root_short_map`, and each project keeps its own entries,
+    so two projects naming the same short name for different tracker
+    repos never collapse onto the first project's repo.
     A configuration problem raises SettingsError, so the pass refuses
     with exit 4 instead of joining against a guess. `resolved` maps
     each registered root to its already-resolved `{name: (tracker
     repo, operators)}` entries: with it the pass shares its one
-    resolution instead of resolving again (every root in `registered`
-    must have an entry); with none, the builder resolves its own. The
-    CLI builds it once per pass and threads it into the admission live
-    set, the stuck, finished and orphan builders and `run_pass`, so a
-    `korapy.toml` edit between two of them cannot make two joins
-    disagree, and each repo lacking an explicit `tracker.repo` shells
-    git once per pass. `git` names the origin-lookup seam; None is the
-    real runner. A builder given no map builds its own, which is the
-    seam tests fake.
+    resolution instead of resolving again (a root with no entry is a
+    SettingsError, never a silent empty map); with none, the builder
+    resolves its own. The CLI builds it once per pass and threads it
+    into the admission live set, the stuck, finished and orphan
+    builders and `run_pass`, so a `korapy.toml` edit between two of
+    them cannot make two joins disagree, and each repo lacking an
+    explicit `tracker.repo` shells git once per pass. `git` names
+    the origin-lookup seam; None is the real runner. A builder given
+    no map builds its own, which is the seam tests fake.
     """
     git = syncli._git if git is None else git
-    found = {}
+    maps = {}
     for project in registered:
         if resolved is None:
             shorts = syncli.root_short_map(project.root, git)
         else:
-            shorts = {
-                name: tracker_repo for name, (tracker_repo, _ops) in resolved[project.root].items()
-            }
+            try:
+                entries = resolved[project.root]
+            except KeyError:
+                raise settings.SettingsError(
+                    f"{project.root}: no resolved [[repo]] entries for this root"
+                ) from None
+            shorts = {name: tracker_repo for name, (tracker_repo, _ops) in entries.items()}
+        maps[project.name] = shorts
+    return maps
+
+
+def production_repo_map(registered, *, git=None, resolved=None):
+    """`{short [[repo]] name: tracker repo}` across registered roots.
+
+    The project-less projection of `production_repo_maps` for callers
+    with no project to join on: the first project naming a short name
+    wins there, by design. Drive's and the rename verb's joins never
+    read this projection: they take the per-project maps, so a shared
+    short name cannot key one project's ticket under another
+    project's tracker repo.
+    """
+    found = {}
+    for shorts in production_repo_maps(registered, git=git, resolved=resolved).values():
         for name, tracker_repo in shorts.items():
             found.setdefault(name, tracker_repo)
     return found
@@ -4561,11 +4645,20 @@ def driven_repos(project, *, resolved=None, git=None):
     return frozenset(syncli.root_short_map(project.root, runner).values())
 
 
-def _resolved_map(registered, mapping, git):
-    """The pass's map when given, else one built from `git`. The test seam."""
+def _resolved_maps(registered, mapping, git):
+    """The pass's maps when given, else ones built from `git`. The test seam."""
     if mapping is not None:
         return mapping
-    return production_repo_map(registered, git=git)
+    return production_repo_maps(registered, git=git)
+
+
+def _is_project_maps(mapping) -> bool:
+    """Whether `mapping` is `{project: {short: tracker}}`, not a flat map."""
+    return (
+        isinstance(mapping, Mapping)
+        and bool(mapping)
+        and all(isinstance(value, Mapping) for value in mapping.values())
+    )
 
 
 def _tracker_key(ticket, mapping):
@@ -4581,6 +4674,57 @@ def _tracker_key(ticket, mapping):
     return (mapping.get(repo, repo), number)
 
 
+def _project_tracker_key(project, ticket, mapping):
+    """The store key for `ticket` under `project`'s own short map. Pure.
+
+    `mapping` is the pass's per-project maps
+    (`production_repo_maps`); a flat `{short: tracker}` map reads as
+    the project-less fallback for callers that have no project. A
+    ticket whose project the maps know takes that project's tracker
+    repo, so two projects naming the same short name never key under
+    each other's repo. A ticket with no project (or an unregistered
+    one) takes the tracker only when every project naming the short
+    agrees on it; an ambiguous short keeps itself, so it never
+    matches a store row under a guessed repo. An unknown short name
+    keeps itself, exactly as in `_tracker_key`.
+    """
+    if _is_project_maps(mapping):
+        if project and project in mapping:
+            return _tracker_key(ticket, mapping[project])
+        repo, _number = ticket
+        trackers = {shorts[repo] for shorts in mapping.values() if repo in shorts}
+        if len(trackers) == 1:
+            return _tracker_key(ticket, {repo: trackers.pop()})
+        return _tracker_key(ticket, {})
+    if isinstance(mapping, Mapping):
+        return _tracker_key(ticket, mapping)
+    return _tracker_key(ticket, dict(mapping or ()))
+
+
+def _entry_project(entry):
+    """The project a registry entry's ticket names, or None. Pure."""
+    ticket = entry.get("ticket") if isinstance(entry, Mapping) else None
+    if isinstance(ticket, Mapping):
+        return ticket.get("project") or None
+    return None
+
+
+def _local_pairs(mapping):
+    """`(short, tracker)` pairs over a flat or per-project mapping. Pure.
+
+    Pairs keep both tracker repos when two projects name the same
+    short, which a flat map keyed by the short name cannot hold; the
+    review-record spelling reads them through `local_repo`.
+    """
+    if _is_project_maps(mapping):
+        return [
+            (short, tracker) for shorts in mapping.values() for short, tracker in shorts.items()
+        ]
+    if isinstance(mapping, Mapping):
+        return list(mapping.items())
+    return [(short, tracker) for short, tracker in (mapping or ())]
+
+
 def production_stuck_inputs(registered, *, now, path=None, git=None, mapping=None):
     """`(agent_states, stale_s, agent_tickets)` from the registry for the stuck sweep.
 
@@ -4594,11 +4738,14 @@ def production_stuck_inputs(registered, *, now, path=None, git=None, mapping=Non
     tests inject; production reads the host registry. `git` names the
     origin-lookup seam for entries without an explicit tracker repo;
     tests pass a fake, production the real runner. `mapping` is the
-    pass's one short-to-tracker map; with none, the builder resolves
-    its own. Raises SettingsError for bad registry or project settings.
+    pass's one per-project short-to-tracker map; with none, the
+    builder resolves its own. Each entry keys under the project its
+    ticket names, so two projects sharing a short name keep their own
+    tracker repos. Raises SettingsError for bad registry or project
+    settings.
     """
     cfg = registry.config()
-    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
+    mapping = _resolved_maps(registered, mapping, syncli._git if git is None else git)
     states = {}
     tickets = {}
     for entry, state in registry.visible(now, cfg, path):
@@ -4606,7 +4753,7 @@ def production_stuck_inputs(registered, *, now, path=None, git=None, mapping=Non
         states[entry["id"]] = (state, float(last))
         ticket = registry.ticket_of(entry)
         if ticket is not None:
-            tickets[entry["id"]] = _tracker_key(ticket, mapping)
+            tickets[entry["id"]] = _project_tracker_key(_entry_project(entry), ticket, mapping)
     return states, cfg["stale_s"], tickets
 
 
@@ -4639,16 +4786,17 @@ def production_stuck_project(registered, repo, *, mapping=None, git=None):
     spelling. A key the map cannot translate falls back to the
     per-root scan, so a tracker repo shadowed out of the pass map by
     an earlier project sharing its short name still stops under its
-    unambiguous owner. `mapping` is the pass's one short-to-tracker
-    map; with none, the builder resolves its own. `git` names the
-    origin-lookup seam for entries without an explicit tracker repo;
-    None is the real runner. Pure settings reads, no subprocess when
-    every entry names its tracker repo explicitly.
+    unambiguous owner. `mapping` is the pass's one per-project
+    short-to-tracker map; with none, the builder resolves its own.
+    `git` names the origin-lookup seam for entries without an
+    explicit tracker repo; None is the real runner. Pure settings
+    reads, no subprocess when every entry names its tracker repo
+    explicitly.
     """
     runner = syncli._git if git is None else git
-    mapping = _resolved_map(registered, mapping, runner)
+    mapping = _resolved_maps(registered, mapping, runner)
     try:
-        short = reviewrecord.local_repo(repo, mapping)
+        short = reviewrecord.local_repo(repo, _local_pairs(mapping))
     except ValueError:
         for project in registered:
             try:
@@ -4673,8 +4821,9 @@ def production_stopper(registered, *, mapping=None, git=None):
     Resolves the owning project per ticket over the pass map, then
     stops the ticket's logged live units. Every argument the stop path
     needs is fixed here; tests inject a fake instead. `mapping` is the
-    pass's one short-to-tracker map; with none, each stop resolves its
-    own. `git` names the origin-lookup seam; None is the real runner.
+    pass's one per-project short-to-tracker map; with none, each stop
+    resolves its own. `git` names the origin-lookup seam; None is the
+    real runner.
     """
     runner = syncli._git if git is None else git
     listings = lambda prefix: units.list_units(prefix, run=units.default_run)
@@ -5743,23 +5892,26 @@ def production_orphan_inputs(registered, *, now, path=None, git=None, mapping=No
     of the same name, the single resolver for it. `path` is the
     registry dir seam tests inject; `git` names the origin-lookup
     seam for entries without an explicit tracker repo. `mapping` is
-    the pass's one short-to-tracker map; with none, the builder
-    resolves its own. Raises the settings error when the registry or
+    the pass's one per-project short-to-tracker map; with none, the
+    builder resolves its own. Each project's units key under that
+    project, so two projects sharing a short name keep their own
+    tracker repos. Raises the settings error when the registry or
     project settings are bad, and `units.Unreachable` when a unit
     listing fails.
     """
     cfg = registry.config()
-    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
+    mapping = _resolved_maps(registered, mapping, syncli._git if git is None else git)
     present = {
         entry["id"]
         for entry, state in registry.visible(now, cfg, path)
         if state in (registry.LIVE, registry.STALE)
     }
-    tickets = set()
+    live = set()
     for project in registered:
         listed = units.list_units(project.unit_prefix, run=units.default_run)
-        tickets |= units.live_tickets(project.unit_prefix, listed)
-    return present, {_tracker_key(ticket, mapping) for ticket in tickets}, cfg["gone_s"]
+        for ticket in units.live_tickets(project.unit_prefix, listed):
+            live.add(_project_tracker_key(project.name, ticket, mapping))
+    return present, live, cfg["gone_s"]
 
 
 def _reviewer_prompt(root, tgt, number, title, author):
@@ -6191,8 +6343,8 @@ def _launching_pass(
     single-host, zero hub calls. A facade with an empty host id is
     refused with the usage error (exit 4): a host that cannot name
     itself must never reconcile. `repo_map` is the pass's one
-    short-to-tracker map, threaded to the admission live set and to
-    orphan recovery. `driven` ({project name: tracker repos it
+    per-project short-to-tracker map, threaded to the admission live
+    set and to orphan recovery. `driven` ({project name: tracker repos it
     drives}, through the one `driven_repos` resolver; required, and
     an empty mapping drives nothing) keeps candidate selection, the
     claim path and the stuck sweep on each project's own
@@ -6946,9 +7098,10 @@ def run_pass(
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
-    short-to-tracker map ({short [[repo]] name: tracker repo}), built
-    by `production_repo_map` once per production pass; with none, the
-    readers that need it resolve their own. `driven` ({project name:
+    per-project short-to-tracker map ({project name: {short [[repo]]
+    name: tracker repo}}), built by `production_repo_maps` once per
+    production pass; with none, the readers that need it resolve
+    their own. `driven` ({project name:
     tracker repos it drives}, through the one `driven_repos`
     resolver; required, and an empty mapping drives nothing) keeps
     candidate selection, the claim path and the stuck sweep on each
