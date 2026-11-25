@@ -124,9 +124,8 @@ class DetailDiscipline(unittest.TestCase):
     def test_detail_entry_points_exist(self):
         api = web_text("api.js")
         for name in (
-            "export const TAIL_POLL_MS = 3000;",
-            "export async function fetchText(",
-            "export function loadTail(",
+            "export const PEEK_POLL_MS = 3000;",
+            "export function loadPeek(",
             "export function hasTicket(",
             "export function agentKey(",
             "export function detailHash(",
@@ -137,27 +136,27 @@ class DetailDiscipline(unittest.TestCase):
         for name in (
             "export function renderDetail(",
             "export function renderDetailMissing(",
-            "export function renderTail(",
-            "export function renderTailMissing(",
-            "export function renderTailFailed(",
-            "export function renderTailLoading(",
-            "export function renderTailButtons(",
+            "export function renderPeek(",
+            "export function renderPeekMissing(",
+            "export function renderPeekFailed(",
+            "export function renderPeekLoading(",
+            "export function renderPeekButtons(",
         ):
             self.assertIn(name, views)
         app = web_text("app.js")
         for name in (
-            "TAIL_POLL_MS",
-            "loadTail(",
+            "PEEK_POLL_MS",
+            "loadPeek(",
             "resolveAgent(",
             "hasTicket(",
             "renderDetail(",
             "renderDetailMissing(",
-            "renderTail(",
+            "renderPeek(",
         ):
             self.assertIn(name, app)
 
-    def test_tail_renders_as_a_single_text_node(self):
-        body = js_body(web_text("views.js"), "export function renderTail(")
+    def test_peek_renders_as_a_single_text_node(self):
+        body = js_body(web_text("views.js"), "export function renderPeek(")
         self.assertIn('getElementById("tail")', body)
         self.assertIn(".textContent =", body)
         self.assertNotIn("appendChild", body)
@@ -166,20 +165,20 @@ class DetailDiscipline(unittest.TestCase):
         self.assertEqual(html.count("<pre"), 1)
         self.assertIn('id="tail"', html)
 
-    def test_tail_404_says_nothing_to_show(self):
+    def test_peek_miss_says_not_available(self):
         views = web_text("views.js")
-        missing = js_body(views, "export function renderTailMissing(")
-        self.assertIn('"nothing to show"', missing)
+        missing = js_body(views, "export function renderPeekMissing(")
+        self.assertIn('"not available"', missing)
         app = web_text("app.js")
         self.assertIn("status === 404", app)
-        self.assertIn("renderTailMissing(", app)
+        self.assertIn("renderPeekMissing(", app)
 
-    def test_tail_fetch_maps_network_failure_to_the_failure_branch(self):
-        body = js_body(web_text("api.js"), "export async function fetchText(")
-        self.assertIn("return { status: 0, text: null };", body)
+    def test_peek_fetch_maps_network_failure_to_the_failure_branch(self):
+        body = js_body(web_text("api.js"), "export async function fetchJson(")
+        self.assertIn("return { status: 0, data: null }", body)
 
-    def test_ticketless_agents_state_no_ticket_no_tail(self):
-        self.assertIn('"no ticket, no tail"', web_text("views.js"))
+    def test_ticketless_agents_state_no_ticket_no_peek(self):
+        self.assertIn('"no ticket, no peek"', web_text("views.js"))
 
     def test_gone_agents_are_stated_never_guessed(self):
         views = web_text("views.js")
@@ -222,22 +221,22 @@ class DetailDiscipline(unittest.TestCase):
             self.assertIn(label, body)
 
     def test_detail_buttons_name_both_states(self):
-        body = js_body(web_text("views.js"), "export function renderTailButtons(")
-        for label in ('"tail: pause"', '"tail: resume"', '"follow: on"', '"follow: off"'):
+        body = js_body(web_text("views.js"), "export function renderPeekButtons(")
+        for label in ('"peek: pause"', '"peek: resume"', '"follow: on"', '"follow: off"'):
             self.assertIn(label, body)
 
-    def test_every_tail_await_sits_inside_a_try(self):
+    def test_every_peek_await_sits_inside_a_try(self):
         app = web_text("app.js")
-        sites = list(re.finditer(r"await\s+loadTail\s*\(", app))
+        sites = list(re.finditer(r"await\s+loadPeek\s*\(", app))
         self.assertTrue(sites)
         for site in sites:
             start = site.start()
             self.assertGreater(app.rfind("try {", 0, start), app.rfind("catch", 0, start))
 
-    def test_tail_schedule_uses_shared_delays(self):
+    def test_peek_schedule_uses_shared_delays(self):
         app = web_text("app.js")
-        self.assertIn("TAIL_POLL_MS", app)
-        self.assertIn("nextDelay(tailFailures)", app)
+        self.assertIn("PEEK_POLL_MS", app)
+        self.assertIn("nextDelay(peekFailures)", app)
 
     def test_stopped_state_clears_the_detail(self):
         body = js_body(web_text("views.js"), "export function renderStopped(")
@@ -274,19 +273,19 @@ class DetailHashGrammarAgreement(unittest.TestCase):
         self.assertEqual(self.detail_keys(), self.parsed_keys())
 
 
-class TailResumeRearmsTail(unittest.TestCase):
-    """Item 3: resuming from pause re-arms the tail poll itself."""
+class PeekResumeRearmsPeek(unittest.TestCase):
+    """Item 3: resuming from pause re-arms the peek poll itself."""
 
-    def test_resume_calls_tick_tail(self):
+    def test_resume_calls_tick_peek(self):
         app = web_text("app.js")
-        at = app.find("function bindTailButtons(")
+        at = app.find("function bindPeekButtons(")
         self.assertGreater(at, -1)
         end = app.find("\n}\n", at)
         body = app[at:end]
-        resume_at = body.find("renderTailPaused(false)")
+        resume_at = body.find("renderPeekPaused(false)")
         self.assertGreater(resume_at, -1)
         window = body[resume_at : resume_at + 400]
-        self.assertIn("tickTail(", window)
+        self.assertIn("tickPeek(", window)
 
 
 if __name__ == "__main__":

@@ -1098,7 +1098,7 @@ class CmdDriveTest(unittest.TestCase):
 class CmdDriveMapFailureTest(unittest.TestCase):
     """A broken project config at map-build time refuses the pass.
 
-    `production_repo_map` raising `SettingsError` through `cmd_drive`
+    `production_repo_maps` raising `SettingsError` through `cmd_drive`
     exits 4 in both the plan and the claiming path, naming the
     problem, instead of joining the pass against a guessed map.
     """
@@ -1118,7 +1118,7 @@ class CmdDriveMapFailureTest(unittest.TestCase):
             mock.patch.object(drive.projects, "load_all", return_value=[]),
             mock.patch.object(
                 drive,
-                "production_repo_map",
+                "production_repo_maps",
                 side_effect=settings.SettingsError("test config names no tracker repo"),
             ),
             mock.patch.object(drive.sys, "stdout", self.out),
@@ -1281,7 +1281,7 @@ class HoldLabelWiringTest(unittest.TestCase):
                 mock.patch.object(drive.settings, "load", return_value=host_settings) as loaded,
                 mock.patch.object(drive.projects, "load_all", return_value=[]),
                 mock.patch.object(
-                    drive, "production_repo_map", return_value={"app": "acme/app"}
+                    drive, "production_repo_maps", return_value={"blue": {"app": "acme/app"}}
                 ) as built_map,
                 mock.patch.object(drive, "production_stuck_inputs", built["stuck"]),
                 mock.patch.object(drive, "production_finished_for", built["finished"]),
@@ -1328,10 +1328,12 @@ class HoldLabelWiringTest(unittest.TestCase):
     def test_a_plan_builds_one_repo_map_and_threads_it_to_every_builder(self):
         code, seen, _, _, built, built_map = self.passing_cmd(plan=True)
         self.assertEqual(code, 0)
-        self.assertEqual(seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(seen.get("repo_map"), {"blue": {"app": "acme/app"}})
         self.assertEqual(built_map.call_count, 1)
         for name in ("stuck", "finished", "orphan"):
-            self.assertEqual(built[name].call_args.kwargs.get("mapping"), {"app": "acme/app"}, name)
+            self.assertEqual(
+                built[name].call_args.kwargs.get("mapping"), {"blue": {"app": "acme/app"}}, name
+            )
 
     def test_the_plan_pass_reads_the_same_projects_the_map_was_built_from(self):
         code, seen, _, _, _, _ = self.passing_cmd(plan=True)
@@ -1341,7 +1343,7 @@ class HoldLabelWiringTest(unittest.TestCase):
     def test_a_claiming_pass_threads_the_same_map_into_the_pass(self):
         code, seen, _, _, _, built_map = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
-        self.assertEqual(seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(seen.get("repo_map"), {"blue": {"app": "acme/app"}})
         self.assertEqual(built_map.call_count, 1)
 
     def test_a_claiming_pass_reads_the_same_projects_the_map_was_built_from(self):
@@ -1411,13 +1413,14 @@ class ClaimingPassResolvesOnceTest(unittest.TestCase):
             code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
         self.assertEqual(code, 0)
         self.assertEqual(calls, [self.root])
-        self.assertEqual(self.seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(self.seen.get("repo_map"), {"blue": {"app": "acme/app"}})
         self.assertEqual(self.seen.get("operators"), {"acme/app": ["acme"]})
         factory = self.seen.get("tracker_factory")
         self.assertIsNotNone(factory)
         assert factory is not None
-        for repo in self.seen["repo_map"].values():
-            self.assertIsNotNone(factory(repo))
+        for shorts in self.seen["repo_map"].values():
+            for repo in shorts.values():
+                self.assertIsNotNone(factory(repo))
 
 
 class DriveSyncExitTest(unittest.TestCase):

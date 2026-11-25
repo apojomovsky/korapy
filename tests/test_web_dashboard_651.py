@@ -89,11 +89,12 @@ class AttentionBand(unittest.TestCase):
     def test_empty_state_still_says_nothing_needs_you(self):
         self.assertIn("nothing needs you", web_text("views.js"))
 
-    def test_no_doctor_row_without_a_reader(self):
+    def test_doctor_row_rides_the_recorded_reader(self):
+        # Ticket 669 adds the reader; the row now traces to it.
         views = web_text("views.js")
-        self.assertNotIn("doctor_failing", views)
-        body = function_body(views, "attentionCard")
-        self.assertNotIn("doctor checks", body)
+        self.assertIn("doctor_failing", views)
+        body = function_body(views, "attentionItems")
+        self.assertIn("doctor ", body)
 
 
 class PlanBand(unittest.TestCase):
@@ -144,11 +145,12 @@ class HonestQuota(unittest.TestCase):
 class PeekAndClock(unittest.TestCase):
     """Doing and idle on the detail, and stamps sliced with the local offset."""
 
-    def test_detail_names_doing_and_idle_without_a_peek_caption(self):
+    def test_detail_names_doing_idle_and_the_peek_caption(self):
+        # Ticket 669 lands the real peek behind the caption.
         body = function_body(web_text("views.js"), "renderDetail")
         for bit in ('"doing: "', '"idle: "'):
             self.assertIn(bit, body)
-        self.assertNotIn("peek: read-only", body)
+        self.assertIn("peek: read-only", body)
 
     def test_shell_slices_the_offset_stamp(self):
         body = function_body(web_text("views.js"), "renderShell")

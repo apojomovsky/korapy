@@ -2,7 +2,7 @@
 
 import {
   BOARD_PAGE_SIZE,
-  TAIL_POLL_MS,
+  PEEK_POLL_MS,
   VERSION_CHECK_MS,
   capEvents,
   capJournal,
@@ -16,9 +16,9 @@ import {
   loadEvents,
   loadJournalLast,
   loadJournalOlder,
+  loadPeek,
   loadProjects,
   loadSnapshot,
-  loadTail,
   loadToken,
   loadVersion,
   nextBoardDelay,
@@ -42,14 +42,14 @@ import {
   renderLog,
   renderOverview,
   renderShell,
+  renderPeek,
+  renderPeekButtons,
+  renderPeekFailed,
+  renderPeekLoading,
+  renderPeekMissing,
+  renderPeekPaused,
   renderStopped,
   renderStrip,
-  renderTail,
-  renderTailButtons,
-  renderTailFailed,
-  renderTailLoading,
-  renderTailMissing,
-  renderTailPaused,
   setAgentFilter,
   setAgentSort,
   showToken,
@@ -83,14 +83,14 @@ let liveToken = null;
 // must neither draw nor reschedule, so each navigation retires the
 // loop it interrupted instead of fighting it over the one timer.
 let pollGen = 0;
-// The tail poll is its own loop beside the snapshot poll: one timer,
+// The peek poll is its own loop beside the snapshot poll: one timer,
 // its own failure count, and operator state that survives polls.
-let tailTimer = null;
-let tailFailures = 0;
-let tailPaused = false;
-let tailFollow = true;
-let lastTailKey = null;
-let tailTarget = null;
+let peekTimer = null;
+let peekFailures = 0;
+let peekPaused = false;
+let peekFollow = true;
+let lastPeekKey = null;
+let peekTarget = null;
 
 // Log view memory, one project at a time. The journal accumulates
 // oldest-first from the newest window backwards; polls replace the
@@ -183,7 +183,7 @@ function logViewKey(route) {
   return String(route.project || "") + "\n" + String(logKind || "");
 }
 
-// The row a detail key names, drawn, with the row for the tail poll.
+// The row a detail key names, drawn, with the row for the peek poll.
 // A null row draws the miss notice; a throw leaves every cache and
 // the live page untouched for the caller to fall through.
 function drawAgentDetail(doc, key, nowMs) {
@@ -214,13 +214,13 @@ function renderCurrentLog(route) {
   lastProject = route.project;
   lastNotice = route.notice;
   lastAgentKey = null;
-  stopTail();
+  stopPeek();
   return true;
 }
 
 function renderCurrent(config, token) {
   if (outdated || lastDoc === null) {
-    stopTail();
+    stopPeek();
     return false;
   }
   const route = routeFromHash();
@@ -239,7 +239,7 @@ function renderCurrent(config, token) {
     lastAgentKey = canonicalJson(route.key);
     lastProject = null;
     lastNotice = null;
-    syncTailPoll(config, token, row);
+    syncPeekPoll(config, token, row);
     return true;
   }
   try {
@@ -253,7 +253,7 @@ function renderCurrent(config, token) {
   lastProject = route.project;
   lastNotice = route.notice;
   lastAgentKey = null;
-  stopTail();
+  stopPeek();
   return true;
 }
 
@@ -295,7 +295,7 @@ function enterStopped(message) {
   lastAgentKey = null;
   lastLogView = null;
   logFp = null;
-  stopTail();
+  stopPeek();
   renderStopped(message);
 }
 
@@ -511,127 +511,135 @@ async function tickLog(config, token, route, doc) {
   }
 }
 
-function stopTail() {
-  if (tailTimer !== null) {
-    window.clearTimeout(tailTimer);
-    tailTimer = null;
+function stopPeek() {
+  if (peekTimer !== null) {
+    window.clearTimeout(peekTimer);
+    peekTimer = null;
   }
-  lastTailKey = null;
-  tailTarget = null;
+  lastPeekKey = null;
+  peekTarget = null;
 }
 
-function scheduleTail(config, token, delayMs) {
-  if (tailTimer !== null) {
-    window.clearTimeout(tailTimer);
-    tailTimer = null;
+function schedulePeek(config, token, delayMs) {
+  if (peekTimer !== null) {
+    window.clearTimeout(peekTimer);
+    peekTimer = null;
   }
-  if (document.hidden || tailPaused || outdated) {
+  if (document.hidden || peekPaused || outdated) {
     return;
   }
-  tailTimer = window.setTimeout(() => {
-    void tickTail(config, token);
+  peekTimer = window.setTimeout(() => {
+    void tickPeek(config, token);
   }, delayMs);
 }
 
-function tailAtBottom() {
+function peekAtBottom() {
   const pane = document.getElementById("tail");
   return pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 8;
 }
 
-// Keeps the tail poll on its ticket: a new ticket clears the pane
+// Keeps the peek poll on its ticket: a new ticket clears the pane
 // and reloads at once, the same ticket re-arms a dead timer (after
 // a visibility return or a resume), anything else stops the loop.
-function syncTailPoll(config, token, row) {
+function syncPeekPoll(config, token, row) {
   if (row !== null && hasTicket(row)) {
-    const target = { repo: String(row.repo), number: String(row.number) };
-    const key = target.repo + "\n" + target.number;
-    tailTarget = target;
-    if (key !== lastTailKey) {
-      lastTailKey = key;
-      tailFailures = 0;
-      renderTailLoading();
+    const target = {
+      repo: String(row.repo),
+      number: String(row.number),
+      role: row.role === null || row.role === undefined ? null : String(row.role),
+    };
+    const key = target.repo + "\n" + target.number + "\n" + String(target.role || "");
+    peekTarget = target;
+    if (key !== lastPeekKey) {
+      lastPeekKey = key;
+      peekFailures = 0;
+      renderPeekLoading();
     }
-    if (tailTimer === null && !tailPaused && !document.hidden && !outdated) {
-      void tickTail(config, token);
+    if (peekTimer === null && !peekPaused && !document.hidden && !outdated) {
+      void tickPeek(config, token);
     }
     return;
   }
-  stopTail();
+  stopPeek();
 }
 
-async function tickTail(config, token) {
-  tailTimer = null;
-  if (tailTarget === null || outdated || lastDoc === null) {
+async function tickPeek(config, token) {
+  peekTimer = null;
+  if (peekTarget === null || outdated || lastDoc === null) {
     return;
   }
-  const target = tailTarget;
+  const target = peekTarget;
   try {
     let reply = null;
     try {
-      reply = await loadTail(token, target.repo, target.number);
+      reply = await loadPeek(token, target.repo, target.number, target.role);
     } catch {
       reply = null;
     }
-    if (target !== tailTarget) {
+    if (target !== peekTarget) {
       return;
     }
-    if (reply && reply.status === 200) {
-      tailFailures = 0;
-      const pinned = tailFollow && tailAtBottom();
-      renderTail(reply.text === null ? "" : reply.text);
+    if (reply && reply.status === 200 && reply.data && reply.data.peek) {
+      peekFailures = 0;
+      const pinned = peekFollow && peekAtBottom();
+      if (reply.data.peek.state === "ready") {
+        renderPeek(reply.data.peek.lines);
+      } else {
+        renderPeekMissing();
+      }
       if (pinned) {
         const pane = document.getElementById("tail");
         pane.scrollTop = pane.scrollHeight;
       }
     } else if (reply && reply.status === 404) {
-      // No session file yet (or any more): an answer, not a failure.
-      tailFailures = 0;
-      renderTailMissing();
+      // No peek route on this backend: an answer, not a failure.
+      peekFailures = 0;
+      renderPeekMissing();
     } else {
-      tailFailures += 1;
-      renderTailFailed();
+      peekFailures += 1;
+      renderPeekFailed();
     }
   } catch {
-    tailFailures += 1;
-    renderTailFailed();
+    peekFailures += 1;
+    renderPeekFailed();
   } finally {
-    if (target === tailTarget && tailTarget !== null) {
-      scheduleTail(config, token, tailFailures === 0 ? TAIL_POLL_MS : nextDelay(tailFailures));
+    if (target === peekTarget && peekTarget !== null) {
+      schedulePeek(config, token, peekFailures === 0 ? PEEK_POLL_MS : nextDelay(peekFailures));
     }
   }
 }
 
-function bindTailButtons(config, getToken) {
+function bindPeekButtons(config, getToken) {
   const pause = document.getElementById("tail-pause");
   const follow = document.getElementById("tail-follow");
   const pane = document.getElementById("tail");
-  renderTailButtons(tailPaused, tailFollow);
+  renderPeekButtons(peekPaused, peekFollow);
   pause.addEventListener("click", () => {
-    tailPaused = !tailPaused;
-    renderTailButtons(tailPaused, tailFollow);
-    if (tailPaused) {
-      if (tailTimer !== null) {
-        window.clearTimeout(tailTimer);
-        tailTimer = null;
+    peekPaused = !peekPaused;
+    renderPeekButtons(peekPaused, peekFollow);
+    if (peekPaused) {
+      if (peekTimer !== null) {
+        window.clearTimeout(peekTimer);
+        peekTimer = null;
       }
-      renderTailPaused(true);
+      renderPeekPaused(true);
     } else {
-      renderTailPaused(false);
-      void tickTail(config, getToken());
+      renderPeekPaused(false);
+      void tickPeek(config, getToken());
     }
   });
   follow.addEventListener("click", () => {
-    tailFollow = !tailFollow;
-    renderTailButtons(tailPaused, tailFollow);
-    if (tailFollow) {
+    peekFollow = !peekFollow;
+    renderPeekButtons(peekPaused, peekFollow);
+    if (peekFollow) {
       pane.scrollTop = pane.scrollHeight;
     }
   });
   pane.addEventListener("scroll", () => {
     // Scrolling up disengages follow; only the button re-engages it.
-    if (tailFollow && !tailAtBottom()) {
-      tailFollow = false;
-      renderTailButtons(tailPaused, tailFollow);
+    if (peekFollow && !peekAtBottom()) {
+      peekFollow = false;
+      renderPeekButtons(peekPaused, peekFollow);
     }
   });
 }
@@ -710,7 +718,7 @@ async function tick(config, token) {
             lastAgentKey = agentKeyText;
           }
         }
-        syncTailPoll(
+        syncPeekPoll(
           config,
           token,
           route.name === "agent" ? resolveAgent(reply.data, route.key) : null,
@@ -718,7 +726,7 @@ async function tick(config, token) {
       }
       renderConnection({ live: true, seenMs });
     } else if (reply && reply.status === 401) {
-      stopTail();
+      stopPeek();
       showToken({
         message: "This server needs a token.",
         help: helpFor(config.mode),
@@ -1173,9 +1181,9 @@ function bindToken(config, setToken) {
       hideToken();
       toast("token saved");
       failures = 0;
-      // The tail timer chain holds its own token closure: drop it so
-      // the tick below re-arms the tail on the pasted token.
-      stopTail();
+      // The peek timer chain holds its own token closure: drop it so
+      // the tick below re-arms the peek on the pasted token.
+      stopPeek();
       await currentTick(config, value);
       if (!kept) {
         showToken({
@@ -1269,7 +1277,7 @@ async function boot() {
     token = value;
     liveToken = value;
   });
-  bindTailButtons(config, () => token);
+  bindPeekButtons(config, () => token);
   bindViewActions(config, () => token);
   bindKeys();
   bindLogView(
@@ -1292,7 +1300,7 @@ async function boot() {
       timer = null;
     }
     if (routeFromHash().name === "board") {
-      stopTail();
+      stopPeek();
       mountBoard(config);
       void boardTick(config, token);
     } else if (!renderCurrent(config, token)) {

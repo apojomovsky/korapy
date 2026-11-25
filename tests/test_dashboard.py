@@ -225,6 +225,62 @@ class Attention(unittest.TestCase):
             self.assertEqual(got["state"], "error", repr(bad))
 
 
+class DoctorRow(unittest.TestCase):
+    """Ticket 669: failing doctor rows inside the attention band."""
+
+    CHECKS = [
+        {"name": "deps:git", "status": "fail", "detail": "git missing", "fix": "install git"},
+        {"name": "accounts", "status": "ok", "detail": "usable", "fix": ""},
+        {"name": "linger", "status": "warn", "detail": "linger off", "fix": "enable linger"},
+    ]
+
+    def test_failing_rows_carry_name_detail_and_fix(self):
+        got = dashboard.attention([], self.CHECKS)
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(
+            got["doctor_failing"],
+            [{"name": "deps:git", "detail": "git missing", "fix": "install git"}],
+        )
+
+    def test_no_doctor_reading_reads_unknown(self):
+        self.assertEqual(dashboard.attention([])["doctor_failing"], "unknown")
+        self.assertEqual(dashboard.attention([], None)["doctor_failing"], "unknown")
+
+    def test_broken_doctor_reading_reads_unknown_not_error(self):
+        got = dashboard.attention([], ValueError("cache corrupt"))
+        self.assertEqual(got["state"], "ready")
+        self.assertEqual(got["doctor_failing"], "unknown")
+
+    def test_wrong_shaped_doctor_reading_reads_unknown(self):
+        for bad in ("oops", 42, {"checks": []}):
+            self.assertEqual(dashboard.attention([], bad)["doctor_failing"], "unknown", repr(bad))
+
+    def test_two_failing_rows_both_list_in_order(self):
+        checks = [
+            {"name": "deps:a", "status": "fail", "detail": "a gone", "fix": "install a"},
+            {"name": "deps:b", "status": "fail", "detail": "b gone", "fix": "install b"},
+        ]
+        got = dashboard.attention([], checks)
+        self.assertEqual([row["name"] for row in got["doctor_failing"]], ["deps:a", "deps:b"])
+
+    def test_warn_and_ok_rows_are_not_failing(self):
+        got = dashboard.attention([], self.CHECKS[1:])
+        self.assertEqual(got["doctor_failing"], [])
+
+    def test_check_objects_and_missing_fields_read_unknown_parts(self):
+        from korapy import doctor
+
+        got = dashboard.attention([], [doctor.Check("deps:x", "fail", "", "")])
+        self.assertEqual(
+            got["doctor_failing"], [{"name": "deps:x", "detail": "unknown", "fix": "unknown"}]
+        )
+
+    def test_doctor_rows_survive_a_missing_event_queue(self):
+        got = dashboard.attention(None, self.CHECKS)
+        self.assertEqual(got["state"], "unknown")
+        self.assertEqual(len(got["doctor_failing"]), 1)
+
+
 class PlanBand(unittest.TestCase):
     def test_unknown_when_drive_missing(self):
         got = dashboard.plan_projection(None, T0)
@@ -552,6 +608,18 @@ class BuildPanels(unittest.TestCase):
         self.assertIn("ship it?", attention["needs_decision"][0]["question"])
         self.assertEqual(len(attention["ready_to_merge"]), 1)
         self.assertEqual(attention["coordinator_handled"], 1)
+
+    def test_attention_carries_failing_doctor_rows(self):
+        doc = self.build(
+            events_view=[],
+            doctor_view=[
+                {"name": "deps:x", "status": "fail", "detail": "gone", "fix": "install x"}
+            ],
+        )
+        self.assertEqual(
+            doc["attention"]["doctor_failing"],
+            [{"name": "deps:x", "detail": "gone", "fix": "install x"}],
+        )
 
     def test_attention_unknown_when_no_queue(self):
         self.assertEqual(self.build()["attention"]["state"], "unknown")

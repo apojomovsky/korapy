@@ -140,48 +140,19 @@ export function nextBoardDelay(failures) {
   return BACKOFF_MS[Math.min(failures - 1, BACKOFF_MS.length - 1)];
 }
 
-// The agent-detail tail cadence, in milliseconds. Failures back off
+// The agent-detail peek cadence, in milliseconds. Failures back off
 // on the shared table; successes stay on this cadence.
-export const TAIL_POLL_MS = 3000;
+export const PEEK_POLL_MS = 3000;
 
-async function readText(resp) {
-  try {
-    return await resp.text();
-  } catch {
-    return null;
+// One ticket's peek document for the detail pane: bounded lines
+// with local stamps, or a not-available state the pane states.
+export function loadPeek(token, repo, number, role) {
+  let path =
+    "/v1/peek?repo=" + encodeURIComponent(repo) + "&number=" + encodeURIComponent(String(number));
+  if (role !== null && role !== undefined && role !== "") {
+    path += "&role=" + encodeURIComponent(String(role));
   }
-}
-
-export async function fetchText(path, token, { timeoutMs = 10000 } = {}) {
-  const ctrl = new AbortController();
-  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const headers = {};
-    if (token) {
-      headers["Authorization"] = "Bearer " + token;
-    }
-    const resp = await window.fetch(path, {
-      cache: "no-store",
-      headers,
-      signal: ctrl.signal,
-    });
-    return { status: resp.status, text: await readText(resp) };
-  } catch {
-    // Same contract as fetchJson: a status the HTTP layer can never
-    // send, so the caller takes the failure branch without its own
-    // throw and the poll loop survives.
-    return { status: 0, text: null };
-  } finally {
-    window.clearTimeout(timer);
-  }
-}
-
-// One ticket's activity lines for the detail tail pane.
-export function loadTail(token, repo, number) {
-  return fetchText(
-    "/v1/tail?repo=" + encodeURIComponent(repo) + "&number=" + encodeURIComponent(String(number)),
-    token,
-  );
+  return fetchJson(path, token);
 }
 
 // Whether a row names a ticket. Ticket-less rows (null repo or
