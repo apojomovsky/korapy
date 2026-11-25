@@ -334,6 +334,79 @@ class ItemTest(unittest.TestCase):
             self.adapter.item("acme/app", 404)
 
 
+class DependsOnExtraTest(unittest.TestCase):
+    def setUp(self):
+        self.gh = FakeRun()
+        self.adapter = ghtracker.GithubTracker(self.gh)
+
+    def test_issue_body_depends_on_lines_become_blocked_by_refs(self):
+        self.gh.add("repos/acme/app/issues/7", item_payload(7, body="Work.\nDepends on #3 and #4"))
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], ["acme/app#3", "acme/app#4"])
+
+    def test_two_depends_on_lines_combine(self):
+        self.gh.add(
+            "repos/acme/app/issues/7", item_payload(7, body="Depends on #8\nText.\nDepends on #5")
+        )
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], ["acme/app#8", "acme/app#5"])
+
+    def test_body_without_a_depends_on_line_clears_blocked_by(self):
+        self.gh.add("repos/acme/app/issues/7", item_payload(7, body="Just work. See #9."))
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], [])
+
+    def test_qualified_body_refs_ride_through_for_the_gate(self):
+        self.gh.add(
+            "repos/acme/app/issues/7", item_payload(7, body="Work.\nDepends on other/repo#5")
+        )
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], ["other/repo#5"])
+
+    def test_body_comes_from_the_issue_read_without_a_new_call(self):
+        self.gh.add("repos/acme/app/issues/7", item_payload(7, body="Work.\nDepends on #3"))
+        found = self.adapter.item("acme/app", 7)
+        self.assertEqual((found.extra or {})["blocked_by"], ["acme/app#3"])
+        self.assertEqual(self.gh.paths(), ["repos/acme/app/issues/7"])
+
+    def test_listing_bodies_ride_the_feed_without_a_new_call(self):
+        path = "repos/acme/app/issues?state=all&sort=updated&direction=asc&per_page=100"
+        self.gh.add(path, [item_payload(7, body="Work.\nDepends on #3")])
+        found = list(self.adapter.items("acme/app"))
+        self.assertEqual(found[0].extra["blocked_by"], ["acme/app#3"])
+        self.assertEqual(self.gh.paths(), [path])
+
+    def test_board_mode_and_issue_mode_share_one_reader(self):
+        from tests.test_board_reader import (
+            BoardFakeRun,
+            full_schema_fields,
+            item_node,
+            items_payload,
+            reader_for,
+            rest_issue,
+            schema_payload,
+        )
+
+        body = "Work.\nDepends on #3 and #4\ndepends on #3"
+        run = BoardFakeRun()
+        rest_issue(run, 7, body=body)
+        run.script("BoardSchemaByNumber", [schema_payload(*full_schema_fields())])
+        run.script("BoardItems", [items_payload([item_node(7, values=[])])])
+        reader = reader_for(run)
+        board_found, _ = reader.poll(reader.schema(), max_pages=10)
+        self.gh.add("repos/example/demo/issues/7", item_payload(7, body=body))
+        issue_found = self.adapter.item("example/demo", 7)
+        self.assertEqual(len(board_found), 1)
+        self.assertEqual(
+            board_found[0].extra["blocked_by"],
+            (issue_found.extra or {})["blocked_by"],
+        )
+        self.assertEqual(
+            (issue_found.extra or {})["blocked_by"],
+            ["example/demo#3", "example/demo#4"],
+        )
+
+
 class MalformedTest(unittest.TestCase):
     def setUp(self):
         self.gh = FakeRun()

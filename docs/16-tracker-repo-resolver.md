@@ -147,17 +147,16 @@ through; neither answers which tracker repo an entry feeds.
 
 ## 4. Two entries sharing one short name
 
-Across registered roots `production_repo_map` keeps the first
-project naming a short name (`setdefault`), while
-`driven_repos` keeps each root's own set, so two projects
-sharing a short name each still drive their own tracker repos.
-That asymmetry is deliberate and a separate ticket (#456) owns it.
-This design is out of that scope: it must not change collision
-semantics, and the agreement test uses distinct short names
-(or pins first-winner explicitly where multi-root). After the
-collapse the three callers resolve each entry identically, so
-a collision surfaces the same spelling in all three reports
-instead of three different guesses.
+Across registered roots the drive pass builds per-project maps
+(`production_repo_maps`), so two projects sharing a short name
+each still drive and join against their own tracker repos
+(#456); the flat `production_repo_map` projection keeps the first
+project naming a short name for project-less callers. This design
+is out of that scope: it must not change collision semantics, and
+the agreement test uses distinct short names (or pins first-winner
+explicitly where multi-root). After the collapse the three callers
+resolve each entry identically, so a collision surfaces the same
+spelling in all three reports instead of three different guesses.
 
 ## 5. Test plan
 
