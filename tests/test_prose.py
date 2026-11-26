@@ -322,12 +322,34 @@ class IsTestPathTest(unittest.TestCase):
     def test_recognises_test_and_example_trees(self):
         self.assertTrue(prose.is_test_path("tests/combo/a.c"))
         self.assertTrue(prose.is_test_path("lib-lcd/tests/a.c"))
+        self.assertTrue(prose.is_test_path("test/a.c"))
         self.assertTrue(prose.is_test_path("examples/a.c"))
         self.assertTrue(prose.is_test_path("lib/examples/a.c"))
+
+    def test_recognises_test_prefixed_basenames(self):
+        self.assertTrue(prose.is_test_path("scripts/test_scenario_8_stamp_judge.py"))
+        self.assertTrue(prose.is_test_path("tools/test_esp32_docs.py"))
+
+    def test_recognises_test_suffixed_basenames(self):
+        self.assertTrue(prose.is_test_path("src/driver_test.go"))
+        self.assertTrue(prose.is_test_path("src/driver_tests.py"))
+        self.assertTrue(prose.is_test_path("web/driver.test.js"))
+        self.assertTrue(prose.is_test_path("web/driver.spec.ts"))
+
+    def test_recognises_fuzz_and_e2e_trees(self):
+        self.assertTrue(prose.is_test_path("bridge/pkg/fuzz/harness.py"))
+        self.assertTrue(prose.is_test_path("bridge/fuzzers/roundtrip.c"))
+        self.assertTrue(prose.is_test_path("e2e/login.py"))
 
     def test_source_paths(self):
         self.assertFalse(prose.is_test_path("src/a.c"))
         self.assertFalse(prose.is_test_path("lib-lcd/src/latest.c"))
+
+    def test_lookalikes_are_not_test_paths(self):
+        self.assertFalse(prose.is_test_path("scripts/contest.py"))
+        self.assertFalse(prose.is_test_path("latest_notes.md"))
+        self.assertFalse(prose.is_test_path("docs/test-plan.md"))
+        self.assertFalse(prose.is_test_path("src/FooTest.java"))
 
 
 class LineRulesTest(unittest.TestCase):
@@ -352,6 +374,13 @@ class LineRulesTest(unittest.TestCase):
 
     def test_test_tree_header_has_no_cap(self):
         block = make_block(kind=prose.HEADER, path="tests/a.c", n=2, header_lines=84)
+        self.assertIsNone(prose.check_line_rules(block))
+
+    def test_test_named_header_has_no_cap(self):
+        # The widened test path shares the exemption with the old
+        # test trees: a long header on a test-named file is not a
+        # violation, wherever the file lives.
+        block = make_block(kind=prose.HEADER, path="scripts/test_x.py", n=2, header_lines=84)
         self.assertIsNone(prose.check_line_rules(block))
 
     def test_doc_has_no_line_cap(self):

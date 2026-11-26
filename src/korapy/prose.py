@@ -315,7 +315,13 @@ def extract(base, cwd=None):
 
 HARD_CAP = 8
 
-_TEST_PATH = re.compile(r"(^|/)(tests?|examples?)/")
+_TEST_PATH = re.compile(r"(^|/)(tests?|examples?|fuzz|fuzzers|e2e)/")
+
+#: A test file by name: `test_` first, or a `_test`, `_tests`,
+#: `.test` or `.spec` stem before the extension. `FooTest.java`
+#: stays out on purpose: that suffix is a naming habit, not a rule.
+_TEST_PREFIX = re.compile(r"^test_")
+_TEST_SUFFIX = re.compile(r"(_tests?\.[^./]+|\.test\.[^./]+|\.spec\.[^./]+)$")
 
 
 class Violation(NamedTuple):
@@ -327,7 +333,17 @@ class Violation(NamedTuple):
 
 
 def is_test_path(path):
-    return bool(_TEST_PATH.search(path))
+    """Whether a path is a test file, for the prose rule and the merge gate.
+
+    The one resolver both readers share: a test, example, fuzz, or e2e
+    tree, or a test-named file wherever it lives. Paths that only
+    mention testing (`scripts/contest.py`, `docs/test-plan.md`) are
+    not test files.
+    """
+    if _TEST_PATH.search(path):
+        return True
+    name = os.path.basename(path)
+    return bool(_TEST_PREFIX.match(name) or _TEST_SUFFIX.search(name))
 
 
 def _violation(block, message):

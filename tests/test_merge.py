@@ -1555,6 +1555,21 @@ class TestsRowTest(ReadinessCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(self.row(result, "tests").status, "ok")
 
+    def test_test_named_files_are_ok(self):
+        # The criterion shares the prose test path rule, so a diff
+        # whose only test file lives outside test/ still passes.
+        cases = (
+            "scripts/test_scenario_8_stamp_judge.py",
+            "tools/test_esp32_docs.py",
+            "bridge/pkg/fuzz/harness.py",
+        )
+        for test_file in cases:
+            with self.subTest(test_file=test_file):
+                files = ("src/korapy/merge.py", test_file)
+                result = self.do_staged(self.staged(files=files))
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(self.row(result, "tests").status, "ok")
+
     def test_untested_diff_blocks(self):
         fake = self.staged(files=("src/korapy/merge.py",))
         result = self.do_staged(fake)
